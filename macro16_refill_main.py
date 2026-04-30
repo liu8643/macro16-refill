@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 宏觀16模組自動抓取與Excel回填主程式
-版本：V1.6 ExcelCommentAligned
+版本：V1.8 SourceDiffAligned
 目的：依「宏觀16模組市場資料回填SOP」與「主程式工程級規格書」執行資料取得、標準化、分數判定、Excel回填與稽核。
 
 執行方式：
@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+import sqlite3
 from dataclasses import dataclass, asdict
 from io import StringIO
 from pathlib import Path
@@ -41,7 +42,7 @@ except Exception as exc:
     raise RuntimeError("缺少 openpyxl，請先安裝：pip install openpyxl") from exc
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "1.6.0-excel-comment-aligned"
+VERSION = "1.8.0-source-diff-aligned"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -65,6 +66,25 @@ YAHOO_SYMBOL_CANDIDATES = {
 
 
 SOURCE_PRIORITY = ["官方資料", "交易所/期交所", "國際金融數據站", "台灣可信財經站", "人工事件判斷"]
+
+SOURCE_URLS = {
+    "reuters_war": "https://www.reuters.com",
+    "bloomberg_policy": "https://www.bloomberg.com",
+    "federal_reserve": "https://www.federalreserve.gov",
+    "bls_api_cpi": "https://api.bls.gov/publicAPI/v2/timeseries/data/CUUR0000SA0",
+    "bls_api_nfp": "https://api.bls.gov/publicAPI/v2/timeseries/data/CES0000000001",
+    "twse_foreign": "https://www.twse.com.tw/fund/BFI82U?response=json&dayDate={date}&type=day",
+    "twse_broker_report": "https://www.twse.com.tw/zh/trading/brokerReport",
+    "tpex_indices": "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/indices-pricing.html",
+    "wantgoo_public_bank": "https://www.wantgoo.com/stock/public-bank/trend",
+    "histock": "https://histock.tw",
+    "techcrunch_ai": "https://techcrunch.com",
+    "isw": "https://www.understandingwar.org",
+    "cnn": "https://www.cnn.com",
+    "iek": "https://ieknet.iek.org.tw/",
+    "taifex_night": "https://www.taifex.com.tw/cht/3/futContractsDateAh",
+}
+
 
 @dataclass
 class RawData:
@@ -178,8 +198,10 @@ class HttpClient:
         self.session = requests.Session() if requests else None
         if self.session:
             self.session.headers.update({
-                "User-Agent": "Mozilla/5.0 Macro16RefillEngine/1.0",
-                "Accept": "application/json,text/csv,text/plain,*/*",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Macro16RefillEngine/1.8",
+                "Accept": "application/json,text/csv,text/html,text/plain,*/*",
+                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+                "Referer": "https://www.google.com/",
             })
 
     def get_text(self, url: str, timeout: int = DEFAULT_TIMEOUT) -> str:
@@ -524,43 +546,222 @@ class SourceConnector:
             self.logger.warning(f"{source_name}抓取失敗 {module}: {exc}")
             return RawData(module, None, "", source_name, url, self._today_str(), status_if_fail, str(exc), data_status="OPTIONAL_MISSING")
 
-    def fetch_gov_news(self, url: str = "https://money.udn.com/money/story/5607/9472868") -> RawData:
-        raw = self.fetch_text_snapshot("官股", url, "UDN Money", "WARN")
+
+    def fetch_bls_api_series(self, module: str, series_id: str, source_url: str) -> RawData:
+        year = dt.date.today().year
+        url = f"{source_url}?startyear={year-2}&endyear={year}"
+        try:
+            data = self.client.get_json(url)
+            series = data.get("Results", {}).get("series", [])
+            if not series or not series[0].get("data"):
+                raise ValueError("BLS API無有效資料")
+            latest = series[0]["data"][0]
+            value = self._to_float(latest.get("value"))
+            period = f"{latest.get('year')}-{latest.get('periodName')}"
+            payload = {"series_id": series_id, "period": period, "value": value, "raw": latest}
+            self.logger.raw_snapshot(module, payload)
+            self.logger.parsed_value(f"{module}_value", value, "BLS API", period)
+            return RawData(module, payload, period, "BLS API", url, self._today_str(), "OK", "BLS API series fetched")
+        except Exception as exc:
+            self.logger.warning(f"BLS API抓取失敗 {module}/{series_id}: {exc}")
+            return RawData(module, None, "", "BLS API", url, self._today_str(), "WARN", str(exc), data_status="FETCH_FAIL")
+
+    def fetch_bls_cpi(self) -> RawData:
+        return self.fetch_bls_api_series("CPI", "CUUR0000SA0", SOURCE_URLS["bls_api_cpi"])
+
+    def fetch_bls_nfp(self) -> RawData:
+        return self.fetch_bls_api_series("非農", "CES0000000001", SOURCE_URLS["bls_api_nfp"])
+
+    def fetch_reuters_war(self, url: str = SOURCE_URLS["reuters_war"]) -> RawData:
+        raw = self.fetch_text_snapshot("戰爭/停火", url, "Reuters", "WARN")
+        if raw.status == "OK" and raw.value:
+            text = raw.value.get("snippet", "").lower()
+            risk = 1 if any(k in text for k in ["war", "ceasefire", "israel", "iran", "attack", "missile", "sanction"]) else 0
+            raw.value["major_event"] = risk
+            self.logger.parsed_value("major_event", risk, "Reuters", raw.date)
+        return raw
+
+    def fetch_bloomberg_policy(self, url: str = SOURCE_URLS["bloomberg_policy"]) -> RawData:
+        return self.fetch_text_snapshot("外交政策", url, "Bloomberg", "WARN")
+
+    def fetch_fed_policy(self, url: str = SOURCE_URLS["federal_reserve"]) -> RawData:
+        return self.fetch_text_snapshot("FED利率政策", url, "Federal Reserve", "WARN")
+
+    def fetch_isw_conflict(self, url: str = SOURCE_URLS["isw"]) -> RawData:
+        raw = self.fetch_text_snapshot("ISW衝突分析", url, "ISW", "WARN")
+        if raw.status == "OK" and raw.value:
+            text = raw.value.get("snippet", "").lower()
+            risk = 1 if any(k in text for k in ["russia", "ukraine", "iran", "israel", "war", "attack"]) else 0
+            raw.value["major_event"] = risk
+            self.logger.parsed_value("isw_major_event", risk, "ISW", raw.date)
+        return raw
+
+    def fetch_cnn_major_news(self, url: str = SOURCE_URLS["cnn"]) -> RawData:
+        raw = self.fetch_text_snapshot("CNN重大新聞", url, "CNN", "WARN")
+        if raw.status == "OK" and raw.value:
+            text = raw.value.get("snippet", "").lower()
+            risk = 1 if any(k in text for k in ["breaking", "war", "crisis", "market", "president", "attack"]) else 0
+            raw.value["major_event"] = risk
+            self.logger.parsed_value("cnn_major_event", risk, "CNN", raw.date)
+        return raw
+
+    def fetch_iek_industry(self, url: str = SOURCE_URLS["iek"]) -> RawData:
+        raw = self.fetch_text_snapshot("IEK產業分析", url, "IEK Taiwan", "WARN")
+        if raw.status == "OK" and raw.value:
+            text = raw.value.get("snippet", "")
+            strength = 0.8 if any(k in text for k in ["AI", "CPO", "半導體", "先進封裝", "產業"]) else 0.5
+            raw.value["ai_strength"] = strength
+            self.logger.parsed_value("iek_ai_strength", strength, "IEK Taiwan", raw.date)
+        return raw
+
+    def fetch_trump_public_news(self, url: str = "https://www.reuters.com/world/us/") -> RawData:
+        raw = self.fetch_text_snapshot("美國總統", url, "Reuters US", "WARN")
+        if raw.status == "OK" and raw.value:
+            text = raw.value.get("snippet", "").lower()
+            signal = 1 if any(k in text for k in ["trump", "tariff", "president", "trade", "china", "fed"]) else 0
+            raw.value["policy_event"] = signal
+            self.logger.parsed_value("us_president_policy_event", signal, "Reuters US", raw.date)
+        return raw
+
+    def fetch_wantgoo_public_bank(self, url: str = SOURCE_URLS["wantgoo_public_bank"]) -> RawData:
+        raw = self.fetch_text_snapshot("官股整理", url, "Wantgoo", "WARN")
+        if raw.status == "OK" and raw.value:
+            text = raw.value.get("snippet", "")
+            nums = [self._to_float(x) for x in re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", text)]
+            nums = [x for x in nums if not math.isnan(x)]
+            if nums:
+                raw.value["gov_hint_values"] = nums[:20]
+                self.logger.parsed_value("wantgoo_gov_hint_values", nums[:5], "Wantgoo", raw.date)
+            else:
+                raw.status = "WARN"
+                raw.data_status = "NO_PARSED_VALUE"
+                raw.message = "Wantgoo頁面已取得但未解析出官股數字"
+        return raw
+
+    def fetch_twse_broker_report(self, url: str = SOURCE_URLS["twse_broker_report"]) -> RawData:
+        raw = self.fetch_text_snapshot("八大官股", url, "TWSE Broker Report", "WARN")
+        if raw.status == "OK" and raw.value:
+            text = raw.value.get("snippet", "")
+            if not any(k in text for k in ["自營", "券商", "買賣", "broker", "交易"]):
+                raw.status = "WARN"
+                raw.data_status = "NO_PARSED_VALUE"
+                raw.message = "TWSE券商報表頁面已取得但未解析出八大官股數字"
+            self.logger.parsed_value("twse_broker_report_status", raw.status, "TWSE Broker Report", raw.date)
+        return raw
+
+    def fetch_ranking_result_db(self, db_path: Optional[str] = None) -> RawData:
+        candidates = []
+        if db_path:
+            candidates.append(Path(db_path))
+        candidates.extend(Path.cwd().glob("*.db"))
+        candidates.extend(Path.cwd().glob("**/*.db"))
+        seen = set()
+        candidates = [p for p in candidates if not (str(p) in seen or seen.add(str(p)))]
+        for path in candidates[:20]:
+            try:
+                conn = sqlite3.connect(str(path))
+                cur = conn.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ranking_result'")
+                if not cur.fetchone():
+                    conn.close()
+                    continue
+                cur.execute("SELECT COUNT(*) FROM ranking_result")
+                count = cur.fetchone()[0]
+                cur.execute("SELECT * FROM ranking_result LIMIT 3")
+                rows = cur.fetchall()
+                conn.close()
+                payload = {"db_path": str(path), "table": "ranking_result", "row_count": count, "sample_rows": rows}
+                self.logger.raw_snapshot("排行分析", payload)
+                self.logger.parsed_value("ranking_result_count", count, "SQLite DB", str(path))
+                return RawData("排行分析", payload, self._today_str(), "SQLite DB", str(path), self._today_str(), "OK", "ranking_result loaded")
+            except Exception as exc:
+                self.logger.debug(f"ranking_result DB skipped path={path}: {exc}")
+        return RawData("排行分析", None, "", "SQLite DB", "db:ranking_result", self._today_str(), "WARN", "未找到 ranking_result 資料表", data_status="DATA_MISSING")
+
+
+    def fetch_gov_news(self, url: str = SOURCE_URLS["wantgoo_public_bank"]) -> RawData:
+        raw = self.fetch_text_snapshot("官股", url, "Wantgoo", "WARN")
         if raw.status == "OK" and raw.value:
             text = raw.value.get("snippet", "")
             m = re.search(r"(?:八大公股|官股|公股).*?(?:買超|買進|承接).*?([0-9]+(?:\.[0-9]+)?)\s*億", text)
             if m:
                 value = float(m.group(1))
                 raw.value["gov_net_100m"] = value
-                raw.message = "UDN官股新聞已解析買超億元"
-                self.logger.parsed_value("gov_net_100m", value, "UDN Money", raw.date)
+                raw.message = "Wantgoo/TWSE官股來源已解析買超億元"
+                self.logger.parsed_value("gov_net_100m", value, "Wantgoo", raw.date)
             else:
-                self.logger.info("PARSED_VALUE field=gov_net_100m value=UNPARSED source=UDN Money actual_date=latest")
+                self.logger.info("PARSED_VALUE field=gov_net_100m value=UNPARSED source=Wantgoo actual_date=latest")
         return raw
 
-    def fetch_ai_industry_news(self, url: str = "https://finance.technews.tw/2026/04/29/ase-technology-holding-is-optimistic-about-the-explosive-growth-in-demand-for-advanced-packaging-business-in-the-next-two-years/") -> RawData:
-        raw = self.fetch_text_snapshot("AI產業", url, "TechNews", "WARN")
+    def fetch_ai_industry_news(self, url: str = SOURCE_URLS["techcrunch_ai"]) -> RawData:
+        raw = self.fetch_text_snapshot("AI產業", url, "TechCrunch", "WARN")
         if raw.status == "OK" and raw.value:
             text = raw.value.get("snippet", "")
             strength = 0.8 if any(k in text for k in ["AI", "先進封裝", "需求", "資本支出", "成長"]) else 0.5
             raw.value["ai_strength"] = strength
-            self.logger.parsed_value("ai_strength", strength, "TechNews", raw.date)
+            self.logger.parsed_value("ai_strength", strength, "TechCrunch", raw.date)
         return raw
 
-    def fetch_geopolitical_news(self, url: str = "https://www.aljazeera.com/news/liveblog/2026/4/29/iran-war-live-trump-says-tehran-wants-end-to-blockade-israel-kills-medics") -> RawData:
-        raw = self.fetch_text_snapshot("戰爭/地緣", url, "Al Jazeera", "WARN")
+    def fetch_geopolitical_news(self, url: str = SOURCE_URLS["reuters_war"]) -> RawData:
+        raw = self.fetch_text_snapshot("戰爭/地緣", url, "Reuters", "WARN")
         if raw.status == "OK" and raw.value:
             text = raw.value.get("snippet", "").lower()
             risk = 1 if any(k in text for k in ["war", "blockade", "israel", "iran", "attack", "missile", "kills"]) else 0
             raw.value["major_event"] = risk
-            self.logger.parsed_value("major_event", risk, "Al Jazeera", raw.date)
+            self.logger.parsed_value("major_event", risk, "Reuters", raw.date)
         return raw
 
-    def fetch_taifex_night_snapshot(self, url: str = "https://www.taifex.com.tw/enl/eng3/futDailyMarketReport") -> RawData:
-        return self.fetch_text_snapshot("台股夜盤", url, "TAIFEX", "WARN")
+    def fetch_taifex_night_snapshot(self, url: str = SOURCE_URLS["taifex_night"]) -> RawData:
+        raw = self.fetch_text_snapshot("台股夜盤", url, "TAIFEX", "WARN")
+        if raw.status != "OK" or not raw.value:
+            return raw
+        text = re.sub(r"\s+", " ", raw.value.get("snippet", ""))
+        patterns = [
+            r"(?:TX|臺股期貨|台股期貨|臺指期|台指期).*?(-?\d+(?:,\d{3})*(?:\.\d+)?).*?(-?\d+(?:,\d{3})*(?:\.\d+)?)",
+            r"(?:夜盤|After\\s*Hours?).*?(?:TX|臺股期貨|台股期貨).*?(-?\d+(?:,\d{3})*(?:\.\d+)?).*?(-?\d+(?:,\d{3})*(?:\.\d+)?)",
+        ]
+        parsed = None
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.I)
+            if m:
+                nums = []
+                for g in m.groups():
+                    try:
+                        nums.append(self._to_float(g))
+                    except Exception:
+                        pass
+                if nums:
+                    parsed = {"contract": "TX", "session": "after_hours", "price_or_value": nums[0], "change_or_volume": nums[1] if len(nums) > 1 else None}
+                    break
+        if parsed:
+            change = parsed.get("change_or_volume")
+            score = 1 if isinstance(change, (int, float)) and change > 0 else (-1 if isinstance(change, (int, float)) and change < 0 else 0)
+            parsed["night_score"] = score
+            raw.value.update(parsed)
+            raw.message = "TAIFEX夜盤已解析數值"
+            self.logger.raw_snapshot("TAIFEX_NIGHT_PARSED", parsed)
+            self.logger.parsed_value("night_score", score, "TAIFEX", raw.date)
+            return raw
+        raw.status = "WARN"
+        raw.data_status = "NO_PARSED_VALUE"
+        raw.message = "TAIFEX正確網址已取得，但未解析出TX夜盤數值"
+        self.logger.warning(f"TAIFEX夜盤未解析出數值 url={url}")
+        return raw
 
-    def fetch_tpex_otc_snapshot(self, url: str = "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/indices-pricing.html") -> RawData:
-        return self.fetch_text_snapshot("OTC官方來源", url, "TPEX", "WARN")
+    def fetch_tpex_otc_snapshot(self, url: str = SOURCE_URLS["tpex_indices"]) -> RawData:
+        raw = self.fetch_text_snapshot("OTC官方來源", url, "TPEX", "WARN")
+        if raw.status == "OK" and raw.value:
+            text = raw.value.get("snippet", "")
+            nums = [self._to_float(x) for x in re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?", text)]
+            nums = [x for x in nums if not math.isnan(x)]
+            if nums:
+                raw.value["otc_hint_values"] = nums[:20]
+                self.logger.parsed_value("tpex_otc_hint_values", nums[:5], "TPEX", raw.date)
+            else:
+                raw.status = "WARN"
+                raw.data_status = "NO_PARSED_VALUE"
+                raw.message = "TPEX官方頁已取得但未解析出OTC指數數值"
+        return raw
 
     def build_manual_raw(self, module: str, value: Any, note: str, source: str = "人工覆寫/Excel註解") -> RawData:
         self.logger.raw_snapshot(module, {"value": value, "note": note})
@@ -648,9 +849,13 @@ class DataProcessor:
             market.gov_net_100m = None
 
         ai = raw.get("AI產業")
+        iek = raw.get("IEK產業分析")
         if ai and ai.status == "OK" and isinstance(ai.value, dict) and ai.value.get("ai_strength") is not None:
             market.ai_strength = float(ai.value.get("ai_strength"))
             self.logger.parsed_value("market.ai_strength", market.ai_strength, ai.source, ai.date)
+        elif iek and iek.status == "OK" and isinstance(iek.value, dict) and iek.value.get("ai_strength") is not None:
+            market.ai_strength = float(iek.value.get("ai_strength"))
+            self.logger.parsed_value("market.ai_strength", market.ai_strength, iek.source, iek.date)
         else:
             market.ai_strength = 0.5
 
@@ -771,27 +976,27 @@ class ScoringEngine:
             direction = -1 if risk else 0
             strength = 0.8 if risk else 0.2
             weighted = round(direction * strength, 2)
-            explanation = "已依 Excel 註解來源抓取 Al Jazeera/地緣事件頁面；若含戰爭、封鎖、攻擊等關鍵字，列重大事件風險。"
+            explanation = "已依 Excel 註解來源優先抓取 Reuters/地緣事件頁面；若含戰爭、封鎖、攻擊等關鍵字，列重大事件風險。"
             trade = "外部事件風險升高，降倉禁追高" if risk else "事件頁面已抓取，未偵測到強風險關鍵字"
             return ModuleScore("戰爭/地緣", raw.value.get("url", ""), strength, direction, weighted, explanation, raw.source, raw.date, trade, "OK")
-        return ModuleScore("戰爭/地緣", "未取得", 0.0, 0, 0.0, "地緣新聞來源未取得，列為選用資料缺失，不得自動編造事件。", "Al Jazeera", market.base_date, "需人工確認事件嚴重度", "WARN")
+        return ModuleScore("戰爭/地緣", "未取得", 0.0, 0, 0.0, "地緣新聞來源未取得，列為選用資料缺失，不得自動編造事件。", "Reuters", market.base_date, "需人工確認事件嚴重度", "WARN")
     def score_cpi(self, raw, market):
         if raw and raw.status == "OK" and raw.value:
             snippet = raw.value.get("snippet", "") if isinstance(raw.value, dict) else str(raw.value)
             nums = re.findall(r"[-+]?\d+(?:\.\d+)?\s*percent|[-+]?\d+(?:\.\d+)?%", snippet, flags=re.I)
-            data_text = "BLS CPI release fetched"
+            data_text = f"BLS CPI API fetched；value={raw.value.get('value') if isinstance(raw.value, dict) else ''}"
             if nums:
                 data_text += "；sample=" + ", ".join(nums[:3])
-            return ModuleScore("CPI", data_text, 0.3, 0, 0.0, "CPI 為週期性資料，已依 Excel 註解改抓 BLS 官方發布頁；非公布日使用最近公告，不做每日回退。", raw.source, raw.date, "通膨資料已抓取，需搭配油價/利率判斷", "OK")
+            return ModuleScore("CPI", data_text, 0.3, 0, 0.0, "CPI 為週期性資料，已依 Excel 註解改抓 BLS API；非公布日使用最近公告，不做每日回退。", raw.source, raw.date, "通膨資料已抓取，需搭配油價/利率判斷", "OK")
         return ModuleScore("CPI", "BLS未取得", 0.0, 0, 0.0, "CPI 為週期性資料；BLS來源抓取失敗時不應假設中性，需標示資料缺失。", "BLS", market.base_date, "需補抓或人工確認", "WARN")
     def score_nfp(self, raw, market):
         if raw and raw.status == "OK" and raw.value:
             snippet = raw.value.get("snippet", "") if isinstance(raw.value, dict) else str(raw.value)
-            data_text = "BLS Employment Situation release fetched"
+            data_text = f"BLS 非農 API fetched；value={raw.value.get('value') if isinstance(raw.value, dict) else ''}"
             m = re.search(r"nonfarm payroll employment.*?(?:rose|increased).*?([0-9,]+)", snippet, flags=re.I)
             if m:
                 data_text += f"；payroll_hint={m.group(1)}"
-            return ModuleScore("非農", data_text, 0.3, 0, 0.0, "非農為週期性資料，已依 Excel 註解改抓 BLS 官方就業報告；非公布日使用最近公告，不做每日回退。", raw.source, raw.date, "就業資料已抓取，需搭配市場預期差判斷", "OK")
+            return ModuleScore("非農", data_text, 0.3, 0, 0.0, "非農為週期性資料，已依 Excel 註解改抓 BLS API就業資料；非公布日使用最近公告，不做每日回退。", raw.source, raw.date, "就業資料已抓取，需搭配市場預期差判斷", "OK")
         return ModuleScore("非農", "BLS未取得", 0.0, 0, 0.0, "非農為週期性資料；BLS來源抓取失敗時需標示資料缺失，不可編造。", "BLS", market.base_date, "需補抓或人工確認", "WARN")
     def score_foreign(self, raw, market):
         value = market.foreign_net_100m
@@ -808,12 +1013,12 @@ class ScoringEngine:
         value = market.gov_net_100m
         if value is None:
             if raw and raw.status == "OK":
-                return ModuleScore("官股", "UDN官股來源已抓取但未解析出買賣超億元", 0.2, 0, 0.0, "已依 Excel 註解抓取官股新聞來源，但未解析出明確數字；不自動編造，列中性觀察。", raw.source, raw.date, "需確認新聞文字或人工補入", "WARN")
-            return ModuleScore("官股", "未取得", 0.0, 0, 0.0, "官股/八大公股來源未取得，本版不編造數字。", "UDN Money", market.base_date, "需補抓或人工確認", "WARN")
+                return ModuleScore("官股", "Wantgoo/TWSE官股來源已抓取但未解析出買賣超億元", 0.2, 0, 0.0, "已依 Excel 註解抓取官股新聞來源，但未解析出明確數字；不自動編造，列中性觀察。", raw.source, raw.date, "需確認新聞文字或人工補入", "WARN")
+            return ModuleScore("官股", "未取得", 0.0, 0, 0.0, "官股/八大公股來源未取得，本版不編造數字。", "Wantgoo", market.base_date, "需補抓或人工確認", "WARN")
         direction = 1 if value > 0 else (-1 if value < 0 else 0)
         strength = min(1.0, max(0.3, abs(value)/100)) if direction else 0.2
         weighted = round(direction*strength,2)
-        return ModuleScore("官股", f"{value:.2f}億元", strength, direction, weighted, "已依 Excel 註解抓取/解析官股來源；官股買超代表承接支撐，賣超代表政策資金未護盤。", raw.source if raw else "UDN Money", market.base_date, "視為支撐判斷，不等於追價依據", "OK")
+        return ModuleScore("官股", f"{value:.2f}億元", strength, direction, weighted, "已依 Excel 註解抓取/解析官股來源；官股買超代表承接支撐，賣超代表政策資金未護盤。", raw.source if raw else "Wantgoo", market.base_date, "視為支撐判斷，不等於追價依據", "OK")
     def score_taiex(self, raw, market):
         if market.close is None or market.ma5 is None:
             return self.score_neutral("台股指數", raw, "台股收盤或5MA不足，列中性")
@@ -838,10 +1043,10 @@ class ScoringEngine:
 
     def score_ai(self, raw, market):
         strength = float(market.ai_strength or 0.5)
-        source = "TechNews/產業來源" if raw and raw.status == "OK" else "人工/預設"
+        source = "TechCrunch/IEK/產業來源" if raw and raw.status == "OK" else "人工/預設"
         direction = 1 if strength >= 0.7 else (0 if strength >= 0.4 else -1)
         weighted = round(direction * strength, 2)
-        explanation = f"AI主流強度{strength:.2f}；V1.7 已依 Excel 註解抓取 TechNews/先進封裝來源，若抓不到才保留預設值。"
+        explanation = f"AI主流強度{strength:.2f}；V1.8 已依 Excel 註解抓取 TechCrunch/IEK產業來源，若抓不到才保留預設值。"
         trade = "主線有效，可優先找主流拉回" if direction > 0 else "AI主線中性，避免過度集中" if direction == 0 else "AI題材轉弱，降低權重"
         status = "OK" if raw and raw.status == "OK" else "WARN"
         return ModuleScore("AI產業", f"AI強度{strength:.2f}", strength, direction, weighted, explanation, source, market.base_date, trade, status)
@@ -852,8 +1057,14 @@ class ScoringEngine:
             return ModuleScore("OTC", "TPEX OTC 官方來源頁已抓取；未解析指數數值", 0.3, 0, 0.0, "已依 Excel 註解抓取 TPEX 櫃買指數來源頁；若需自動給分，下一版需解析指數與漲跌。", raw.source, raw.date, "OTC 資金強弱輔助判斷", "OK")
         return self.score_neutral("OTC", raw, "OTC資料未取得，列中性")
     def score_night(self, raw, market):
-        if raw and raw.status == "OK":
-            return ModuleScore("台股夜盤", "TAIFEX 夜盤來源已抓取；本版依 Excel 註解維持中性，不作主判斷", 0.3, 0, 0.0, "已抓取 TAIFEX 夜盤來源頁並寫入 Log；因夜盤具時間敏感性，未完整驗證前不自動給多空分數。", raw.source, raw.date, "作為盤前輔助，不作主要交易開關", "OK")
+        if raw and raw.status == "OK" and isinstance(raw.value, dict) and raw.value.get("night_score") is not None:
+            score = int(raw.value.get("night_score"))
+            direction = 1 if score > 0 else (-1 if score < 0 else 0)
+            strength = 0.4 if direction else 0.2
+            weighted = round(direction * strength, 2)
+            return ModuleScore("台股夜盤", str(raw.value), strength, direction, weighted, "已依附件指定 TAIFEX futContractsDateAh 解析台股夜盤數值。", raw.source, raw.date, "作為盤前輔助判斷", "OK")
+        if raw and raw.status == "WARN":
+            return ModuleScore("台股夜盤", raw.message or "TAIFEX正確網址已抓取但未解析數值", 0.0, 0, 0.0, "已改用附件指定 TAIFEX 夜盤網址，但本次未解析出TX夜盤數值，不可假裝OK。", raw.source, raw.date, "需修正 parser 或人工確認", "WARN")
         return ModuleScore("台股夜盤", "未取得", 0.0, 0, 0.0, "TAIFEX 夜盤來源未取得；屬時間敏感輔助資料，不阻斷主判斷。", "TAIFEX", market.base_date, "盤前需確認夜盤強弱", "WARN")
 class IndicatorEngine:
     def __init__(self, logger: Macro16Logger):
@@ -1078,14 +1289,25 @@ class Macro16Engine:
         for module, symbols in YAHOO_SYMBOL_CANDIDATES.items():
             raw[module] = self.source.fetch_yahoo_chart_candidates(symbols, module)
         raw["美債10Y"] = self.source.fetch_fred_csv_latest("DGS10", "美債10Y")
-        raw["CPI"] = self.source.fetch_bls_release_text("CPI", "https://www.bls.gov/news.release/cpi.nr0.htm")
-        raw["非農"] = self.source.fetch_bls_release_text("非農", "https://www.bls.gov/news.release/empsit.nr0.htm")
-        raw["戰爭/地緣"] = self.source.fetch_geopolitical_news()
+        raw["FED利率政策"] = self.source.fetch_fed_policy()
+        raw["CPI"] = self.source.fetch_bls_cpi()
+        raw["非農"] = self.source.fetch_bls_nfp()
+        raw["戰爭/停火"] = self.source.fetch_reuters_war()
+        raw["外交政策"] = self.source.fetch_bloomberg_policy()
+        raw["戰爭/地緣"] = raw["戰爭/停火"] if raw["戰爭/停火"].status == "OK" else self.source.fetch_geopolitical_news()
+        raw["ISW衝突分析"] = self.source.fetch_isw_conflict()
+        raw["CNN重大新聞"] = self.source.fetch_cnn_major_news()
+        raw["美國總統"] = self.source.fetch_trump_public_news()
+        raw["八大官股"] = self.source.fetch_twse_broker_report()
+        raw["官股整理"] = self.source.fetch_wantgoo_public_bank()
         raw["官股"] = self.source.fetch_gov_news()
         raw["AI產業"] = self.source.fetch_ai_industry_news()
+        raw["IEK產業分析"] = self.source.fetch_iek_industry()
+        raw["排行分析"] = self.source.fetch_ranking_result_db()
         raw["台股夜盤"] = self.source.fetch_taifex_night_snapshot()
         tpex_otc_raw = self.source.fetch_tpex_otc_snapshot()
-        if tpex_otc_raw.status == "OK":
+        raw["櫃買官方來源"] = tpex_otc_raw
+        if tpex_otc_raw.status == "OK" and isinstance(tpex_otc_raw.value, dict) and "close" in tpex_otc_raw.value:
             raw["OTC"] = tpex_otc_raw
         if override and override.event_note:
             raw["戰爭/地緣"] = self.source.build_manual_raw("戰爭/地緣", {"event_note": override.event_note, "major_event": 1}, override.event_note)
