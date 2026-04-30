@@ -41,7 +41,7 @@ except Exception as exc:
     raise RuntimeError("缺少 openpyxl，請先安裝：pip install openpyxl") from exc
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "1.3.0-debugfix"
+VERSION = "1.4.0-data-fallback"
 DEFAULT_TIMEOUT = 15
 
 MODULES = [
@@ -75,6 +75,12 @@ class RawData:
     fetched_at: str
     status: str = "OK"
     message: str = ""
+    query_date: str = ""
+    actual_date: str = ""
+    is_fallback: bool = False
+    fallback_days: int = 0
+    data_status: str = "OK"
+    data_note: str = ""
 
 @dataclass
 class MarketInput:
@@ -184,6 +190,47 @@ class SourceConnector:
     def _today_str(self) -> str:
         return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def _compact_date(self, value: Optional[str]) -> str:
+        if not value:
+            return dt.date.today().strftime("%Y%m%d")
+        return str(value).replace("-", "")
+
+    def _dash_date(self, value: str) -> str:
+        v = self._compact_date(value)
+        return f"{v[:4]}-{v[4:6]}-{v[6:8]}" if len(v) == 8 else v
+
+    def _previous_calendar_day(self, compact_date: str) -> str:
+        d = dt.datetime.strptime(self._compact_date(compact_date), "%Y%m%d").date()
+        return (d - dt.timedelta(days=1)).strftime("%Y%m%d")
+
+    def _twse_rows(self, data: Dict[str, Any]) -> List[Any]:
+        rows = data.get("data", []) or []
+        if not rows and data.get("tables"):
+            for table in data.get("tables", []):
+                rows.extend(table.get("data", []) or [])
+        return rows
+
+    def _official_no_data(self, source_name: str, query_date: str, try_date: str, url: str, data: Optional[Dict[str, Any]] = None):
+        stat = ""
+        try:
+            stat = str(data.get("stat", "")) if isinstance(data, dict) else ""
+        except Exception:
+            stat = ""
+        self.logger.warning(f"OFFICIAL_NOT_UPDATED source={source_name} query_date={query_date} try_date={try_date} stat={stat} url={url}")
+
+    def _fallback_note(self, query_date: str, actual_date: str, source_name: str) -> Tuple[bool, int, str]:
+        q = self._compact_date(query_date)
+        a = self._compact_date(actual_date)
+        is_fb = q != a
+        if not is_fb:
+            return False, 0, ""
+        qd = dt.datetime.strptime(q, "%Y%m%d").date()
+        ad = dt.datetime.strptime(a, "%Y%m%d").date()
+        days = max(0, (qd - ad).days)
+        note = f"{source_name} 查詢日 {q} 官網尚未公布/無資料，已使用最近可用資料日 {a}"
+        self.logger.info(f"FALLBACK_USED source={source_name} query_date={q} actual_date={a} fallback_days={days}")
+        return True, days, note
+
     def fetch_yahoo_chart(self, symbol: str, module: str, range_days: str = "10d") -> RawData:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range_days}&interval=1d"
         try:
@@ -226,131 +273,155 @@ class SourceConnector:
             last_fail = data
         return last_fail or RawData(module, None, "", "Yahoo Finance", ",".join(symbols), self._today_str(), "FAIL", "所有Yahoo候選代碼失敗")
 
-    def fetch_twse_taiex_history(self, base_date: Optional[str] = None) -> RawData:
-        if not base_date:
-            base_date = dt.date.today().strftime("%Y%m%d")
-        date_param = base_date.replace("-", "")
-        url = f"https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?date={date_param}&response=json"
-        try:
-            data = self.client.get_json(url)
-            rows = data.get("data", [])
-            if not rows:
-                raise ValueError("TWSE MI_5MINS_HIST 無資料")
-            parsed = []
-            for row in rows:
-                try:
-                    roc_date = str(row[0])
-                    parts = roc_date.split("/")
-                    year = int(parts[0]) + 1911 if int(parts[0]) < 1911 else int(parts[0])
-                    date_str = f"{year:04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
-                    open_v = self._to_float(row[1])
-                    high_v = self._to_float(row[2])
-                    low_v = self._to_float(row[3])
-                    close_v = self._to_float(row[4])
-                    parsed.append({"date": date_str, "open": open_v, "high": high_v, "low": low_v, "close": close_v})
-                except Exception:
-                    continue
-            if not parsed:
-                raise ValueError("TWSE歷史資料解析失敗")
-            last = parsed[-1]
-            value = {"rows": parsed, "last": last}
-            return RawData("台股指數", value, last["date"], "TWSE MI_5MINS_HIST", url, self._today_str())
-        except Exception as exc:
-            self.logger.warning(f"TWSE加權指數抓取失敗: {exc}")
-            return RawData("台股指數", None, "", "TWSE MI_5MINS_HIST", url, self._today_str(), "FAIL", str(exc))
-
-    def fetch_twse_turnover_month(self, base_date: Optional[str] = None) -> RawData:
-        """抓取TWSE成交值（月表），V1.3修正：多端點fallback，避免舊端點404。"""
-        if not base_date:
-            base_date = dt.date.today().strftime("%Y%m%d")
-        target = base_date.replace("-", "")
-        month_param = target[:6] + "01"
-        candidates = [
-            f"https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date={month_param}&response=json",
-            f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={month_param}",
-            f"https://www.twse.com.tw/rwd/zh/TAIEX/FMTQIK?date={month_param}&response=json",
-        ]
+    def fetch_twse_taiex_history(self, base_date: Optional[str] = None, max_back_days: int = 15) -> RawData:
+        query_date = self._compact_date(base_date)
+        try_date = query_date
         last_error = ""
-        for url in candidates:
+        for fallback_days in range(max_back_days + 1):
+            url = f"https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?date={try_date}&response=json"
             try:
                 data = self.client.get_json(url)
                 rows = data.get("data", []) or []
-                if not rows and data.get("tables"):
-                    for table in data.get("tables", []):
-                        rows.extend(table.get("data", []))
+                if not rows:
+                    self._official_no_data("TWSE_TAIEX", query_date, try_date, url, data)
+                    try_date = self._previous_calendar_day(try_date)
+                    continue
                 parsed = []
                 for row in rows:
                     try:
-                        roc_date = str(row[0]).strip()
+                        roc_date = str(row[0])
                         parts = roc_date.split("/")
                         year = int(parts[0]) + 1911 if int(parts[0]) < 1911 else int(parts[0])
                         date_str = f"{year:04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
                         compact = date_str.replace("-", "")
-                        if compact > target:
+                        if compact > query_date:
                             continue
-                        amount = self._to_float(row[2])
-                        parsed.append({"date": date_str, "turnover_100m": amount / 100000000})
-                    except Exception as row_exc:
-                        self.logger.debug(f"FMTQIK row skipped row={row}; error={row_exc}")
+                        parsed.append({
+                            "date": date_str,
+                            "open": self._to_float(row[1]),
+                            "high": self._to_float(row[2]),
+                            "low": self._to_float(row[3]),
+                            "close": self._to_float(row[4]),
+                        })
+                    except Exception:
                         continue
                 if not parsed:
-                    raise ValueError("TWSE成交值資料解析失敗或目標日期無資料")
+                    self._official_no_data("TWSE_TAIEX", query_date, try_date, url, data)
+                    try_date = self._previous_calendar_day(try_date)
+                    continue
                 last = parsed[-1]
-                self.logger.info(f"TWSE成交值取得成功 source={url}, date={last['date']}, turnover_100m={last['turnover_100m']:.2f}")
-                return RawData("成交量", {"rows": parsed, "last": last}, last["date"], "TWSE FMTQIK", url, self._today_str())
+                actual = last["date"].replace("-", "")
+                is_fb, fb_days, note = self._fallback_note(query_date, actual, "TWSE_TAIEX")
+                value = {"rows": parsed, "last": last}
+                return RawData("台股指數", value, last["date"], "TWSE MI_5MINS_HIST", url, self._today_str(),
+                               "OK", note, query_date, actual, is_fb, fb_days, "OK", note)
             except Exception as exc:
                 last_error = str(exc)
-                self.logger.warning(f"TWSE成交值來源失敗 {url}: {exc}")
-                continue
-        return RawData("成交量", None, "", "TWSE FMTQIK", candidates[0], self._today_str(), "FAIL", last_error or "所有成交值來源失敗")
+                self.logger.warning(f"TWSE加權指數來源失敗 try_date={try_date} url={url}: {exc}")
+                try_date = self._previous_calendar_day(try_date)
+        return RawData("台股指數", None, "", "TWSE MI_5MINS_HIST", "", self._today_str(),
+                       "FAIL", last_error or "最近可用台股指數資料未取得", query_date, "", True, max_back_days, "DATA_MISSING", last_error)
 
-    def fetch_foreign_investor(self, base_date: Optional[str] = None) -> RawData:
-        """抓取外資買賣超，V1.3修正：使用實際市場基準日、多端點、表格語意解析。"""
-        if not base_date:
-            base_date = dt.date.today().strftime("%Y%m%d")
-        date_param = base_date.replace("-", "")
-        candidates = [
-            f"https://www.twse.com.tw/rwd/zh/fund/BFI82U?dayDate={date_param}&type=day&response=json",
-            f"https://www.twse.com.tw/fund/BFI82U?response=json&dayDate={date_param}&type=day",
-            f"https://www.twse.com.tw/rwd/zh/fund/TWT38U?date={date_param}&response=json",
-            f"https://www.twse.com.tw/fund/TWT38U?response=json&date={date_param}",
-        ]
+    def fetch_twse_turnover_month(self, base_date: Optional[str] = None, max_back_days: int = 15) -> RawData:
+        """抓取TWSE成交值。V1.4：指定日期無資料時，自動往前找最近有效交易日。"""
+        query_date = self._compact_date(base_date)
+        try_date = query_date
         last_error = ""
-        for url in candidates:
-            try:
-                data = self.client.get_json(url)
-                rows = data.get("data", []) or []
-                if not rows and data.get("tables"):
-                    for table in data.get("tables", []):
-                        rows.extend(table.get("data", []))
-                for row in rows:
-                    row_text = " ".join([str(x) for x in row])
-                    if ("外資" in row_text) or ("外陸資" in row_text):
-                        vals = []
-                        for cell in row:
-                            try:
-                                v = self._to_float(cell)
-                                if not math.isnan(v):
-                                    vals.append(v)
-                            except Exception:
-                                pass
-                        if vals:
-                            net_100m = vals[-1] / 100000000
-                            self.logger.info(f"外資取得成功 source={url}, net_100m={net_100m:.2f}, row={row_text[:160]}")
-                            return RawData("外資", {"net_100m": net_100m, "raw_hint": row_text[:500]}, date_param, "TWSE三大法人", url, self._today_str())
-                text = json.dumps(data, ensure_ascii=False)
-                nums = [self._to_float(x) for x in re.findall(r"-?\d[\d,]*\.?\d*", text)]
-                nums = [x for x in nums if abs(x) > 1000000]
-                if nums:
-                    net_100m = nums[-1] / 100000000
-                    self.logger.warning(f"外資語意列未找到，使用數值fallback source={url}, net_100m={net_100m:.2f}")
-                    return RawData("外資", {"net_100m": net_100m, "raw_hint": text[:500]}, date_param, "TWSE三大法人-fallback", url, self._today_str(), "WARN", "使用fallback解析")
-                raise ValueError("外資表格無可用資料")
-            except Exception as exc:
-                last_error = str(exc)
-                self.logger.warning(f"外資來源失敗 {url}: {exc}")
-                continue
-        return RawData("外資", None, "", "TWSE三大法人", candidates[0], self._today_str(), "FAIL", last_error or "外資資料未取得")
+        for fallback_days in range(max_back_days + 1):
+            month_param = try_date[:6] + "01"
+            candidates = [
+                f"https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date={month_param}&response=json",
+                f"https://www.twse.com.tw/exchangeReport/FMTQIK?response=json&date={month_param}",
+                f"https://www.twse.com.tw/rwd/zh/TAIEX/FMTQIK?date={month_param}&response=json",
+            ]
+            for url in candidates:
+                try:
+                    data = self.client.get_json(url)
+                    rows = self._twse_rows(data)
+                    parsed = []
+                    for row in rows:
+                        try:
+                            roc_date = str(row[0]).strip()
+                            parts = roc_date.split("/")
+                            year = int(parts[0]) + 1911 if int(parts[0]) < 1911 else int(parts[0])
+                            date_str = f"{year:04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+                            compact = date_str.replace("-", "")
+                            if compact > query_date or compact > try_date:
+                                continue
+                            amount = self._to_float(row[2])
+                            if not math.isnan(amount):
+                                parsed.append({"date": date_str, "turnover_100m": amount / 100000000})
+                        except Exception as row_exc:
+                            self.logger.debug(f"FMTQIK row skipped row={row}; error={row_exc}")
+                    if not parsed:
+                        self._official_no_data("TWSE_FMTQIK", query_date, try_date, url, data)
+                        continue
+                    last = parsed[-1]
+                    actual = last["date"].replace("-", "")
+                    is_fb, fb_days, note = self._fallback_note(query_date, actual, "TWSE_FMTQIK")
+                    self.logger.info(f"TWSE成交值取得成功 source={url}, query_date={query_date}, actual_date={actual}, turnover_100m={last['turnover_100m']:.2f}")
+                    return RawData("成交量", {"rows": parsed, "last": last}, last["date"], "TWSE FMTQIK", url, self._today_str(),
+                                   "OK", note, query_date, actual, is_fb, fb_days, "OK", note)
+                except Exception as exc:
+                    last_error = str(exc)
+                    self.logger.warning(f"TWSE成交值來源失敗 try_date={try_date} url={url}: {exc}")
+            try_date = self._previous_calendar_day(try_date)
+        return RawData("成交量", None, "", "TWSE FMTQIK", "", self._today_str(),
+                       "FAIL", last_error or "最近可用成交值資料未取得", query_date, "", True, max_back_days, "DATA_MISSING", last_error)
+
+    def fetch_foreign_investor(self, base_date: Optional[str] = None, max_back_days: int = 15) -> RawData:
+        """抓取外資買賣超。V1.4：先抓指定日期，若官網尚未更新，自動往前找最近有效資料日。"""
+        query_date = self._compact_date(base_date)
+        try_date = query_date
+        last_error = ""
+        for fallback_days in range(max_back_days + 1):
+            candidates = [
+                f"https://www.twse.com.tw/rwd/zh/fund/BFI82U?dayDate={try_date}&type=day&response=json",
+                f"https://www.twse.com.tw/fund/BFI82U?response=json&dayDate={try_date}&type=day",
+                f"https://www.twse.com.tw/rwd/zh/fund/TWT38U?date={try_date}&response=json",
+                f"https://www.twse.com.tw/fund/TWT38U?response=json&date={try_date}",
+            ]
+            for url in candidates:
+                try:
+                    data = self.client.get_json(url)
+                    rows = self._twse_rows(data)
+                    if not rows:
+                        self._official_no_data("TWSE_FOREIGN", query_date, try_date, url, data)
+                        continue
+                    for row in rows:
+                        row_text = " ".join([str(x) for x in row])
+                        if ("外資" in row_text) or ("外陸資" in row_text):
+                            vals = []
+                            for cell in row:
+                                try:
+                                    v = self._to_float(cell)
+                                    if not math.isnan(v):
+                                        vals.append(v)
+                                except Exception:
+                                    pass
+                            if vals:
+                                net_100m = vals[-1] / 100000000
+                                is_fb, fb_days, note = self._fallback_note(query_date, try_date, "TWSE_FOREIGN")
+                                self.logger.info(f"FETCH_OK source=TWSE_FOREIGN query_date={query_date} actual_date={try_date} net_100m={net_100m:.2f} url={url}")
+                                return RawData("外資", {"net_100m": net_100m, "raw_hint": row_text[:500]}, self._dash_date(try_date),
+                                               "TWSE三大法人", url, self._today_str(), "OK", note, query_date, try_date, is_fb, fb_days, "OK", note)
+                    text = json.dumps(data, ensure_ascii=False)
+                    nums = [self._to_float(x) for x in re.findall(r"-?\d[\d,]*\.?\d*", text)]
+                    nums = [x for x in nums if abs(x) > 1000000]
+                    if nums:
+                        net_100m = nums[-1] / 100000000
+                        is_fb, fb_days, note = self._fallback_note(query_date, try_date, "TWSE_FOREIGN")
+                        msg = "使用fallback解析；" + note if note else "使用fallback解析"
+                        self.logger.warning(f"外資語意列未找到，使用數值fallback source={url}, query_date={query_date}, actual_date={try_date}, net_100m={net_100m:.2f}")
+                        return RawData("外資", {"net_100m": net_100m, "raw_hint": text[:500]}, self._dash_date(try_date),
+                                       "TWSE三大法人-fallback", url, self._today_str(), "WARN", msg, query_date, try_date, is_fb, fb_days, "OK", msg)
+                    self._official_no_data("TWSE_FOREIGN", query_date, try_date, url, data)
+                except Exception as exc:
+                    last_error = str(exc)
+                    self.logger.warning(f"外資來源失敗 try_date={try_date} url={url}: {exc}")
+            try_date = self._previous_calendar_day(try_date)
+        return RawData("外資", None, "", "TWSE三大法人", "", self._today_str(),
+                       "FAIL", last_error or "最近可用外資資料未取得", query_date, "", True, max_back_days, "DATA_MISSING", last_error)
 
     def fetch_fred_csv_latest(self, series_id: str, module: str) -> RawData:
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
@@ -378,6 +449,18 @@ class DataProcessor:
     def __init__(self, logger: Macro16Logger):
         self.logger = logger
 
+    def _source_note(self, raw: RawData) -> str:
+        parts = [raw.url]
+        if raw.query_date:
+            parts.append(f"query_date={raw.query_date}")
+        if raw.actual_date:
+            parts.append(f"actual_date={raw.actual_date}")
+        if raw.is_fallback:
+            parts.append(f"fallback_days={raw.fallback_days}")
+        if raw.data_note:
+            parts.append(raw.data_note)
+        return " | ".join([p for p in parts if p])
+
     def build_market_input(self, raw: Dict[str, RawData], base_date: str = "") -> MarketInput:
         market = MarketInput()
         taiex = raw.get("台股指數")
@@ -395,7 +478,7 @@ class DataProcessor:
                 market.prev_low = rows[-2].get("low")
             if len(rows) >= 5:
                 market.ma5 = round(sum([r["close"] for r in rows[-5:]]) / 5, 2)
-            market.source_1 = taiex.url
+            market.source_1 = self._source_note(taiex)
         else:
             market.base_date = base_date or dt.date.today().isoformat()
             self.logger.warning("台股指數未取得，市場輸入將保留缺值")
@@ -405,10 +488,10 @@ class DataProcessor:
             market.turnover_100m = round(last_t.get("turnover_100m", 0), 2)
             if len(trows) >= 5:
                 market.avg_turnover_5d_100m = round(sum([r["turnover_100m"] for r in trows[-5:]]) / 5, 2)
-            market.source_2 = turnover.url
+            market.source_2 = self._source_note(turnover)
         if foreign and foreign.status == "OK" and foreign.value:
             market.foreign_net_100m = round(foreign.value.get("net_100m", 0), 2)
-            market.source_3 = foreign.url
+            market.source_3 = self._source_note(foreign)
         market.gov_net_100m = None
         market.ai_strength = 0.5
         market.major_event = 0
@@ -636,6 +719,7 @@ class ExcelWriter:
         self._write_macro_modules(wb, scores)
         self._write_technical(wb, tech)
         self._write_audit(wb, market, scores, tech, summary, logs)
+        self._write_data_source_status(wb, market)
         self._format_all(wb)
         wb.save(out_path)
         self.logger.info(f"Excel已輸出：{out_path}")
@@ -699,6 +783,14 @@ class ExcelWriter:
         for msg in logs[-30:]:
             i += 1
             ws.cell(i,10,msg[:180])
+
+    def _write_data_source_status(self, wb, market: MarketInput):
+        ws = self._sheet(wb, "資料來源狀態")
+        ws.append(["欄位", "來源與日期狀態"])
+        ws.append(["台股指數", market.source_1])
+        ws.append(["成交量", market.source_2])
+        ws.append(["外資", market.source_3])
+        ws.append(["說明", "query_date=使用者查詢日；actual_date=實際資料日；fallback_days=往前回退天數。若今日官網尚未公布，系統使用最近有效交易日資料，但會完整標示。"])
 
     def _format_all(self, wb):
         for ws in wb.worksheets:
@@ -776,7 +868,7 @@ class Macro16Engine:
         # V1.3：完整記錄每個資料源狀態，方便後續增修與問題追蹤
         for k, v in raw.items():
             try:
-                self.logger.debug(f"RAW_STATUS {k}: status={v.status}, date={v.date}, source={v.source}, url={v.url}, message={v.message}")
+                self.logger.debug(f"RAW_STATUS {k}: status={v.status}, query_date={v.query_date}, actual_date={v.actual_date or v.date}, is_fallback={v.is_fallback}, fallback_days={v.fallback_days}, data_status={v.data_status}, source={v.source}, url={v.url}, message={v.message}")
             except Exception:
                 pass
         market = self.processor.build_market_input(raw, base_date or "")
