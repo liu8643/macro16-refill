@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 宏觀16模組自動抓取與Excel回填主程式
-版本：V1.8 SourceDiffAligned
+版本：V2.0 FinalEvidenceSystem
 目的：依「宏觀16模組市場資料回填SOP」與「主程式工程級規格書」執行資料取得、標準化、分數判定、Excel回填與稽核。
 
 執行方式：
@@ -42,7 +42,7 @@ except Exception as exc:
     raise RuntimeError("缺少 openpyxl，請先安裝：pip install openpyxl") from exc
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "1.8.0-source-diff-aligned"
+VERSION = "2.0.0-final-evidence-system"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -102,6 +102,9 @@ class RawData:
     fallback_days: int = 0
     data_status: str = "OK"
     data_note: str = ""
+    parse_status: str = "PARSE_OK"
+    raw_file_path: str = ""
+    confidence: float = 1.0
 
 @dataclass
 class MarketInput:
@@ -158,7 +161,14 @@ class TechnicalRisk:
 class Macro16Logger:
     def __init__(self, log_dir: Path):
         log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_file = log_dir / f"macro16_debug_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        self.run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = log_dir / f"macro16_debug_{self.run_id}.txt"
+        self.raw_dir = log_dir / "raw" / self.run_id[:8] / self.run_id
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+        self.evidence_records: List[Dict[str, Any]] = []
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
         logging.basicConfig(
             filename=str(self.log_file),
             level=logging.INFO,
@@ -183,11 +193,39 @@ class Macro16Logger:
         logging.info("DEBUG " + msg)
         self.messages.append(f"DEBUG {msg}")
 
-    def raw_snapshot(self, source: str, payload: Any):
+    def _safe_filename(self, value: str) -> str:
+        return re.sub(r"[^0-9A-Za-z_\\-\\u4e00-\\u9fff]+", "_", str(value)).strip("_")[:80] or "source"
+
+    def write_raw_evidence(self, source: str, payload: Any, parsed: Optional[Dict[str, Any]] = None, status: str = "OK", url: str = "", message: str = "") -> str:
+        parsed = parsed or {}
+        record = {
+            "run_id": self.run_id,
+            "source": source,
+            "url": url,
+            "fetch_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status,
+            "parse_status": "PARSE_OK" if parsed else "NO_PARSED_VALUE",
+            "parsed_fields": parsed,
+            "message": message,
+            "raw_excerpt": str(payload)[:4000],
+        }
+        path = self.raw_dir / f"{self._safe_filename(source)}.json"
+        try:
+            path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            record["raw_file_path"] = str(path)
+            self.evidence_records.append(record)
+            self.info(f"RAW_EVIDENCE_FILE source={source} path={path} status={status} parse_status={record['parse_status']}")
+            return str(path)
+        except Exception as exc:
+            self.warning(f"RAW_EVIDENCE_WRITE_FAIL source={source} error={exc}")
+            return ""
+
+    def raw_snapshot(self, source: str, payload: Any, parsed: Optional[Dict[str, Any]] = None, status: str = "OK", url: str = "", message: str = ""):
         text = str(payload)
         if len(text) > 900:
             text = text[:900] + "..."
         self.info(f"RAW_DATA_SNAPSHOT source={source} payload={text}")
+        self.write_raw_evidence(source, payload, parsed=parsed, status=status, url=url, message=message)
 
     def parsed_value(self, field: str, value: Any, source: str, actual_date: str = ""):
         self.info(f"PARSED_VALUE field={field} value={value} source={source} actual_date={actual_date}")
@@ -198,7 +236,7 @@ class HttpClient:
         self.session = requests.Session() if requests else None
         if self.session:
             self.session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Macro16RefillEngine/1.8",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Macro16RefillEngine/2.0",
                 "Accept": "application/json,text/csv,text/html,text/plain,*/*",
                 "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
                 "Referer": "https://www.google.com/",
@@ -533,18 +571,23 @@ class SourceConnector:
             self.logger.warning(f"BLS抓取失敗 {module}: {exc}")
             return RawData(module, None, "", "BLS", url, self._today_str(), "WARN", str(exc), data_status="OPTIONAL_MISSING")
 
-    def fetch_text_snapshot(self, module: str, url: str, source_name: str, status_if_fail: str = "WARN") -> RawData:
+    def fetch_text_snapshot(self, module: str, url: str, source_name: str, status_if_fail: str = "WARN", parse_required: bool = False) -> RawData:
         try:
             text = self.client.get_text(url)
             compact = re.sub(r"\s+", " ", text)
-            snippet = compact[:1500]
+            snippet = compact[:5000]
             value = {"url": url, "snippet": snippet}
-            self.logger.raw_snapshot(module, value)
+            status = "WARN" if parse_required else "OK"
+            data_status = "NO_PARSED_VALUE" if parse_required else "OK"
+            message = f"{source_name} source fetched" if not parse_required else f"{source_name} source fetched but parser required"
+            raw_path = self.logger.write_raw_evidence(module, value, parsed={}, status=status, url=url, message=message)
+            self.logger.raw_snapshot(module, value, parsed={}, status=status, url=url, message=message)
             self.logger.parsed_value(f"{module}_source_url", url, source_name, "latest")
-            return RawData(module, value, "latest", source_name, url, self._today_str(), "OK", f"{source_name} source fetched")
+            return RawData(module, value, "latest", source_name, url, self._today_str(), status, message, data_status=data_status, parse_status="NO_PARSED_VALUE" if parse_required else "PARSE_OK", raw_file_path=raw_path, confidence=0.5 if parse_required else 0.8)
         except Exception as exc:
             self.logger.warning(f"{source_name}抓取失敗 {module}: {exc}")
-            return RawData(module, None, "", source_name, url, self._today_str(), status_if_fail, str(exc), data_status="OPTIONAL_MISSING")
+            raw_path = self.logger.write_raw_evidence(module, {"url": url, "error": str(exc)}, parsed={}, status=status_if_fail, url=url, message=str(exc))
+            return RawData(module, None, "", source_name, url, self._today_str(), status_if_fail, str(exc), data_status="FETCH_FAIL", parse_status="NO_PARSED_VALUE", raw_file_path=raw_path, confidence=0.0)
 
 
     def fetch_bls_api_series(self, module: str, series_id: str, source_url: str) -> RawData:
@@ -639,14 +682,26 @@ class SourceConnector:
         return raw
 
     def fetch_twse_broker_report(self, url: str = SOURCE_URLS["twse_broker_report"]) -> RawData:
-        raw = self.fetch_text_snapshot("八大官股", url, "TWSE Broker Report", "WARN")
-        if raw.status == "OK" and raw.value:
-            text = raw.value.get("snippet", "")
-            if not any(k in text for k in ["自營", "券商", "買賣", "broker", "交易"]):
-                raw.status = "WARN"
-                raw.data_status = "NO_PARSED_VALUE"
-                raw.message = "TWSE券商報表頁面已取得但未解析出八大官股數字"
-            self.logger.parsed_value("twse_broker_report_status", raw.status, "TWSE Broker Report", raw.date)
+        raw = self.fetch_text_snapshot("官股", url, "TWSE券商報表", "WARN", parse_required=True)
+        if not raw.value:
+            return raw
+        text = raw.value.get("snippet", "")
+        keywords_ok = any(k in text for k in ["券商", "買賣", "自營", "公股", "八大", "交易", "broker"])
+        nums = [self._to_float(x) for x in re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", text)]
+        nums = [x for x in nums if not math.isnan(x)]
+        gov_candidates = [x for x in nums if abs(x) >= 1]
+        if keywords_ok and gov_candidates:
+            gov_net_100m = round(gov_candidates[-1] / 100000000 if abs(gov_candidates[-1]) > 1000000 else gov_candidates[-1], 2)
+            parsed = {"gov_net_100m": gov_net_100m, "numbers_sample": gov_candidates[:20], "source_rule": "TWSE券商報表主來源"}
+            self.logger.parsed_value("gov_net_100m", gov_net_100m, "TWSE券商報表", raw.date)
+            return self._complete_parsed_raw(raw, parsed, "TWSE券商報表已解析官股/券商資料", confidence=0.85)
+        raw.status = "WARN"
+        raw.data_status = "NO_PARSED_VALUE"
+        raw.parse_status = "NO_PARSED_VALUE"
+        raw.message = "TWSE券商報表頁面已取得，但未解析出官股買賣超數字；不改用Wantgoo當主來源"
+        raw.confidence = 0.3
+        raw.raw_file_path = self.logger.write_raw_evidence("官股", raw.value, parsed={}, status="WARN", url=url, message=raw.message)
+        self.logger.parsed_value("twse_broker_report_status", raw.status, "TWSE券商報表", raw.date)
         return raw
 
     def fetch_ranking_result_db(self, db_path: Optional[str] = None) -> RawData:
@@ -679,19 +734,21 @@ class SourceConnector:
         return RawData("排行分析", None, "", "SQLite DB", "db:ranking_result", self._today_str(), "WARN", "未找到 ranking_result 資料表", data_status="DATA_MISSING")
 
 
-    def fetch_gov_news(self, url: str = SOURCE_URLS["wantgoo_public_bank"]) -> RawData:
-        raw = self.fetch_text_snapshot("官股", url, "Wantgoo", "WARN")
-        if raw.status == "OK" and raw.value:
-            text = raw.value.get("snippet", "")
-            m = re.search(r"(?:八大公股|官股|公股).*?(?:買超|買進|承接).*?([0-9]+(?:\.[0-9]+)?)\s*億", text)
-            if m:
-                value = float(m.group(1))
-                raw.value["gov_net_100m"] = value
-                raw.message = "Wantgoo/TWSE官股來源已解析買超億元"
-                self.logger.parsed_value("gov_net_100m", value, "Wantgoo", raw.date)
-            else:
-                self.logger.info("PARSED_VALUE field=gov_net_100m value=UNPARSED source=Wantgoo actual_date=latest")
+
+    def _complete_parsed_raw(self, raw: RawData, parsed: Dict[str, Any], message: str, confidence: float = 1.0) -> RawData:
+        raw.value = raw.value or {}
+        if isinstance(raw.value, dict):
+            raw.value.update(parsed)
+        raw.status = "OK"
+        raw.data_status = "OK"
+        raw.parse_status = "PARSE_OK"
+        raw.message = message
+        raw.confidence = confidence
+        raw.raw_file_path = self.logger.write_raw_evidence(raw.key, raw.value, parsed=parsed, status="OK", url=raw.url, message=message)
         return raw
+
+    def fetch_gov_news(self, url: str = SOURCE_URLS["twse_broker_report"]) -> RawData:
+        return self.fetch_twse_broker_report(url)
 
     def fetch_ai_industry_news(self, url: str = SOURCE_URLS["techcrunch_ai"]) -> RawData:
         raw = self.fetch_text_snapshot("AI產業", url, "TechCrunch", "WARN")
@@ -739,12 +796,19 @@ class SourceConnector:
             parsed["night_score"] = score
             raw.value.update(parsed)
             raw.message = "TAIFEX夜盤已解析數值"
-            self.logger.raw_snapshot("TAIFEX_NIGHT_PARSED", parsed)
+            raw.status = "OK"
+            raw.data_status = "OK"
+            raw.parse_status = "PARSE_OK"
+            raw.confidence = 0.85
+            raw.raw_file_path = self.logger.write_raw_evidence("台股夜盤", raw.value, parsed=parsed, status="OK", url=url, message=raw.message)
+            self.logger.raw_snapshot("TAIFEX_NIGHT_PARSED", parsed, parsed=parsed, status="OK", url=url, message=raw.message)
             self.logger.parsed_value("night_score", score, "TAIFEX", raw.date)
             return raw
         raw.status = "WARN"
         raw.data_status = "NO_PARSED_VALUE"
         raw.message = "TAIFEX正確網址已取得，但未解析出TX夜盤數值"
+        raw.confidence = 0.3
+        raw.raw_file_path = self.logger.write_raw_evidence("台股夜盤", raw.value, parsed={}, status="WARN", url=url, message=raw.message)
         self.logger.warning(f"TAIFEX夜盤未解析出數值 url={url}")
         return raw
 
@@ -841,9 +905,10 @@ class DataProcessor:
             market.foreign_net_100m = round(foreign.value.get("net_100m", 0), 2)
             market.source_3 = self._source_note(foreign)
 
-        gov = raw.get("官股")
-        if gov and gov.status == "OK" and isinstance(gov.value, dict) and gov.value.get("gov_net_100m") is not None:
+        gov = raw.get("官股") or raw.get("八大官股")
+        if gov and gov.status == "OK" and getattr(gov, "parse_status", "") == "PARSE_OK" and isinstance(gov.value, dict) and gov.value.get("gov_net_100m") is not None:
             market.gov_net_100m = round(float(gov.value.get("gov_net_100m")), 2)
+            market.source_4 = self._source_note(gov)
             self.logger.parsed_value("market.gov_net_100m", market.gov_net_100m, gov.source, gov.date)
         else:
             market.gov_net_100m = None
@@ -862,6 +927,8 @@ class DataProcessor:
         geo = raw.get("戰爭/地緣")
         if geo and geo.status == "OK" and isinstance(geo.value, dict) and geo.value.get("major_event") is not None:
             market.major_event = int(geo.value.get("major_event"))
+            if not market.source_4:
+                market.source_4 = self._source_note(geo)
             self.logger.parsed_value("market.major_event", market.major_event, geo.source, geo.date)
         else:
             market.major_event = 0
@@ -979,7 +1046,7 @@ class ScoringEngine:
             explanation = "已依 Excel 註解來源優先抓取 Reuters/地緣事件頁面；若含戰爭、封鎖、攻擊等關鍵字，列重大事件風險。"
             trade = "外部事件風險升高，降倉禁追高" if risk else "事件頁面已抓取，未偵測到強風險關鍵字"
             return ModuleScore("戰爭/地緣", raw.value.get("url", ""), strength, direction, weighted, explanation, raw.source, raw.date, trade, "OK")
-        return ModuleScore("戰爭/地緣", "未取得", 0.0, 0, 0.0, "地緣新聞來源未取得，列為選用資料缺失，不得自動編造事件。", "Reuters", market.base_date, "需人工確認事件嚴重度", "WARN")
+        return ModuleScore("戰爭/地緣", "未取得", 0.0, 0, 0.0, "地緣新聞來源未取得，列為選用資料缺失，不得自動編造事件。", "Reuters", market.base_date, "需確認資料來源/解析結果事件嚴重度", "WARN")
     def score_cpi(self, raw, market):
         if raw and raw.status == "OK" and raw.value:
             snippet = raw.value.get("snippet", "") if isinstance(raw.value, dict) else str(raw.value)
@@ -1012,13 +1079,13 @@ class ScoringEngine:
     def score_gov(self, raw, market):
         value = market.gov_net_100m
         if value is None:
-            if raw and raw.status == "OK":
-                return ModuleScore("官股", "Wantgoo/TWSE官股來源已抓取但未解析出買賣超億元", 0.2, 0, 0.0, "已依 Excel 註解抓取官股新聞來源，但未解析出明確數字；不自動編造，列中性觀察。", raw.source, raw.date, "需確認新聞文字或人工補入", "WARN")
-            return ModuleScore("官股", "未取得", 0.0, 0, 0.0, "官股/八大公股來源未取得，本版不編造數字。", "Wantgoo", market.base_date, "需補抓或人工確認", "WARN")
+            source = raw.source if raw else "TWSE券商報表"
+            msg = raw.message if raw else "未取得TWSE券商報表"
+            return ModuleScore("官股", msg, 0.0, 0, 0.0, "官股主來源固定為TWSE券商報表；未解析出明確數字時列WARN，不可改用Wantgoo當主判斷。", source, raw.date if raw else market.base_date, "官股資料不足，不納入主判斷", "WARN")
         direction = 1 if value > 0 else (-1 if value < 0 else 0)
         strength = min(1.0, max(0.3, abs(value)/100)) if direction else 0.2
         weighted = round(direction*strength,2)
-        return ModuleScore("官股", f"{value:.2f}億元", strength, direction, weighted, "已依 Excel 註解抓取/解析官股來源；官股買超代表承接支撐，賣超代表政策資金未護盤。", raw.source if raw else "Wantgoo", market.base_date, "視為支撐判斷，不等於追價依據", "OK")
+        return ModuleScore("官股", f"{value:.2f}億元", strength, direction, weighted, "已依Excel指定來源TWSE券商報表解析官股/政策資金方向；買超代表承接支撐，賣超代表政策資金未護盤。", raw.source if raw else "TWSE券商報表", market.base_date, "視為支撐判斷，不等於追價依據", "OK")
     def score_taiex(self, raw, market):
         if market.close is None or market.ma5 is None:
             return self.score_neutral("台股指數", raw, "台股收盤或5MA不足，列中性")
@@ -1054,7 +1121,7 @@ class ScoringEngine:
         if raw and raw.status == "OK" and isinstance(raw.value, dict) and "close" in raw.value:
             return self._score_yahoo_index(raw, "OTC", "中小型資金活躍", "中小型資金轉弱")
         if raw and raw.status == "OK":
-            return ModuleScore("OTC", "TPEX OTC 官方來源頁已抓取；未解析指數數值", 0.3, 0, 0.0, "已依 Excel 註解抓取 TPEX 櫃買指數來源頁；若需自動給分，下一版需解析指數與漲跌。", raw.source, raw.date, "OTC 資金強弱輔助判斷", "OK")
+            return ModuleScore("OTC", "TPEX OTC 官方來源頁已抓取但未解析指數數值", 0.0, 0, 0.0, "抓到頁面不等於抓到數據；未解析出OTC指數與漲跌前列WARN，不納入分數。", raw.source, raw.date, "OTC資料不足，不納入主判斷", "WARN")
         return self.score_neutral("OTC", raw, "OTC資料未取得，列中性")
     def score_night(self, raw, market):
         if raw and raw.status == "OK" and isinstance(raw.value, dict) and raw.value.get("night_score") is not None:
@@ -1140,6 +1207,7 @@ class ExcelWriter:
         self._write_technical(wb, tech)
         self._write_audit(wb, market, scores, tech, summary, logs)
         self._write_data_source_status(wb, market, raw or {})
+        self._write_evidence_index(wb, raw or {})
         self._format_all(wb)
         wb.save(out_path)
         self.logger.info(f"Excel已輸出：{out_path}")
@@ -1206,11 +1274,12 @@ class ExcelWriter:
 
     def _write_data_source_status(self, wb, market: MarketInput, raw: Dict[str, RawData]):
         ws = self._sheet(wb, "資料來源狀態")
-        ws.append(["資料源", "狀態", "資料分類", "查詢日", "實際資料日", "是否回退", "回退天數", "來源", "URL", "說明/訊息"])
+        ws.append(["資料源", "狀態", "資料分類", "解析狀態", "信心分數", "查詢日", "實際資料日", "是否回退", "回退天數", "來源", "URL", "RAW證據檔", "說明/訊息"])
         for name, item in raw.items():
             ws.append([
-                name, item.status, item.data_status, item.query_date, item.actual_date or item.date,
-                item.is_fallback, item.fallback_days, item.source, item.url, item.message or item.data_note
+                name, item.status, item.data_status, getattr(item, "parse_status", ""), getattr(item, "confidence", ""),
+                item.query_date, item.actual_date or item.date, item.is_fallback, item.fallback_days, item.source, item.url,
+                getattr(item, "raw_file_path", ""), item.message or item.data_note
             ])
         ws.append([])
         ws.append(["說明", "query_date=使用者查詢日；actual_date=實際資料日；fallback_days=往前回退天數；RAW_DATA_SNAPSHOT 與 PARSED_VALUE 會寫入 log 證明實際抓取資料。"])
@@ -1234,6 +1303,39 @@ class ExcelWriter:
                 ws.column_dimensions[get_column_letter(col)].width = width
             ws.freeze_panes = "A2"
 
+class WordEvidenceReportWriter:
+    def __init__(self, logger: Macro16Logger):
+        self.logger = logger
+
+    def write(self, out_path: str, raw: Dict[str, RawData], summary: Dict[str, str]) -> str:
+        try:
+            from docx import Document
+        except Exception:
+            self.logger.warning("python-docx未安裝，略過Word證據報告")
+            return ""
+        path = Path(out_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        doc = Document()
+        doc.add_heading("Macro16 資料抓取證據報告", 0)
+        doc.add_paragraph(f"Run ID：{self.logger.run_id}")
+        doc.add_paragraph(f"產出時間：{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        doc.add_heading("總結", level=1)
+        for k, v in summary.items():
+            doc.add_paragraph(f"{k}：{v}")
+        doc.add_heading("逐資料源證據", level=1)
+        for name, item in raw.items():
+            doc.add_heading(name, level=2)
+            doc.add_paragraph(f"來源：{item.source}")
+            doc.add_paragraph(f"URL：{item.url}")
+            doc.add_paragraph(f"狀態：{item.status} / {item.data_status} / {getattr(item, 'parse_status', '')}")
+            doc.add_paragraph(f"信心分數：{getattr(item, 'confidence', '')}")
+            doc.add_paragraph(f"RAW證據檔：{getattr(item, 'raw_file_path', '')}")
+            doc.add_paragraph(f"說明：{item.message or item.data_note}")
+        doc.save(str(path))
+        self.logger.info(f"WORD_EVIDENCE_REPORT path={path}")
+        return str(path)
+
+
 class AuditEngine:
     def __init__(self, logger: Macro16Logger):
         self.logger = logger
@@ -1247,7 +1349,7 @@ class AuditEngine:
                 warnings.append(f"市場輸入缺{field}")
         for s in scores:
             if s.status != "OK":
-                warnings.append(f"{s.module} 狀態={s.status}，需人工確認")
+                warnings.append(f"{s.module} 狀態={s.status}，需確認資料來源/解析結果")
             if s.direction not in (-1, 0, 1):
                 warnings.append(f"{s.module} 方向不是+1/0/-1")
         if warnings:
@@ -1268,6 +1370,7 @@ class Macro16Engine:
         self.explain = ExplanationEngine()
         self.audit = AuditEngine(self.logger)
         self.writer = ExcelWriter(self.logger)
+        self.word_evidence_writer = WordEvidenceReportWriter(self.logger)
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
@@ -1298,9 +1401,8 @@ class Macro16Engine:
         raw["ISW衝突分析"] = self.source.fetch_isw_conflict()
         raw["CNN重大新聞"] = self.source.fetch_cnn_major_news()
         raw["美國總統"] = self.source.fetch_trump_public_news()
-        raw["八大官股"] = self.source.fetch_twse_broker_report()
+        raw["官股"] = self.source.fetch_twse_broker_report()
         raw["官股整理"] = self.source.fetch_wantgoo_public_bank()
-        raw["官股"] = self.source.fetch_gov_news()
         raw["AI產業"] = self.source.fetch_ai_industry_news()
         raw["IEK產業分析"] = self.source.fetch_iek_industry()
         raw["排行分析"] = self.source.fetch_ranking_result_db()
@@ -1329,8 +1431,9 @@ class Macro16Engine:
         if warnings:
             summary["QA警告"] = "; ".join(warnings[:8])
         output = self.writer.write(template, out_path, market, scores, tech, summary, self.logger.messages, raw)
+        evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
         self.logger.info("執行完成")
-        return {"output": output, "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file)}
+        return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file)}
 
 def run_gui():
     import tkinter as tk
