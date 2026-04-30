@@ -42,7 +42,7 @@ except Exception as exc:
     raise RuntimeError("缺少 openpyxl，請先安裝：pip install openpyxl") from exc
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.0.0-final-evidence-system"
+VERSION = "2.1.0-evidence-index-fix"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -196,20 +196,52 @@ class Macro16Logger:
     def _safe_filename(self, value: str) -> str:
         return re.sub(r"[^0-9A-Za-z_\\-\\u4e00-\\u9fff]+", "_", str(value)).strip("_")[:80] or "source"
 
+    def _infer_parsed_fields(self, payload: Any) -> Dict[str, Any]:
+        """從已解析payload自動產生 parsed_fields，避免 status=OK 但 parse_status=NO_PARSED_VALUE。"""
+        if isinstance(payload, dict):
+            parsed = {}
+            for k, v in payload.items():
+                if k in ("raw", "rows", "snippet"):
+                    continue
+                if isinstance(v, (str, int, float, bool)) or v is None:
+                    parsed[k] = v
+                elif isinstance(v, (list, tuple)) and len(v) <= 10:
+                    parsed[k] = v
+                elif isinstance(v, dict):
+                    parsed[k] = {kk: vv for kk, vv in list(v.items())[:10] if isinstance(vv, (str, int, float, bool)) or vv is None}
+            return parsed
+        return {}
+
     def write_raw_evidence(self, source: str, payload: Any, parsed: Optional[Dict[str, Any]] = None, status: str = "OK", url: str = "", message: str = "") -> str:
+        if parsed is None:
+            parsed = self._infer_parsed_fields(payload)
         parsed = parsed or {}
+        parse_status = "PARSE_OK" if parsed else "NO_PARSED_VALUE"
+        if status == "OK" and parse_status != "PARSE_OK":
+            status = "WARN"
+            message = (message + "；" if message else "") + "已抓到原始資料但尚未形成parsed_fields，避免假OK。"
         record = {
             "run_id": self.run_id,
             "source": source,
             "url": url,
             "fetch_time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "status": status,
-            "parse_status": "PARSE_OK" if parsed else "NO_PARSED_VALUE",
+            "parse_status": parse_status,
             "parsed_fields": parsed,
             "message": message,
             "raw_excerpt": str(payload)[:4000],
         }
-        path = self.raw_dir / f"{self._safe_filename(source)}.json"
+        base = self._safe_filename(source)
+        path = self.raw_dir / f"{base}.json"
+        # 不允許不同來源覆蓋同一個source.json/模組json；若重複則自動加序號。
+        if path.exists():
+            idx = 2
+            while True:
+                candidate = self.raw_dir / f"{base}_{idx}.json"
+                if not candidate.exists():
+                    path = candidate
+                    break
+                idx += 1
         try:
             path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
             record["raw_file_path"] = str(path)
@@ -576,14 +608,23 @@ class SourceConnector:
             text = self.client.get_text(url)
             compact = re.sub(r"\s+", " ", text)
             snippet = compact[:5000]
-            value = {"url": url, "snippet": snippet}
-            status = "WARN" if parse_required else "OK"
-            data_status = "NO_PARSED_VALUE" if parse_required else "OK"
-            message = f"{source_name} source fetched" if not parse_required else f"{source_name} source fetched but parser required"
-            raw_path = self.logger.write_raw_evidence(module, value, parsed={}, status=status, url=url, message=message)
-            self.logger.raw_snapshot(module, value, parsed={}, status=status, url=url, message=message)
+            value = {"url": url, "snippet": snippet, "snippet_length": len(snippet)}
+            if parse_required:
+                status = "WARN"
+                data_status = "NO_PARSED_VALUE"
+                parsed = {}
+                parse_status = "NO_PARSED_VALUE"
+                message = f"{source_name} source fetched but parser required"
+            else:
+                status = "OK"
+                data_status = "OK"
+                parsed = {"source_url": url, "snippet_length": len(snippet)}
+                parse_status = "PARSE_OK"
+                message = f"{source_name} source fetched"
+            raw_path = self.logger.write_raw_evidence(module, value, parsed=parsed, status=status, url=url, message=message)
+            self.logger.raw_snapshot(module, value, parsed=parsed, status=status, url=url, message=message)
             self.logger.parsed_value(f"{module}_source_url", url, source_name, "latest")
-            return RawData(module, value, "latest", source_name, url, self._today_str(), status, message, data_status=data_status, parse_status="NO_PARSED_VALUE" if parse_required else "PARSE_OK", raw_file_path=raw_path, confidence=0.5 if parse_required else 0.8)
+            return RawData(module, value, "latest", source_name, url, self._today_str(), status, message, data_status=data_status, parse_status=parse_status, raw_file_path=raw_path, confidence=0.5 if parse_required else 0.8)
         except Exception as exc:
             self.logger.warning(f"{source_name}抓取失敗 {module}: {exc}")
             raw_path = self.logger.write_raw_evidence(module, {"url": url, "error": str(exc)}, parsed={}, status=status_if_fail, url=url, message=str(exc))
@@ -1283,6 +1324,46 @@ class ExcelWriter:
             ])
         ws.append([])
         ws.append(["說明", "query_date=使用者查詢日；actual_date=實際資料日；fallback_days=往前回退天數；RAW_DATA_SNAPSHOT 與 PARSED_VALUE 會寫入 log 證明實際抓取資料。"])
+
+
+    def _write_evidence_index(self, wb, raw: Dict[str, RawData]):
+        """寫入資料證據索引，修復V2.0缺少方法導致Excel輸出中斷。"""
+        ws = self._sheet(wb, "資料證據索引")
+        headers = [
+            "項次", "模組/資料源", "狀態", "資料分類", "解析狀態", "parsed_fields摘要",
+            "查詢日", "實際資料日", "是否回退", "回退天數", "來源", "URL",
+            "RAW證據檔", "信心分數", "問題判定", "處理建議"
+        ]
+        ws.append(headers)
+        for idx, (name, item) in enumerate(raw.items(), start=1):
+            parsed_summary = ""
+            issue = "OK"
+            action = "可作為證據鏈追溯"
+            raw_path = getattr(item, "raw_file_path", "") or ""
+            try:
+                if raw_path and Path(raw_path).exists():
+                    payload = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+                    parsed_fields = payload.get("parsed_fields", {})
+                    parsed_summary = json.dumps(parsed_fields, ensure_ascii=False)[:500]
+                    if item.status == "OK" and not parsed_fields:
+                        issue = "假OK風險：status=OK但parsed_fields為空"
+                        action = "需補parser或降為WARN，不可進主分數"
+                elif item.status == "OK" and getattr(item, "parse_status", "") != "PARSE_OK":
+                    issue = "缺RAW證據或解析欄位"
+                    action = "需確認write_raw_evidence與parser"
+            except Exception as exc:
+                issue = f"RAW讀取失敗：{exc}"
+                action = "需檢查RAW證據檔路徑"
+            if item.status != "OK":
+                issue = item.message or item.data_status or item.status
+                action = "依資料來源狀態修正來源或人工確認"
+            ws.append([
+                idx, name, item.status, item.data_status, getattr(item, "parse_status", ""), parsed_summary,
+                item.query_date, item.actual_date or item.date, item.is_fallback, item.fallback_days, item.source, item.url,
+                raw_path, getattr(item, "confidence", ""), issue, action
+            ])
+        ws.append([])
+        ws.append(["驗收規則", "所有核心來源若status=OK，parse_status必須為PARSE_OK且parsed_fields不得為空；未解析資料必須WARN，不得假OK。"] )
 
 
     def _format_all(self, wb):
