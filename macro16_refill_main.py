@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 宏觀16模組自動抓取與Excel回填主程式
-版本：V1.0
+版本：V1.2 DebugLog
 目的：依「宏觀16模組市場資料回填SOP」與「主程式工程級規格書」執行資料取得、標準化、分數判定、Excel回填與稽核。
 
 執行方式：
@@ -41,7 +41,7 @@ except Exception as exc:
     raise RuntimeError("缺少 openpyxl，請先安裝：pip install openpyxl") from exc
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "1.0.0"
+VERSION = "1.2.0-debug"
 DEFAULT_TIMEOUT = 15
 
 MODULES = [
@@ -56,8 +56,12 @@ YAHOO_SYMBOLS = {
     "美股-道瓊": "^DJI",
     "VIX恐慌": "^VIX",
     "原油": "CL=F",
-    "OTC": "TWOII.TWO",
 }
+
+YAHOO_SYMBOL_CANDIDATES = {
+    "OTC": ["^TWOII", "TWOII.TW", "TWOII.TWO"],
+}
+
 
 SOURCE_PRIORITY = ["官方資料", "交易所/期交所", "國際金融數據站", "台灣可信財經站", "人工事件判斷"]
 
@@ -118,7 +122,7 @@ class TechnicalRisk:
 class Macro16Logger:
     def __init__(self, log_dir: Path):
         log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_file = log_dir / f"macro16_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.log_file = log_dir / f"macro16_debug_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         logging.basicConfig(
             filename=str(self.log_file),
             level=logging.INFO,
@@ -136,8 +140,12 @@ class Macro16Logger:
         self.messages.append(f"WARN {msg}")
 
     def error(self, msg: str):
-        logging.error(msg)
+        logging.error(msg, exc_info=True)
         self.messages.append(f"ERROR {msg}")
+
+    def debug(self, msg: str):
+        logging.info("DEBUG " + msg)
+        self.messages.append(f"DEBUG {msg}")
 
 class HttpClient:
     def __init__(self, logger: Macro16Logger):
@@ -154,6 +162,7 @@ class HttpClient:
             raise RuntimeError("requests 未安裝，無法抓取網路資料")
         self.logger.info(f"GET {url}")
         r = self.session.get(url, timeout=timeout)
+        self.logger.debug(f"HTTP status={r.status_code}, content_type={r.headers.get('content-type','')}, len={len(r.text or '')}")
         r.raise_for_status()
         if not r.encoding:
             r.encoding = "utf-8"
@@ -161,7 +170,11 @@ class HttpClient:
 
     def get_json(self, url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
         text = self.get_text(url, timeout)
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except Exception as exc:
+            self.logger.warning(f"JSON解析失敗 url={url}; head={text[:200]!r}; error={exc}")
+            raise
 
 class SourceConnector:
     def __init__(self, client: HttpClient, logger: Macro16Logger):
@@ -201,6 +214,17 @@ class SourceConnector:
         except Exception as exc:
             self.logger.warning(f"Yahoo抓取失敗 {module}/{symbol}: {exc}")
             return RawData(module, None, "", "Yahoo Finance", url, self._today_str(), "FAIL", str(exc))
+
+
+    def fetch_yahoo_chart_candidates(self, symbols: List[str], module: str, range_days: str = "10d") -> RawData:
+        last_fail = None
+        for symbol in symbols:
+            data = self.fetch_yahoo_chart(symbol, module, range_days)
+            if data.status == "OK":
+                data.message = f"使用候選代碼 {symbol}"
+                return data
+            last_fail = data
+        return last_fail or RawData(module, None, "", "Yahoo Finance", ",".join(symbols), self._today_str(), "FAIL", "所有Yahoo候選代碼失敗")
 
     def fetch_twse_taiex_history(self, base_date: Optional[str] = None) -> RawData:
         if not base_date:
@@ -583,45 +607,36 @@ class ExcelWriter:
 
     def _write_market_input(self, wb, market: MarketInput):
         ws = self._sheet(wb, "市場輸入")
-        ws.append(["欄位", "數值", "來源/說明"])
-        items = [
-            ("日期", market.base_date, "最新完整收盤交易日"),
-            ("收盤", market.close, market.source_1),
-            ("最高", market.high, market.source_1),
-            ("最低", market.low, market.source_1),
-            ("前高", market.prev_high, "前一交易日高點"),
-            ("前低", market.prev_low, "前一交易日低點"),
-            ("5MA", market.ma5, "近5日收盤平均"),
-            ("成交量(億)", market.turnover_100m, market.source_2),
-            ("5日均量(億)", market.avg_turnover_5d_100m, "近5日成交值平均"),
-            ("外資買賣超(億)", market.foreign_net_100m, market.source_3),
-            ("官股買賣超(億)", market.gov_net_100m, "未取得時不可編造"),
-            ("AI主流強度(0-1)", market.ai_strength, "人工/產業判讀，預設0.5"),
-            ("重大事件(0/1)", market.major_event, "有明確事件來源才填1"),
-        ]
-        for row in items:
-            ws.append(list(row))
+        headers = ["日期", "收盤", "最高", "最低", "前高", "前低", "5MA", "成交量(億)", "5日均量(億)", "外資買賣超(億)", "官股買賣超(億)", "AI主流強度(0-1)", "重大事件(0/1)", "來源1", "來源2", "來源3", "來源4"]
+        values = [market.base_date, market.close, market.high, market.low, market.prev_high, market.prev_low, market.ma5, market.turnover_100m, market.avg_turnover_5d_100m, market.foreign_net_100m, market.gov_net_100m, market.ai_strength, market.major_event, market.source_1, market.source_2, market.source_3, market.source_4]
+        ws.append(headers)
+        ws.append(values)
+        ws.append([])
+        ws.append(["欄位說明", "本表由主程式自動回填。若數值為空白/None，代表資料來源未取得，程式不編造數字，請依Log與回填紀錄修正資料來源或人工確認。"] + [None]*(len(headers)-2))
+        judge = []
+        if market.close and market.ma5:
+            judge.append(f"收盤 {market.close} {'站上' if market.close >= market.ma5 else '跌破'} 5MA {market.ma5}")
+        if market.foreign_net_100m is None:
+            judge.append("外資未取得")
+        if market.turnover_100m is None:
+            judge.append("成交值未取得")
+        ws.append(["交易判讀", "；".join(judge) if judge else "資料不足，需檢查來源與Log。"] + [None]*(len(headers)-2))
 
     def _write_macro_modules(self, wb, scores: List[ModuleScore]):
         ws = self._sheet(wb, "宏觀15模組")
-        ws.append(["模組", "強度", "方向", "加權分數", "說明", "來源", "資料時間", "交易用途", "狀態", "數據/事件"])
+        ws.append(["模組", "風險/強度分數(0-1)", "方向(+1/0/-1)", "加權分數", "說明", "資料來源", "資料時間"])
         for s in scores:
-            ws.append([s.module, s.strength, s.direction, s.weighted_score, s.explanation, s.source, s.data_time, s.trade_usage, s.status, s.data_text])
+            ws.append([s.module, s.strength, s.direction, s.weighted_score, s.explanation, s.source, s.data_time])
+        ws.append([])
+        ws.append(["補充欄位", "狀態", "數據/事件", "交易用途"] )
+        for s in scores:
+            ws.append([s.module, s.status, s.data_text, s.trade_usage])
 
     def _write_technical(self, wb, tech: TechnicalRisk):
         ws = self._sheet(wb, "V2技術引擎")
-        ws.append(["項目", "填值", "判斷方式", "說明"])
-        rows = [
-            ("跌破5MA", tech.below_ma5, "收盤 < 5MA", "1=短線轉弱"),
-            ("高不過高", tech.lower_high, "當日最高 < 前高", "1=攻擊失敗"),
-            ("低破低", tech.lower_low, "當日最低 < 前低", "1=結構轉弱"),
-            ("放量", tech.volume_expansion, "成交值 > 5日均量*1.05", "需搭配漲跌判斷"),
-            ("重大事件", tech.major_event, "重大事件=1", "需有來源"),
-            ("技術/風險分數", tech.risk_score, "以上條件加總", "越高越需降倉"),
-            ("大盤判定", tech.market_judgement, "宏觀總分+技術風險", "交易語言輸出"),
-        ]
-        for r in rows:
-            ws.append(list(r))
+        ws.append(["跌破5MA", "高不過高", "低破低", "放量", "重大事件", "技術/風險分數", "大盤判定"])
+        ws.append([tech.below_ma5, tech.lower_high, tech.lower_low, tech.volume_expansion, tech.major_event, tech.risk_score, tech.market_judgement])
+        ws.append(["判讀說明", "收盤<5MA為1", "最高<前高為1", "最低<前低為1", "成交值>5日均量*1.05為1", "需有明確來源", "五項加總", "供下單清單參考"])
 
     def _write_audit(self, wb, market: MarketInput, scores: List[ModuleScore], tech: TechnicalRisk, summary: Dict[str,str], logs: List[str]):
         name = f"回填紀錄_{market.base_date.replace('-', '') if market.base_date else dt.date.today().strftime('%Y%m%d')}"
@@ -703,6 +718,8 @@ class Macro16Engine:
         raw["外資"] = self.source.fetch_foreign_investor(twse_date)
         for module, symbol in YAHOO_SYMBOLS.items():
             raw[module] = self.source.fetch_yahoo_chart(symbol, module)
+        for module, symbols in YAHOO_SYMBOL_CANDIDATES.items():
+            raw[module] = self.source.fetch_yahoo_chart_candidates(symbols, module)
         raw["美債10Y"] = self.source.fetch_fred_csv_latest("DGS10", "美債10Y")
         market = self.processor.build_market_input(raw, base_date or "")
         scores = self.scoring.score_all(raw, market)
