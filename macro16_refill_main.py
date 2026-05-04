@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import sqlite3
+import html as html_lib
 from dataclasses import dataclass, asdict
 from io import StringIO
 from pathlib import Path
@@ -42,7 +43,7 @@ except Exception as exc:
     raise RuntimeError("缺少 openpyxl，請先安裝：pip install openpyxl") from exc
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.1.0-evidence-index-fix"
+VERSION = "2.4.0-ranking-taifex-gov-hotfix"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -83,6 +84,8 @@ SOURCE_URLS = {
     "cnn": "https://www.cnn.com",
     "iek": "https://ieknet.iek.org.tw/",
     "taifex_night": "https://www.taifex.com.tw/cht/3/futContractsDateAh",
+    "twse_t86": "https://www.twse.com.tw/rwd/zh/fund/T86?date={date}&selectType=ALLBUT0999&response=json",
+    "gov_broker_fallback_histock": "https://histock.tw/stock/broker8.aspx",
 }
 
 
@@ -722,57 +725,108 @@ class SourceConnector:
                 raw.message = "Wantgoo頁面已取得但未解析出官股數字"
         return raw
 
-    def fetch_twse_broker_report(self, url: str = SOURCE_URLS["twse_broker_report"]) -> RawData:
-        raw = self.fetch_text_snapshot("官股", url, "TWSE券商報表", "WARN", parse_required=True)
-        if not raw.value:
-            return raw
-        text = raw.value.get("snippet", "")
-        keywords_ok = any(k in text for k in ["券商", "買賣", "自營", "公股", "八大", "交易", "broker"])
-        nums = [self._to_float(x) for x in re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", text)]
-        nums = [x for x in nums if not math.isnan(x)]
-        gov_candidates = [x for x in nums if abs(x) >= 1]
-        if keywords_ok and gov_candidates:
-            gov_net_100m = round(gov_candidates[-1] / 100000000 if abs(gov_candidates[-1]) > 1000000 else gov_candidates[-1], 2)
-            parsed = {"gov_net_100m": gov_net_100m, "numbers_sample": gov_candidates[:20], "source_rule": "TWSE券商報表主來源"}
-            self.logger.parsed_value("gov_net_100m", gov_net_100m, "TWSE券商報表", raw.date)
-            return self._complete_parsed_raw(raw, parsed, "TWSE券商報表已解析官股/券商資料", confidence=0.85)
+    def fetch_twse_broker_report(self, url: str = SOURCE_URLS["twse_broker_report"], base_date: Optional[str] = None, max_back_days: int = DEFAULT_MAX_FALLBACK_DAYS) -> RawData:
+        """
+        V2.4 官股資料修正：
+        1. 原 twse_broker_report 頁面會回 404，因此不再把 404 頁面當成可用官股資料。
+        2. 先抓 TWSE 官方 T86 作為證交所法人資料證據；但 T86 不是八大官股本體，只能作官方佐證。
+        3. 八大官股目前 TWSE 無公開可直接彙總的官方 API；若使用 Histock/Wantgoo，只標記為「第三方輔助」，不得假裝官方。
+        """
+        query_date = self._compact_date(base_date)
+        try_date = query_date
+        last_error = ""
+        for fallback_days in range(max_back_days + 1):
+            self._log_fallback_try("TWSE_T86_GOV_EVIDENCE", query_date, try_date, fallback_days, max_back_days)
+            api_url = SOURCE_URLS["twse_t86"].format(date=try_date)
+            try:
+                data = self.client.get_json(api_url)
+                rows = self._twse_rows(data)
+                if rows:
+                    parsed = {"twse_t86_rows": len(rows), "source_rule": "TWSE官方T86法人資料佐證；非八大官股本體"}
+                    is_fb, fb_days, note = self._fallback_note(query_date, try_date, "TWSE_T86_GOV_EVIDENCE")
+                    payload = {"official_evidence": parsed, "rows_sample": rows[:3], "gov_net_100m": None}
+                    raw_path = self.logger.write_raw_evidence("官股", payload, parsed=parsed, status="WARN", url=api_url, message="TWSE官方T86可取得，但不是八大官股彙總；官股數字需券商分點彙總或人工覆寫")
+                    self.logger.parsed_value("twse_t86_rows", len(rows), "TWSE T86", self._dash_date(try_date))
+                    return RawData("官股", payload, self._dash_date(try_date), "TWSE T86 官方佐證", api_url, self._today_str(),
+                                   "WARN", "TWSE官方T86可取得，但不是八大官股彙總；未提供gov_net_100m，避免非官方數字進主判斷", query_date,
+                                   try_date, is_fb, fb_days, "NO_PARSED_VALUE", note, "NO_PARSED_VALUE", raw_path, 0.35)
+                self._official_no_data("TWSE_T86_GOV_EVIDENCE", query_date, try_date, api_url, data)
+            except Exception as exc:
+                last_error = str(exc)
+                self.logger.warning(f"TWSE T86官股佐證來源失敗 try_date={try_date} url={api_url}: {exc}")
+            try_date = self._previous_calendar_day(try_date)
+
+        # 第三方輔助來源只做證據，不進主分數
+        fallback_url = SOURCE_URLS.get("gov_broker_fallback_histock", SOURCE_URLS.get("wantgoo_public_bank", ""))
+        raw = self.fetch_text_snapshot("官股", fallback_url, "第三方八大官股輔助", "WARN", parse_required=True)
         raw.status = "WARN"
         raw.data_status = "NO_PARSED_VALUE"
         raw.parse_status = "NO_PARSED_VALUE"
-        raw.message = "TWSE券商報表頁面已取得，但未解析出官股買賣超數字；不改用Wantgoo當主來源"
-        raw.confidence = 0.3
-        raw.raw_file_path = self.logger.write_raw_evidence("官股", raw.value, parsed={}, status="WARN", url=url, message=raw.message)
-        self.logger.parsed_value("twse_broker_report_status", raw.status, "TWSE券商報表", raw.date)
+        raw.message = "TWSE官方官股彙總未取得；第三方八大官股頁只作輔助證據，不進主判斷。" + (f" TWSE錯誤={last_error}" if last_error else "")
+        raw.confidence = 0.25
         return raw
 
-    def fetch_ranking_result_db(self, db_path: Optional[str] = None) -> RawData:
-        candidates = []
+    def fetch_ranking_result_db(self, db_path: Optional[str] = None, strict: bool = False) -> RawData:
+        """
+        V2.4 Ranking資料修正：
+        - 若使用者指定db_path，只檢查該DB，不再亂掃其他DB。
+        - 未指定時才掃描目前目錄與子目錄，並記錄候選DB。
+        - ranking_result不存在或空表時，parse_status必須是NO_PARSED_VALUE，不能假OK。
+        - strict=True時直接丟出錯誤，避免交易系統在沒有Ranking核心時繼續產出可下單結論。
+        """
+        candidates: List[Path] = []
         if db_path:
-            candidates.append(Path(db_path))
-        candidates.extend(Path.cwd().glob("*.db"))
-        candidates.extend(Path.cwd().glob("**/*.db"))
+            candidates = [Path(db_path)]
+        else:
+            candidates.extend(Path.cwd().glob("*.db"))
+            candidates.extend(Path.cwd().glob("**/*.db"))
         seen = set()
         candidates = [p for p in candidates if not (str(p) in seen or seen.add(str(p)))]
-        for path in candidates[:20]:
+        checked: List[str] = []
+        for path in candidates[:50]:
+            checked.append(str(path))
+            if not path.exists():
+                self.logger.warning(f"RANKING_DB_NOT_FOUND path={path}")
+                continue
             try:
                 conn = sqlite3.connect(str(path))
                 cur = conn.cursor()
                 cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ranking_result'")
                 if not cur.fetchone():
                     conn.close()
+                    self.logger.warning(f"RANKING_TABLE_MISSING db={path} table=ranking_result")
                     continue
                 cur.execute("SELECT COUNT(*) FROM ranking_result")
-                count = cur.fetchone()[0]
-                cur.execute("SELECT * FROM ranking_result LIMIT 3")
+                count = int(cur.fetchone()[0] or 0)
+                if count <= 0:
+                    conn.close()
+                    msg = f"ranking_result為空 db={path}，交易系統不可運行"
+                    self.logger.warning("RANKING_TABLE_EMPTY " + msg)
+                    if strict:
+                        raise RuntimeError(msg)
+                    payload = {"db_path": str(path), "table": "ranking_result", "row_count": 0}
+                    raw_path = self.logger.write_raw_evidence("排行分析", payload, parsed={}, status="FAIL", url=str(path), message=msg)
+                    return RawData("排行分析", None, "", "SQLite DB", str(path), self._today_str(), "FAIL", msg, data_status="DATA_MISSING", parse_status="NO_PARSED_VALUE", raw_file_path=raw_path, confidence=0.0)
+                cur.execute("PRAGMA table_info(ranking_result)")
+                columns = [r[1] for r in cur.fetchall()]
+                cur.execute("SELECT * FROM ranking_result LIMIT 5")
                 rows = cur.fetchall()
                 conn.close()
-                payload = {"db_path": str(path), "table": "ranking_result", "row_count": count, "sample_rows": rows}
-                self.logger.raw_snapshot("排行分析", payload)
+                parsed = {"db_path": str(path), "table": "ranking_result", "row_count": count, "columns": columns[:50]}
+                payload = {**parsed, "sample_rows": rows}
+                self.logger.raw_snapshot("排行分析", payload, parsed=parsed, status="OK", url=str(path), message="ranking_result loaded")
                 self.logger.parsed_value("ranking_result_count", count, "SQLite DB", str(path))
-                return RawData("排行分析", payload, self._today_str(), "SQLite DB", str(path), self._today_str(), "OK", "ranking_result loaded")
+                return RawData("排行分析", payload, self._today_str(), "SQLite DB", str(path), self._today_str(), "OK", "ranking_result loaded", data_status="OK", parse_status="PARSE_OK", confidence=1.0)
             except Exception as exc:
                 self.logger.debug(f"ranking_result DB skipped path={path}: {exc}")
-        return RawData("排行分析", None, "", "SQLite DB", "db:ranking_result", self._today_str(), "WARN", "未找到 ranking_result 資料表", data_status="DATA_MISSING")
+                if strict:
+                    raise
+        msg = "未找到 ranking_result 資料表；已檢查DB=" + ("; ".join(checked[:20]) if checked else "無DB候選")
+        if strict:
+            raise RuntimeError(msg)
+        raw_path = self.logger.write_raw_evidence("排行分析", {"checked_db": checked}, parsed={}, status="FAIL", url="db:ranking_result", message=msg)
+        return RawData("排行分析", None, "", "SQLite DB", "db:ranking_result", self._today_str(), "FAIL", msg, data_status="DATA_MISSING", parse_status="NO_PARSED_VALUE", raw_file_path=raw_path, confidence=0.0)
+
 
 
 
@@ -809,49 +863,111 @@ class SourceConnector:
             self.logger.parsed_value("major_event", risk, "Reuters", raw.date)
         return raw
 
-    def fetch_taifex_night_snapshot(self, url: str = SOURCE_URLS["taifex_night"]) -> RawData:
-        raw = self.fetch_text_snapshot("台股夜盤", url, "TAIFEX", "WARN")
-        if raw.status != "OK" or not raw.value:
-            return raw
-        text = re.sub(r"\s+", " ", raw.value.get("snippet", ""))
-        patterns = [
-            r"(?:TX|臺股期貨|台股期貨|臺指期|台指期).*?(-?\d+(?:,\d{3})*(?:\.\d+)?).*?(-?\d+(?:,\d{3})*(?:\.\d+)?)",
-            r"(?:夜盤|After\\s*Hours?).*?(?:TX|臺股期貨|台股期貨).*?(-?\d+(?:,\d{3})*(?:\.\d+)?).*?(-?\d+(?:,\d{3})*(?:\.\d+)?)",
-        ]
-        parsed = None
-        for pat in patterns:
-            m = re.search(pat, text, flags=re.I)
-            if m:
+    def _strip_html_cells(self, row_html: str) -> List[str]:
+        cells = re.findall(r"<(?:td|th)[^>]*>(.*?)</(?:td|th)>", row_html, flags=re.I | re.S)
+        out = []
+        for c in cells:
+            txt = re.sub(r"<[^>]+>", " ", c)
+            txt = html_lib.unescape(txt)
+            txt = re.sub(r"\s+", " ", txt).strip()
+            if txt:
+                out.append(txt)
+        return out
+
+    def _parse_taifex_night_html(self, html_text: str) -> Optional[Dict[str, Any]]:
+        """解析TAIFEX夜盤頁。優先解析臺股期貨/外資列的多空淨額口數。"""
+        decoded = html_lib.unescape(html_text or "")
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", decoded, flags=re.I | re.S)
+        last_product = ""
+        target_date = ""
+        mdate = re.search(r"日期\s*(\d{4}/\d{2}/\d{2}|\d{4}-\d{2}-\d{2}|\d{4}\d{2}\d{2})", re.sub(r"<[^>]+>", " ", decoded))
+        if mdate:
+            target_date = mdate.group(1).replace("/", "-")
+        for row in rows:
+            cols = self._strip_html_cells(row)
+            if not cols:
+                continue
+            row_text = " ".join(cols)
+            if "臺股期貨" in row_text or "台股期貨" in row_text:
+                last_product = "臺股期貨"
+            # TAIFEX表格常見結構：商品名稱只出現在第一列，自營商/投信/外資在後續列沿用商品名稱
+            if last_product == "臺股期貨" and any(c == "外資" or "外資" in c for c in cols):
                 nums = []
-                for g in m.groups():
-                    try:
-                        nums.append(self._to_float(g))
-                    except Exception:
-                        pass
-                if nums:
-                    parsed = {"contract": "TX", "session": "after_hours", "price_or_value": nums[0], "change_or_volume": nums[1] if len(nums) > 1 else None}
-                    break
-        if parsed:
-            change = parsed.get("change_or_volume")
-            score = 1 if isinstance(change, (int, float)) and change > 0 else (-1 if isinstance(change, (int, float)) and change < 0 else 0)
-            parsed["night_score"] = score
-            raw.value.update(parsed)
-            raw.message = "TAIFEX夜盤已解析數值"
-            raw.status = "OK"
-            raw.data_status = "OK"
-            raw.parse_status = "PARSE_OK"
-            raw.confidence = 0.85
-            raw.raw_file_path = self.logger.write_raw_evidence("台股夜盤", raw.value, parsed=parsed, status="OK", url=url, message=raw.message)
-            self.logger.raw_snapshot("TAIFEX_NIGHT_PARSED", parsed, parsed=parsed, status="OK", url=url, message=raw.message)
-            self.logger.parsed_value("night_score", score, "TAIFEX", raw.date)
-            return raw
-        raw.status = "WARN"
-        raw.data_status = "NO_PARSED_VALUE"
-        raw.message = "TAIFEX正確網址已取得，但未解析出TX夜盤數值"
-        raw.confidence = 0.3
-        raw.raw_file_path = self.logger.write_raw_evidence("台股夜盤", raw.value, parsed={}, status="WARN", url=url, message=raw.message)
-        self.logger.warning(f"TAIFEX夜盤未解析出數值 url={url}")
-        return raw
+                for c in cols:
+                    cleaned = c.replace(",", "").replace("−", "-").strip()
+                    if re.fullmatch(r"-?\d+(?:\.\d+)?", cleaned):
+                        nums.append(float(cleaned))
+                if len(nums) >= 6:
+                    long_lots = int(nums[-6])
+                    long_amount = int(nums[-5])
+                    short_lots = int(nums[-4])
+                    short_amount = int(nums[-3])
+                    net_lots = int(nums[-2])
+                    net_amount = int(nums[-1])
+                elif len(nums) >= 2:
+                    net_lots = int(nums[-2])
+                    net_amount = int(nums[-1])
+                    long_lots = long_amount = short_lots = short_amount = None
+                else:
+                    continue
+                return {
+                    "contract": "TX",
+                    "contract_name": "臺股期貨",
+                    "identity": "外資",
+                    "session": "after_hours",
+                    "data_date": target_date or "latest",
+                    "long_lots": long_lots,
+                    "long_amount": long_amount,
+                    "short_lots": short_lots,
+                    "short_amount": short_amount,
+                    "net_lots": net_lots,
+                    "net_amount": net_amount,
+                    "night_score": 1 if net_lots > 0 else (-1 if net_lots < 0 else 0),
+                    "source_rule": "TAIFEX夜盤臺股期貨外資多空淨額口數"
+                }
+        # fallback：以純文字行序解析（當HTML表格結構變動時）
+        text = re.sub(r"<[^>]+>", "\n", decoded)
+        tokens = [t.strip() for t in re.split(r"\n+", text) if t.strip()]
+        try:
+            i = tokens.index("臺股期貨")
+        except ValueError:
+            try:
+                i = tokens.index("台股期貨")
+            except ValueError:
+                return None
+        window = tokens[i:i+60]
+        if "外資" in window:
+            j = window.index("外資")
+            vals = []
+            for t in window[j+1:j+10]:
+                c = t.replace(",", "").replace("−", "-")
+                if re.fullmatch(r"-?\d+(?:\.\d+)?", c):
+                    vals.append(float(c))
+            if len(vals) >= 6:
+                net_lots = int(vals[4])
+                net_amount = int(vals[5])
+                return {"contract": "TX", "contract_name": "臺股期貨", "identity": "外資", "session": "after_hours", "data_date": target_date or "latest", "long_lots": int(vals[0]), "long_amount": int(vals[1]), "short_lots": int(vals[2]), "short_amount": int(vals[3]), "net_lots": net_lots, "net_amount": net_amount, "night_score": 1 if net_lots > 0 else (-1 if net_lots < 0 else 0), "source_rule": "TAIFEX夜盤純文字fallback"}
+        return None
+
+    def fetch_taifex_night_snapshot(self, url: str = SOURCE_URLS["taifex_night"]) -> RawData:
+        try:
+            html_text = self.client.get_text(url)
+            parsed = self._parse_taifex_night_html(html_text)
+            if parsed:
+                value = {"url": url, "html_length": len(html_text), **parsed}
+                raw_path = self.logger.write_raw_evidence("台股夜盤", value, parsed=parsed, status="OK", url=url, message="TAIFEX夜盤已解析臺股期貨外資多空淨額")
+                self.logger.raw_snapshot("TAIFEX_NIGHT_PARSED", parsed, parsed=parsed, status="OK", url=url, message="TAIFEX夜盤已解析臺股期貨外資多空淨額")
+                self.logger.parsed_value("night_score", parsed.get("night_score"), "TAIFEX", parsed.get("data_date", "latest"))
+                self.logger.parsed_value("taifex_tx_foreign_net_lots", parsed.get("net_lots"), "TAIFEX", parsed.get("data_date", "latest"))
+                return RawData("台股夜盤", value, parsed.get("data_date", "latest"), "TAIFEX", url, self._today_str(), "OK", "TAIFEX夜盤已解析臺股期貨外資多空淨額", data_status="OK", parse_status="PARSE_OK", raw_file_path=raw_path, confidence=0.9)
+            value = {"url": url, "html_length": len(html_text), "snippet": re.sub(r"\s+", " ", html_text[:5000])}
+            raw_path = self.logger.write_raw_evidence("台股夜盤", value, parsed={}, status="WARN", url=url, message="TAIFEX頁面已取得，但未解析出臺股期貨外資多空淨額")
+            self.logger.warning(f"TAIFEX夜盤未解析出數值 url={url}")
+            return RawData("台股夜盤", value, "latest", "TAIFEX", url, self._today_str(), "WARN", "TAIFEX頁面已取得，但未解析出臺股期貨外資多空淨額", data_status="NO_PARSED_VALUE", parse_status="NO_PARSED_VALUE", raw_file_path=raw_path, confidence=0.3)
+        except Exception as exc:
+            self.logger.warning(f"TAIFEX夜盤抓取失敗 url={url}: {exc}")
+            raw_path = self.logger.write_raw_evidence("台股夜盤", {"url": url, "error": str(exc)}, parsed={}, status="WARN", url=url, message=str(exc))
+            return RawData("台股夜盤", None, "", "TAIFEX", url, self._today_str(), "WARN", str(exc), data_status="FETCH_FAIL", parse_status="NO_PARSED_VALUE", raw_file_path=raw_path, confidence=0.0)
 
     def fetch_tpex_otc_snapshot(self, url: str = SOURCE_URLS["tpex_indices"]) -> RawData:
         raw = self.fetch_text_snapshot("OTC官方來源", url, "TPEX", "WARN")
@@ -1453,7 +1569,7 @@ class Macro16Engine:
         self.writer = ExcelWriter(self.logger)
         self.word_evidence_writer = WordEvidenceReportWriter(self.logger)
 
-    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None) -> Dict[str, Any]:
+    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
@@ -1482,11 +1598,11 @@ class Macro16Engine:
         raw["ISW衝突分析"] = self.source.fetch_isw_conflict()
         raw["CNN重大新聞"] = self.source.fetch_cnn_major_news()
         raw["美國總統"] = self.source.fetch_trump_public_news()
-        raw["官股"] = self.source.fetch_twse_broker_report()
+        raw["官股"] = self.source.fetch_twse_broker_report(base_date=actual_twse_date)
         raw["官股整理"] = self.source.fetch_wantgoo_public_bank()
         raw["AI產業"] = self.source.fetch_ai_industry_news()
         raw["IEK產業分析"] = self.source.fetch_iek_industry()
-        raw["排行分析"] = self.source.fetch_ranking_result_db()
+        raw["排行分析"] = self.source.fetch_ranking_result_db(db_path=db_path, strict=strict_ranking)
         raw["台股夜盤"] = self.source.fetch_taifex_night_snapshot()
         tpex_otc_raw = self.source.fetch_tpex_otc_snapshot()
         raw["櫃買官方來源"] = tpex_otc_raw
@@ -1527,6 +1643,8 @@ def run_gui():
     template_var = tk.StringVar()
     out_var = tk.StringVar(value=str(Path.cwd() / f"宏觀16模組_自動回填_{dt.date.today().strftime('%Y%m%d')}.xlsx"))
     date_var = tk.StringVar(value=dt.date.today().strftime("%Y-%m-%d"))
+    db_var = tk.StringVar()
+    strict_ranking_var = tk.BooleanVar(value=False)
     status_var = tk.StringVar(value="待執行")
 
     def browse_template():
@@ -1539,6 +1657,11 @@ def run_gui():
         if p:
             out_var.set(p)
 
+    def browse_db():
+        p = filedialog.askopenfilename(filetypes=[("SQLite DB", "*.db"), ("All files", "*.*")])
+        if p:
+            db_var.set(p)
+
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill="both", expand=True)
     ttk.Label(frm, text="宏觀16模組 自動抓取與Excel回填", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
@@ -1550,11 +1673,15 @@ def run_gui():
     ttk.Button(frm, text="另存", command=browse_out).grid(row=2, column=2)
     ttk.Label(frm, text="基準日(YYYY-MM-DD)").grid(row=3, column=0, sticky="w")
     ttk.Entry(frm, textvariable=date_var, width=20).grid(row=3, column=1, sticky="w")
-    ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=4, column=0, columnspan=3, sticky="w", pady=8)
+    ttk.Label(frm, text="主DB檔案(選填)").grid(row=4, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=db_var, width=90).grid(row=4, column=1, sticky="we")
+    ttk.Button(frm, text="選擇DB", command=browse_db).grid(row=4, column=2)
+    ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=5, column=1, sticky="w")
+    ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=6, column=0, columnspan=3, sticky="w", pady=8)
 
     log_text = tk.Text(frm, height=26, wrap="word")
-    log_text.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(10,0))
-    frm.rowconfigure(6, weight=1)
+    log_text.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(10,0))
+    frm.rowconfigure(8, weight=1)
     frm.columnconfigure(1, weight=1)
 
     def append_log(text):
@@ -1567,7 +1694,7 @@ def run_gui():
             status_var.set("執行中：抓資料、計分、回填Excel...")
             log_text.delete("1.0", "end")
             engine = Macro16Engine(Path("logs"))
-            result = engine.run(template_var.get() or None, out_var.get(), date_var.get())
+            result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()))
             for msg in engine.logger.messages:
                 append_log(msg)
             append_log("\n總結：" + json.dumps(result["summary"], ensure_ascii=False, indent=2))
@@ -1579,8 +1706,8 @@ def run_gui():
             append_log("ERROR " + str(exc))
             messagebox.showerror("錯誤", str(exc))
 
-    ttk.Button(frm, text="執行回填", command=execute).grid(row=5, column=0, sticky="w", pady=6)
-    ttk.Button(frm, text="離開", command=root.destroy).grid(row=5, column=2, sticky="e", pady=6)
+    ttk.Button(frm, text="執行回填", command=execute).grid(row=7, column=0, sticky="w", pady=6)
+    ttk.Button(frm, text="離開", command=root.destroy).grid(row=7, column=2, sticky="e", pady=6)
     root.mainloop()
 
 def main():
@@ -1595,11 +1722,13 @@ def main():
     parser.add_argument("--major-event", type=int, default=None, help="人工覆寫重大事件0/1")
     parser.add_argument("--event-note", default="", help="人工覆寫戰爭/地緣/重大事件說明")
     parser.add_argument("--night-score", type=float, default=None, help="人工覆寫台股夜盤分數")
+    parser.add_argument("--db-path", default="", help="指定主SQLite DB路徑；用於ranking_result驗證")
+    parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
     args = parser.parse_args()
     if args.cli:
         engine = Macro16Engine(Path(args.log_dir))
         override = ManualOverride(gov_net_100m=args.gov_net, ai_strength=args.ai_strength, major_event=args.major_event, event_note=args.event_note, night_score=args.night_score)
-        result = engine.run(args.template or None, args.out, args.date, override)
+        result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         run_gui()
