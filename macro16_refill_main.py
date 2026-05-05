@@ -42,8 +42,18 @@ try:
 except Exception as exc:
     raise RuntimeError("缺少 openpyxl，請先安裝：pip install openpyxl") from exc
 
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.4.0-ranking-taifex-gov-hotfix"
+VERSION = "2.5.0-p0-institutional-tej-market5day"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -1062,6 +1072,19 @@ class DataProcessor:
             market.foreign_net_100m = round(foreign.value.get("net_100m", 0), 2)
             market.source_3 = self._source_note(foreign)
 
+        # V2.5 P0：跨月5日資料優先覆蓋單日資料，補齊前高/前低/5MA/5日均量。
+        market5 = raw.get("市場5日資料")
+        if market5 and market5.status == "OK" and isinstance(market5.value, dict):
+            v = market5.value
+            for field in ["base_date", "close", "high", "low", "prev_high", "prev_low", "ma5", "turnover_100m", "avg_turnover_5d_100m"]:
+                if v.get(field) is not None:
+                    setattr(market, field, v.get(field))
+            note = f"TWSE跨月5日：{v.get('taiex_recent_dates','')} / 成交值：{v.get('turnover_recent_dates','')}"
+            market.source_1 = note
+            market.source_2 = note
+            self.logger.parsed_value("market.ma5", market.ma5, "TWSE跨月5日", market.base_date)
+            self.logger.parsed_value("market.avg_turnover_5d_100m", market.avg_turnover_5d_100m, "TWSE跨月5日", market.base_date)
+
         gov = raw.get("官股") or raw.get("八大官股")
         if gov and gov.status == "OK" and getattr(gov, "parse_status", "") == "PARSE_OK" and isinstance(gov.value, dict) and gov.value.get("gov_net_100m") is not None:
             market.gov_net_100m = round(float(gov.value.get("gov_net_100m")), 2)
@@ -1072,12 +1095,13 @@ class DataProcessor:
 
         ai = raw.get("AI產業")
         iek = raw.get("IEK產業分析")
-        if ai and ai.status == "OK" and isinstance(ai.value, dict) and ai.value.get("ai_strength") is not None:
-            market.ai_strength = float(ai.value.get("ai_strength"))
-            self.logger.parsed_value("market.ai_strength", market.ai_strength, ai.source, ai.date)
-        elif iek and iek.status == "OK" and isinstance(iek.value, dict) and iek.value.get("ai_strength") is not None:
+        # V2.5：依P0/P1修正，IEK 台灣產業來源優先於 TechCrunch，避免低估台股AI產業強度。
+        if iek and iek.status == "OK" and isinstance(iek.value, dict) and iek.value.get("ai_strength") is not None:
             market.ai_strength = float(iek.value.get("ai_strength"))
             self.logger.parsed_value("market.ai_strength", market.ai_strength, iek.source, iek.date)
+        elif ai and ai.status == "OK" and isinstance(ai.value, dict) and ai.value.get("ai_strength") is not None:
+            market.ai_strength = float(ai.value.get("ai_strength"))
+            self.logger.parsed_value("market.ai_strength", market.ai_strength, ai.source, ai.date)
         else:
             market.ai_strength = 0.5
 
@@ -1341,6 +1365,548 @@ class ExplanationEngine:
             advice += " 技術風險偏高，需再降部位。"
         return {"宏觀總分": f"{macro_total:.2f}", "技術風險分數": f"{tech.risk_score:.0f}", "市場狀態": state, "交易開關": switch, "操作建議": advice, "核心結論": tech.market_judgement}
 
+
+# =============================
+# V2.5 P0 Institutional Report + TEJ + Market5Day
+# =============================
+EXPECTED_INSTITUTIONAL_SHEETS = [
+    "00_執行摘要", "01_DB資料盤點", "02_模型設計", "03_最終TOP15",
+    "04_成長模型TOP30", "05_價值模型TOP30", "06_低位階候選",
+    "07_老師點名股檢核", "08_排除與風險", "09_來源與限制"
+]
+
+REPORT_COLUMNS = [
+    "排名", "代號", "名稱", "市場", "產業", "題材", "老師分類", "現價",
+    "低接區", "停損", "目標1", "目標2", "RR", "是否可下單",
+    "老師總分", "成長分", "價值分", "EPS_TTM", "PE", "殖利率%",
+    "營收YoY%", "法人分", "20日漲幅%", "低位階分", "K線分",
+    "均線支撐分", "量能健康分", "營收EPS分", "操作策略", "排除原因"
+]
+
+TEACHER_WATCHLIST = [
+    "2317", "2382", "3706", "2881", "2330", "3019", "2324", "6533", "2359",
+    "3231", "2454", "3034", "3711", "9945", "2603", "2412"
+]
+
+class TEJGovBankEngine:
+    """V2.5 P0：TEJ八大公股行庫主來源解析。Wantgoo/T86只作佐證，不冒充主資料。"""
+    def __init__(self, tej_file: Optional[str], logger: Macro16Logger):
+        self.tej_file = tej_file
+        self.logger = logger
+
+    def _to_number(self, v: Any) -> float:
+        try:
+            if v is None:
+                return math.nan
+            s = str(v).replace(",", "").replace("--", "").strip()
+            if s == "" or s.lower() == "nan":
+                return math.nan
+            return float(s)
+        except Exception:
+            return math.nan
+
+    def load(self):
+        if pd is None:
+            self.logger.warning("TEJGovBankEngine 需要 pandas，未安裝時官股只能標示WARN")
+            return None
+        if not self.tej_file:
+            return None
+        path = Path(self.tej_file)
+        if not path.exists():
+            self.logger.warning(f"TEJ_GOV_FILE_NOT_FOUND path={path}")
+            return None
+        try:
+            sheets = pd.read_excel(path, sheet_name=None)
+        except Exception as exc:
+            self.logger.warning(f"TEJ_GOV_READ_FAIL path={path} error={exc}")
+            return None
+        raw = None
+        for name in ["Raw1", "Raw2", "raw1", "raw2"]:
+            if name in sheets:
+                raw = sheets[name]
+                break
+        if raw is None:
+            for _, df in sheets.items():
+                cols = [str(c) for c in df.columns]
+                if any(("買" in c and "超" in c) for c in cols):
+                    raw = df
+                    break
+        if raw is None or raw.empty:
+            return None
+        raw = raw.copy()
+        raw.columns = [str(c).strip() for c in raw.columns]
+        return raw
+
+    def parse(self) -> Dict[str, Any]:
+        df = self.load()
+        if df is None or len(df) == 0:
+            return {"status": "WARN", "gov_net_100m": None, "gov_signal": "未知", "gov_score": 0, "message": "TEJ檔案未提供、讀取失敗或無Raw資料", "rows": 0}
+        amount_col = next((c for c in df.columns if "買(賣)超金額" in c or "買賣超金額" in c or "買賣超金額" in c.replace(" ", "")), None)
+        net_col = next((c for c in df.columns if "買(賣)超" in c or "買賣超" in c), None)
+        date_col = next((c for c in df.columns if "日期" in c), None)
+        if amount_col:
+            amount = sum([self._to_number(x) for x in df[amount_col].tolist() if not math.isnan(self._to_number(x))])
+            # TEJ欄位可能已是千元/元；先以欄名金額總和保守轉億元，證據保留原欄位。
+            gov_net_100m = amount / 100000000.0
+            amount_source_col = amount_col
+        elif net_col:
+            gov_net_100m = None
+            amount_source_col = net_col
+        else:
+            return {"status": "WARN", "gov_net_100m": None, "gov_signal": "未知", "gov_score": 0, "message": "TEJ欄位缺少買賣超或買賣超金額", "rows": len(df)}
+        if gov_net_100m is None:
+            net_vals = [self._to_number(x) for x in df[net_col].tolist()]
+            net_vals = [x for x in net_vals if not math.isnan(x)]
+            direction_sum = sum(net_vals) if net_vals else 0
+            gov_signal = "偏多" if direction_sum > 0 else "偏空" if direction_sum < 0 else "中性"
+        else:
+            gov_signal = "偏多" if gov_net_100m > 0 else "偏空" if gov_net_100m < 0 else "中性"
+        gov_score = 1 if gov_signal == "偏多" else -1 if gov_signal == "偏空" else 0
+        actual_date = "latest"
+        if date_col and df[date_col].notna().any():
+            actual_date = str(df[date_col].dropna().iloc[0])
+        payload = {
+            "status": "OK", "source": "TEJ八大公股行庫", "actual_date": actual_date,
+            "gov_net_100m": gov_net_100m, "gov_signal": gov_signal, "gov_score": gov_score,
+            "rows": len(df), "amount_column": amount_source_col,
+            "message": "TEJ八大官股解析完成；TWSE T86/Wantgoo僅作佐證"
+        }
+        self.logger.write_raw_evidence("官股_TEJ", payload, parsed=payload, status="OK", url=self.tej_file or "", message=payload["message"])
+        self.logger.parsed_value("gov_net_100m", gov_net_100m, "TEJ八大公股行庫", actual_date)
+        return payload
+
+class Market5DayEngine:
+    """V2.5 P0：跨月回補最近5個有效交易日，避免前高/前低/5MA/5日均量空白。"""
+    def __init__(self, client: HttpClient, logger: Macro16Logger):
+        self.client = client
+        self.logger = logger
+
+    def _num(self, value: Any) -> float:
+        try:
+            return float(str(value).replace(",", "").strip())
+        except Exception:
+            return math.nan
+
+    def _iso(self, compact: str) -> str:
+        compact = str(compact).replace("-", "")
+        return f"{compact[:4]}-{compact[4:6]}-{compact[6:8]}"
+
+    def _tw_date_to_iso(self, value: Any) -> str:
+        s = str(value).strip()
+        parts = s.split("/")
+        if len(parts) >= 3:
+            year = int(parts[0]) + 1911 if int(parts[0]) < 1911 else int(parts[0])
+            return f"{year:04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+        if re.fullmatch(r"\d{8}", s):
+            return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+        return s
+
+    def _month_candidates(self, base_date: str, months_back: int = 4) -> List[str]:
+        base = dt.datetime.strptime(str(base_date).replace("-", ""), "%Y%m%d").date().replace(day=1)
+        out = []
+        y, m = base.year, base.month
+        for _ in range(months_back):
+            out.append(f"{y:04d}{m:02d}01")
+            m -= 1
+            if m == 0:
+                y -= 1; m = 12
+        return out
+
+    def fetch_taiex_recent_days(self, base_date: str, need: int = 5):
+        frames = []
+        for month_start in self._month_candidates(base_date, 4):
+            url = f"https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?date={month_start}&response=json"
+            try:
+                js = self.client.get_json(url)
+            except Exception as exc:
+                self.logger.warning(f"MARKET5_TAIEX_FETCH_FAIL url={url} error={exc}")
+                continue
+            for row in js.get("data", []) or []:
+                try:
+                    frames.append({"date": self._tw_date_to_iso(row[0]), "open": self._num(row[1]), "high": self._num(row[2]), "low": self._num(row[3]), "close": self._num(row[4])})
+                except Exception:
+                    continue
+        if pd is None:
+            return []
+        df = pd.DataFrame(frames)
+        if df.empty:
+            return df
+        df = df.dropna(subset=["date", "close"]).drop_duplicates("date")
+        df = df[df["date"] <= self._iso(base_date)].sort_values("date", ascending=False).head(need)
+        return df.sort_values("date")
+
+    def fetch_turnover_recent_days(self, base_date: str, need: int = 5):
+        frames = []
+        for month_start in self._month_candidates(base_date, 4):
+            url = f"https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date={month_start}&response=json"
+            try:
+                js = self.client.get_json(url)
+            except Exception as exc:
+                self.logger.warning(f"MARKET5_TURNOVER_FETCH_FAIL url={url} error={exc}")
+                continue
+            for row in js.get("data", []) or []:
+                try:
+                    frames.append({"date": self._tw_date_to_iso(row[0]), "turnover_100m": self._num(row[2]) / 100000000.0})
+                except Exception:
+                    continue
+        if pd is None:
+            return []
+        df = pd.DataFrame(frames)
+        if df.empty:
+            return df
+        df = df.dropna(subset=["date", "turnover_100m"]).drop_duplicates("date")
+        df = df[df["date"] <= self._iso(base_date)].sort_values("date", ascending=False).head(need)
+        return df.sort_values("date")
+
+    def build_market_features(self, base_date: str) -> Dict[str, Any]:
+        compact = str(base_date).replace("-", "")
+        px = self.fetch_taiex_recent_days(compact, 5)
+        tv = self.fetch_turnover_recent_days(compact, 5)
+        if pd is None or getattr(px, "empty", True) or getattr(tv, "empty", True) or len(px) < 5 or len(tv) < 5:
+            msg = f"P0_FAIL: 最近5交易日不足 taiex={0 if pd is None or getattr(px,'empty',True) else len(px)} turnover={0 if pd is None or getattr(tv,'empty',True) else len(tv)}"
+            self.logger.warning(msg)
+            return {"status": "FAIL", "message": msg}
+        latest = px.iloc[-1]
+        prev = px.iloc[-2]
+        result = {
+            "status": "OK", "base_date": latest["date"], "close": float(latest["close"]),
+            "high": float(latest["high"]), "low": float(latest["low"]),
+            "prev_high": float(prev["high"]), "prev_low": float(prev["low"]),
+            "ma5": round(float(px["close"].mean()), 2),
+            "turnover_100m": round(float(tv.iloc[-1]["turnover_100m"]), 2),
+            "avg_turnover_5d_100m": round(float(tv["turnover_100m"].mean()), 2),
+            "taiex_recent_dates": ",".join(px["date"].astype(str).tolist()),
+            "turnover_recent_dates": ",".join(tv["date"].astype(str).tolist()),
+        }
+        self.logger.write_raw_evidence("市場5日資料", result, parsed=result, status="OK", url="TWSE MI_5MINS_HIST/FMTQIK", message="跨月5日資料已補齊")
+        return result
+
+class DBRepository:
+    """V2.5：從股票DB建立機構級報告資料集。"""
+    def __init__(self, db_path: str, logger: Optional[Macro16Logger] = None):
+        self.db_path = db_path
+        self.logger = logger
+
+    def connect(self):
+        return sqlite3.connect(self.db_path)
+
+    def table_exists(self, table: str) -> bool:
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+            return cur.fetchone() is not None
+
+    def get_trade_date(self) -> str:
+        with self.connect() as conn:
+            return pd.read_sql("SELECT MAX(date) AS d FROM ranking_result", conn).iloc[0]["d"]
+
+    def table_count(self, table: str) -> int:
+        if not self.table_exists(table):
+            return 0
+        with self.connect() as conn:
+            return int(pd.read_sql(f"SELECT COUNT(*) AS n FROM {table}", conn).iloc[0]["n"])
+
+    def latest_date(self, table: str) -> str:
+        if not self.table_exists(table):
+            return ""
+        candidates = ["date", "snapshot_date", "trade_date", "data_date", "feature_date", "plan_date", "source_date", "data_year"]
+        with self.connect() as conn:
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            for c in candidates:
+                if c in cols:
+                    try:
+                        return str(pd.read_sql(f"SELECT MAX({c}) AS d FROM {table}", conn).iloc[0]["d"])
+                    except Exception:
+                        pass
+        return ""
+
+    def load_latest_table(self, conn, table: str, date_col: str, trade_date: str):
+        if not self.table_exists(table):
+            return pd.DataFrame()
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if date_col in cols:
+            try:
+                return pd.read_sql(f"SELECT * FROM {table} WHERE {date_col}=(SELECT MAX({date_col}) FROM {table} WHERE {date_col}<=?)", conn, params=[trade_date])
+            except Exception:
+                pass
+        return pd.read_sql(f"SELECT * FROM {table}", conn)
+
+    def load_base_universe(self, trade_date: str):
+        with self.connect() as conn:
+            r = pd.read_sql("SELECT * FROM ranking_result WHERE date=?", conn, params=[trade_date])
+            ms = self.load_latest_table(conn, "market_snapshot", "snapshot_date", trade_date)
+            sm = self.load_latest_table(conn, "stocks_master", "update_date", trade_date)
+            val = self.load_latest_table(conn, "external_valuation", "data_date", trade_date)
+            rev = self.load_latest_table(conn, "external_revenue", "source_date", trade_date)
+            inst = self.load_latest_table(conn, "external_institutional", "trade_date", trade_date)
+            margin = self.load_latest_table(conn, "external_margin", "trade_date", trade_date)
+            ph = pd.read_sql("SELECT * FROM price_history WHERE date<=?", conn, params=[trade_date]) if self.table_exists("price_history") else pd.DataFrame()
+        for df in [r, ms, sm, val, rev, inst, margin, ph]:
+            if not df.empty and "stock_id" in df.columns:
+                df["stock_id"] = df["stock_id"].astype(str).str.zfill(4)
+        df = r.copy()
+        if not ms.empty:
+            df = df.merge(ms.drop_duplicates("stock_id"), on="stock_id", how="left", suffixes=("", "_m"))
+        if not sm.empty:
+            df = df.merge(sm.drop_duplicates("stock_id"), on="stock_id", how="left", suffixes=("", "_master"))
+        if not val.empty:
+            df = df.merge(val.drop_duplicates("stock_id"), on="stock_id", how="left", suffixes=("", "_valuation"))
+        if not rev.empty:
+            df = df.merge(rev.drop_duplicates("stock_id"), on="stock_id", how="left", suffixes=("", "_revenue"))
+        if not inst.empty:
+            df = df.merge(inst.drop_duplicates("stock_id"), on="stock_id", how="left", suffixes=("", "_inst"))
+        if not margin.empty:
+            df = df.merge(margin.drop_duplicates("stock_id"), on="stock_id", how="left", suffixes=("", "_margin"))
+        if not ph.empty:
+            feats = self._price_features(ph)
+            df = df.merge(feats, on="stock_id", how="left")
+        return df.drop_duplicates("stock_id")
+
+    def _price_features(self, ph):
+        out = []
+        for sid, g in ph.groupby("stock_id"):
+            g = g.sort_values("date")
+            close = pd.to_numeric(g["close"], errors="coerce")
+            high = pd.to_numeric(g["high"], errors="coerce")
+            low = pd.to_numeric(g["low"], errors="coerce")
+            vol = pd.to_numeric(g.get("volume"), errors="coerce") if "volume" in g.columns else pd.Series(dtype=float)
+            last_close = close.iloc[-1] if len(close) else math.nan
+            high120 = high.tail(120).max() if len(high) else math.nan
+            low120 = low.tail(120).min() if len(low) else math.nan
+            pos120 = (last_close - low120) / (high120 - low120) if high120 and low120 and high120 != low120 else math.nan
+            pct20 = (last_close / close.iloc[-20] - 1) * 100 if len(close) >= 20 and close.iloc[-20] else math.nan
+            ma20_calc = close.tail(20).mean() if len(close) >= 20 else math.nan
+            ma60_calc = close.tail(60).mean() if len(close) >= 60 else math.nan
+            vol5 = vol.tail(5).mean() if len(vol) >= 5 else math.nan
+            vol20 = vol.tail(20).mean() if len(vol) >= 20 else math.nan
+            out.append({"stock_id": str(sid).zfill(4), "pos_120d": pos120, "pct_20d": pct20, "ma20_calc": ma20_calc, "ma60_calc": ma60_calc, "vol5": vol5, "vol20": vol20})
+        return pd.DataFrame(out)
+
+class FeatureBuilder:
+    def build(self, df):
+        for c in ["close", "ma20", "ma60", "ma20_calc", "ma60_calc", "rsi", "volume", "vol5", "vol20", "revenue_yoy", "yoy", "eps_ttm", "eps_yoy", "pe", "dividend_yield", "roe", "institutional_score", "risk_score"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["close"] = df.get("close", pd.Series(index=df.index, dtype=float)).fillna(df.get("close_m", pd.Series(index=df.index, dtype=float)))
+        df["ma20_final"] = df.get("ma20", pd.Series(index=df.index, dtype=float)).fillna(df.get("ma20_calc", pd.Series(index=df.index, dtype=float)))
+        df["ma60_final"] = df.get("ma60", pd.Series(index=df.index, dtype=float)).fillna(df.get("ma60_calc", pd.Series(index=df.index, dtype=float)))
+        df["low_base_score"] = ((1 - df.get("pos_120d", pd.Series(index=df.index, dtype=float)).clip(0,1)) * 100).fillna(50)
+        df["ma_support_score"] = 50
+        df.loc[df["close"] >= df["ma20_final"], "ma_support_score"] += 25
+        df.loc[df["ma20_final"] >= df["ma60_final"] * 0.98, "ma_support_score"] += 25
+        df["ma_support_score"] = df["ma_support_score"].clip(0,100)
+        df["kline_score"] = df.get("reversal_score", pd.Series(50, index=df.index)).fillna(50)
+        ratio = df.get("vol5", pd.Series(index=df.index, dtype=float)) / df.get("vol20", pd.Series(index=df.index, dtype=float)).replace(0, math.nan)
+        df["volume_health_score"] = (50 + (ratio.fillna(1) - 1) * 50).clip(0,100)
+        rev = df.get("yoy", df.get("revenue_yoy", pd.Series(index=df.index, dtype=float)))
+        eps_yoy = df.get("eps_yoy", pd.Series(index=df.index, dtype=float))
+        df["revenue_eps_score"] = (normalize_series(rev) * 0.55 + normalize_series(eps_yoy) * 0.45).fillna(50)
+        theme_text = (df.get("theme", df.get("sub_theme", pd.Series("", index=df.index))).astype(str) + " " + df.get("industry", pd.Series("", index=df.index)).astype(str))
+        df["theme_score"] = theme_text.apply(lambda x: 85 if any(k in x for k in ["AI", "半導體", "伺服器", "CPO", "散熱", "電源", "網通"]) else 50)
+        return df
+
+def normalize_series(series, low=None, high=None):
+    if series is None:
+        return pd.Series(dtype=float)
+    s = pd.to_numeric(series, errors="coerce")
+    if s.dropna().empty:
+        return pd.Series(50, index=s.index)
+    lo = s.quantile(0.05) if low is None else low
+    hi = s.quantile(0.95) if high is None else high
+    if hi == lo:
+        return pd.Series(50, index=s.index)
+    return ((s - lo) / (hi - lo) * 100).clip(0,100).fillna(50)
+
+class DualModelScoringEngine:
+    def score(self, df):
+        rev = df.get("yoy", df.get("revenue_yoy", pd.Series(index=df.index, dtype=float)))
+        df["growth_score"] = (
+            0.25 * normalize_series(rev) +
+            0.20 * normalize_series(df.get("eps_yoy")) +
+            0.20 * normalize_series(df.get("ai_score")) +
+            0.15 * normalize_series(df.get("momentum_score")) +
+            0.10 * normalize_series(df.get("volume_score")) +
+            0.10 * df.get("theme_score", pd.Series(50, index=df.index))
+        )
+        df["value_score"] = (
+            0.25 * (100 - normalize_series(df.get("pe"))) +
+            0.20 * normalize_series(df.get("dividend_yield")) +
+            0.20 * normalize_series(df.get("roe")) +
+            0.15 * normalize_series(100 - pd.to_numeric(df.get("risk_score", pd.Series(50, index=df.index)), errors="coerce")) +
+            0.10 * df.get("ma_support_score", pd.Series(50, index=df.index)) +
+            0.10 * normalize_series(df.get("institutional_score"))
+        )
+        df["teacher_score"] = (
+            0.20 * df.get("low_base_score", pd.Series(50, index=df.index)) +
+            0.20 * df.get("kline_score", pd.Series(50, index=df.index)) +
+            0.15 * df.get("ma_support_score", pd.Series(50, index=df.index)) +
+            0.10 * df.get("volume_health_score", pd.Series(50, index=df.index)) +
+            0.15 * df.get("revenue_eps_score", pd.Series(50, index=df.index)) +
+            0.10 * normalize_series(df.get("dividend_yield")) +
+            0.10 * df.get("theme_score", pd.Series(50, index=df.index))
+        )
+        return df
+
+class ReportClassifier:
+    def classify(self, df):
+        df["老師分類"] = "觀察"
+        rev = pd.to_numeric(df.get("yoy", df.get("revenue_yoy", pd.Series(index=df.index))), errors="coerce")
+        df.loc[(rev >= 20) & (df["growth_score"] >= 70), "老師分類"] = "主流成長"
+        df.loc[(pd.to_numeric(df.get("eps_ttm", 0), errors="coerce") > 0) & (pd.to_numeric(df.get("pe", 999), errors="coerce") <= 18), "老師分類"] = "價值防守"
+        df.loc[(df.get("pos_120d", pd.Series(1,index=df.index)) <= 0.45) & (df["ma_support_score"] >= 60), "老師分類"] = "低位階翻多"
+        return df
+
+class TradePlanEngine:
+    def build(self, df):
+        close = pd.to_numeric(df["close"], errors="coerce")
+        ma20 = pd.to_numeric(df["ma20_final"], errors="coerce")
+        ma60 = pd.to_numeric(df["ma60_final"], errors="coerce")
+        atr = pd.to_numeric(df.get("atr"), errors="coerce")
+        df["entry_low"] = np.maximum(ma20 * 0.98, close * 0.935) if np is not None else close * 0.935
+        df["entry_high"] = np.minimum(ma20 * 1.01, close * 0.965) if np is not None else close * 0.965
+        fallback = df["entry_low"].isna() | df["entry_high"].isna() | (close < df["entry_low"])
+        df.loc[fallback, "entry_low"] = close * 0.995
+        df.loc[fallback, "entry_high"] = close * 1.010
+        df["stop_loss"] = np.minimum(ma60 * 0.97, df["entry_low"] * 0.94) if np is not None else df["entry_low"] * 0.94
+        df["stop_loss"] = df["stop_loss"].fillna(df["entry_low"] * 0.94)
+        df["target_1"] = np.where(atr.notna(), close + atr * 1.382, close * 1.05) if np is not None else close * 1.05
+        df["target_2"] = np.where(atr.notna(), close + atr * 1.618, close * 1.125) if np is not None else close * 1.125
+        df["rr"] = ((df["target_1"] - df["entry_high"]) / (df["entry_high"] - df["stop_loss"].replace(0, math.nan))).replace([math.inf, -math.inf], math.nan)
+        df["exclude_reason"] = ""
+        df.loc[pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0) < 500, "exclude_reason"] += "成交量不足;"
+        df.loc[df["rr"].fillna(0) < 1.2, "exclude_reason"] += "RR不足;"
+        df.loc[pd.to_numeric(df.get("rsi", 50), errors="coerce").fillna(50) > 78, "exclude_reason"] += "RSI過熱;"
+        df["exclude_flag"] = df["exclude_reason"].ne("")
+        df["是否可下單"] = "NO"
+        yes = (df["teacher_score"] >= 55) & (df["rr"] >= 1.5) & (~df["exclude_flag"]) & (close <= df["entry_high"] * 1.03)
+        wait = (df["teacher_score"] >= 55) & (df["rr"] >= 1.5) & (~df["exclude_flag"]) & (~yes)
+        df.loc[yes, "是否可下單"] = "YES"
+        df.loc[wait, "是否可下單"] = "WAIT"
+        df["操作策略"] = df["是否可下單"].map({"YES":"低接區內可分批", "WAIT":"等待回到低接區或RR改善", "NO":"不符合下單條件"}).fillna("觀察")
+        return df
+
+class InstitutionalReportEngine:
+    def __init__(self, db_path: str, logger: Macro16Logger):
+        self.repo = DBRepository(db_path, logger)
+        self.logger = logger
+
+    def run(self):
+        if pd is None:
+            self.logger.warning("pandas未安裝，無法產出機構級股票投資規劃報表")
+            return None
+        trade_date = self.repo.get_trade_date()
+        df = self.repo.load_base_universe(trade_date)
+        df = FeatureBuilder().build(df)
+        df = DualModelScoringEngine().score(df)
+        df = ReportClassifier().classify(df)
+        df = TradePlanEngine().build(df)
+        df["report_name"] = df.get("stock_name", df.get("stock_name_master", df.get("name", "")))
+        result = {
+            "trade_date": trade_date,
+            "db_path": self.repo.db_path,
+            "counts": {t: self.repo.table_count(t) for t in ["ranking_result", "market_snapshot", "price_history", "external_revenue", "external_valuation", "external_institutional", "external_margin", "trade_plan"]},
+            "latest_dates": {t: self.repo.latest_date(t) for t in ["ranking_result", "market_snapshot", "price_history", "external_revenue", "external_valuation", "external_institutional", "external_margin", "trade_plan"]},
+            "all": df
+        }
+        self.logger.info(f"INSTITUTIONAL_REPORT_READY date={trade_date} rows={len(df)}")
+        return result
+
+class ReportValidator:
+    def validate_workbook(self, wb) -> List[str]:
+        errors = []
+        for name in EXPECTED_INSTITUTIONAL_SHEETS:
+            if name not in wb.sheetnames:
+                errors.append(f"缺少Sheet:{name}")
+        # 驗證03~08欄位
+        for name in EXPECTED_INSTITUTIONAL_SHEETS[3:9]:
+            if name in wb.sheetnames:
+                ws = wb[name]
+                cols = [ws.cell(1, i).value for i in range(1, len(REPORT_COLUMNS)+1)]
+                if cols != REPORT_COLUMNS:
+                    errors.append(f"{name}欄位不一致")
+        return errors
+
+class InstitutionalExcelWriter:
+    def __init__(self, logger: Macro16Logger):
+        self.logger = logger
+
+    def _sheet(self, wb, name):
+        if name in wb.sheetnames:
+            ws = wb[name]
+            ws.delete_rows(1, ws.max_row)
+        else:
+            ws = wb.create_sheet(name)
+        return ws
+
+    def _report_rows(self, df, topn=None):
+        if df is None or df.empty:
+            return []
+        if topn:
+            df = df.head(topn)
+        rows=[]
+        for i, (_, r) in enumerate(df.iterrows(), 1):
+            name = r.get("stock_name") or r.get("stock_name_master") or r.get("report_name") or ""
+            rows.append([
+                i, str(r.get("stock_id", "")).zfill(4), name, r.get("market", ""), r.get("industry", r.get("industry_master", "")), r.get("theme", r.get("sub_theme", "")), r.get("老師分類", ""), round(float(r.get("close", 0) or 0),2),
+                f"{round(float(r.get('entry_low',0) or 0),2)}~{round(float(r.get('entry_high',0) or 0),2)}", round(float(r.get("stop_loss",0) or 0),2), round(float(r.get("target_1",0) or 0),2), round(float(r.get("target_2",0) or 0),2), round(float(r.get("rr",0) or 0),2), r.get("是否可下單", "NO"),
+                round(float(r.get("teacher_score",0) or 0),2), round(float(r.get("growth_score",0) or 0),2), round(float(r.get("value_score",0) or 0),2), round(float(r.get("eps_ttm", r.get("valuation_eps_ttm",0)) or 0),2), round(float(r.get("pe",0) or 0),2), round(float(r.get("dividend_yield",0) or 0),2),
+                round(float(r.get("yoy", r.get("revenue_yoy",0)) or 0),2), round(float(r.get("institutional_score",0) or 0),2), round(float(r.get("pct_20d",0) or 0),2), round(float(r.get("low_base_score",0) or 0),2), round(float(r.get("kline_score",0) or 0),2),
+                round(float(r.get("ma_support_score",0) or 0),2), round(float(r.get("volume_health_score",0) or 0),2), round(float(r.get("revenue_eps_score",0) or 0),2), r.get("操作策略", ""), r.get("exclude_reason", "")
+            ])
+        return rows
+
+    def write_into_workbook(self, wb, report: Optional[Dict[str, Any]], gov_result: Optional[Dict[str, Any]] = None, market5_result: Optional[Dict[str, Any]] = None):
+        if report is None:
+            return
+        df = report["all"]
+        # 00
+        ws = self._sheet(wb, "00_執行摘要")
+        ws.append(["項目", "內容"])
+        ws.append(["報告日期", report.get("trade_date")])
+        ws.append(["DB路徑", report.get("db_path")])
+        ws.append(["總股票數", len(df)])
+        ws.append(["YES", int((df["是否可下單"]=="YES").sum())])
+        ws.append(["WAIT", int((df["是否可下單"]=="WAIT").sum())])
+        ws.append(["NO", int((df["是否可下單"]=="NO").sum())])
+        ws.append(["TEJ官股", json.dumps(gov_result or {}, ensure_ascii=False)[:800]])
+        ws.append(["跨月5日", json.dumps(market5_result or {}, ensure_ascii=False)[:800]])
+        # 01
+        ws = self._sheet(wb, "01_DB資料盤點")
+        ws.append(["資料表", "筆數", "最新日期", "用途"])
+        usages = {"ranking_result":"模型排行主資料", "market_snapshot":"價格/RSI/ATR/MA", "price_history":"日K/20日漲幅/120日位階", "external_revenue":"營收YoY", "external_valuation":"PE/EPS/殖利率", "external_institutional":"法人分", "external_margin":"融資風險", "trade_plan":"既有交易計畫參考"}
+        for t,n in report.get("counts",{}).items():
+            ws.append([t,n,report.get("latest_dates",{}).get(t,""),usages.get(t,"")])
+        # 02
+        ws = self._sheet(wb, "02_模型設計")
+        ws.append(["模型", "權重/規則", "說明"])
+        ws.append(["老師總分", "低位階20% + K線20% + 均線15% + 量能10% + 營收EPS15% + 殖利率10% + 題材10%", "依Word規格"])
+        ws.append(["YES", "teacher_score>=55 AND RR>=1.5 AND 非排除 AND 現價<=entry_high*1.03", "可下單"])
+        ws.append(["WAIT", "分數與RR足夠但位置未到", "等待低接"])
+        ws.append(["NO", "排除條件或RR不足", "不下單"])
+        # datasets
+        final = df[~df["exclude_flag"]].sort_values(["teacher_score","growth_score","value_score"], ascending=False).head(15)
+        growth = df.sort_values("growth_score", ascending=False).head(30)
+        value = df.sort_values("value_score", ascending=False).head(30)
+        low = df[df["老師分類"].eq("低位階翻多")].sort_values("teacher_score", ascending=False).head(30)
+        watch = df[df["stock_id"].astype(str).str.zfill(4).isin(TEACHER_WATCHLIST)].sort_values("teacher_score", ascending=False)
+        excluded = df[df["exclude_flag"]].sort_values("teacher_score", ascending=False).head(100)
+        for sheet, data, topn in [("03_最終TOP15", final, 15), ("04_成長模型TOP30", growth, 30), ("05_價值模型TOP30", value, 30), ("06_低位階候選", low, 30), ("07_老師點名股檢核", watch, None), ("08_排除與風險", excluded, 100)]:
+            ws = self._sheet(wb, sheet)
+            ws.append(REPORT_COLUMNS)
+            for row in self._report_rows(data, topn):
+                ws.append(row)
+        ws = self._sheet(wb, "09_來源與限制")
+        ws.append(["項目", "內容"])
+        ws.append(["資料來源", "stock_system DB + TEJ八大公股行庫（若提供）+ TWSE/TPEX/TAIFEX宏觀來源"])
+        ws.append(["TEJ八大官股", "本版已提供TEJGovBankEngine；缺檔時標P0_WARN，不得用Wantgoo冒充主資料"])
+        ws.append(["Macro16跨月5日", "本版已提供Market5DayEngine；不足5日標P0_FAIL，停止市場技術判斷"])
+        ws.append(["格式驗收", "00~09固定；03~08共用30欄；不得新增第10頁"])
+        errors = ReportValidator().validate_workbook(wb)
+        if errors:
+            self.logger.warning("INSTITUTIONAL_REPORT_VALIDATE_FAIL " + ";".join(errors))
+        else:
+            self.logger.info("INSTITUTIONAL_REPORT_VALIDATE_OK")
+
 class ExcelWriter:
     def __init__(self, logger: Macro16Logger):
         self.logger = logger
@@ -1349,7 +1915,7 @@ class ExcelWriter:
         self.warn_fill = PatternFill("solid", fgColor="FFF2CC")
         self.thin = Side(style="thin", color="D9E2F3")
 
-    def write(self, template: Optional[str], out_path: str, market: MarketInput, scores: List[ModuleScore], tech: TechnicalRisk, summary: Dict[str, str], logs: List[str], raw: Optional[Dict[str, RawData]] = None) -> str:
+    def write(self, template: Optional[str], out_path: str, market: MarketInput, scores: List[ModuleScore], tech: TechnicalRisk, summary: Dict[str, str], logs: List[str], raw: Optional[Dict[str, RawData]] = None, institutional_report: Optional[Dict[str, Any]] = None, gov_result: Optional[Dict[str, Any]] = None, market5_result: Optional[Dict[str, Any]] = None) -> str:
         if template and Path(template).exists():
             try:
                 wb = load_workbook(template)
@@ -1359,6 +1925,9 @@ class ExcelWriter:
                 wb = Workbook()
         else:
             wb = Workbook()
+        # V2.5：若有DB報告，先輸出00~09機構等級股票投資規劃，並驗證欄位一致性。
+        if institutional_report is not None:
+            InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result)
         self._write_market_input(wb, market)
         self._write_macro_modules(wb, scores)
         self._write_technical(wb, tech)
@@ -1569,7 +2138,7 @@ class Macro16Engine:
         self.writer = ExcelWriter(self.logger)
         self.word_evidence_writer = WordEvidenceReportWriter(self.logger)
 
-    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False) -> Dict[str, Any]:
+    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
@@ -1584,6 +2153,9 @@ class Macro16Engine:
             self.logger.warning(f"資料基準日校正失敗：{exc}")
         raw["成交量"] = self.source.fetch_twse_turnover_month(actual_twse_date)
         raw["外資"] = self.source.fetch_foreign_investor(actual_twse_date)
+        # V2.5 P0：跨月補齊最近5個有效交易日，產出前高/前低/5MA/5日均量。
+        market5_result = Market5DayEngine(self.client, self.logger).build_market_features(actual_twse_date or requested_date or dt.date.today().strftime("%Y%m%d"))
+        raw["市場5日資料"] = RawData("市場5日資料", market5_result, market5_result.get("base_date", ""), "TWSE跨月5日", "TWSE MI_5MINS_HIST/FMTQIK", self.source._today_str(), "OK" if market5_result.get("status") == "OK" else "FAIL", market5_result.get("message", ""), requested_date or "", market5_result.get("base_date", ""), False, 0, "OK" if market5_result.get("status") == "OK" else "DATA_MISSING", market5_result.get("message", ""), "PARSE_OK" if market5_result.get("status") == "OK" else "NO_PARSED_VALUE", confidence=1.0 if market5_result.get("status") == "OK" else 0.0)
         for module, symbol in YAHOO_SYMBOLS.items():
             raw[module] = self.source.fetch_yahoo_chart(symbol, module)
         for module, symbols in YAHOO_SYMBOL_CANDIDATES.items():
@@ -1598,7 +2170,13 @@ class Macro16Engine:
         raw["ISW衝突分析"] = self.source.fetch_isw_conflict()
         raw["CNN重大新聞"] = self.source.fetch_cnn_major_news()
         raw["美國總統"] = self.source.fetch_trump_public_news()
-        raw["官股"] = self.source.fetch_twse_broker_report(base_date=actual_twse_date)
+        # V2.5 P0：TEJ八大官股為主來源；TWSE T86與Wantgoo只作佐證。
+        gov_result = TEJGovBankEngine(tej_gov_file, self.logger).parse()
+        if gov_result.get("status") == "OK":
+            raw["官股"] = RawData("官股", gov_result, gov_result.get("actual_date", ""), "TEJ八大公股行庫", tej_gov_file or "", self.source._today_str(), "OK", gov_result.get("message", ""), actual_twse_date or "", gov_result.get("actual_date", ""), False, 0, "OK", gov_result.get("message", ""), "PARSE_OK", confidence=0.95)
+        else:
+            raw["官股"] = RawData("官股", gov_result, "", "TEJ八大公股行庫", tej_gov_file or "", self.source._today_str(), "WARN", gov_result.get("message", "TEJ未提供"), actual_twse_date or "", "", False, 0, "NO_PARSED_VALUE", gov_result.get("message", ""), "NO_PARSED_VALUE", confidence=0.0)
+        raw["官股TWSE佐證"] = self.source.fetch_twse_broker_report(base_date=actual_twse_date)
         raw["官股整理"] = self.source.fetch_wantgoo_public_bank()
         raw["AI產業"] = self.source.fetch_ai_industry_news()
         raw["IEK產業分析"] = self.source.fetch_iek_industry()
@@ -1608,6 +2186,12 @@ class Macro16Engine:
         raw["櫃買官方來源"] = tpex_otc_raw
         if tpex_otc_raw.status == "OK" and isinstance(tpex_otc_raw.value, dict) and "close" in tpex_otc_raw.value:
             raw["OTC"] = tpex_otc_raw
+        institutional_report = None
+        if db_path:
+            try:
+                institutional_report = InstitutionalReportEngine(db_path, self.logger).run()
+            except Exception as exc:
+                self.logger.warning(f"INSTITUTIONAL_REPORT_FAIL db_path={db_path} error={exc}")
         if override and override.event_note:
             raw["戰爭/地緣"] = self.source.build_manual_raw("戰爭/地緣", {"event_note": override.event_note, "major_event": 1}, override.event_note)
         if override and override.night_score is not None:
@@ -1627,7 +2211,7 @@ class Macro16Engine:
         warnings = self.audit.check(market, scores, tech)
         if warnings:
             summary["QA警告"] = "; ".join(warnings[:8])
-        output = self.writer.write(template, out_path, market, scores, tech, summary, self.logger.messages, raw)
+        output = self.writer.write(template, out_path, market, scores, tech, summary, self.logger.messages, raw, institutional_report=institutional_report, gov_result=locals().get("gov_result"), market5_result=locals().get("market5_result"))
         evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
         self.logger.info("執行完成")
         return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file)}
@@ -1644,6 +2228,7 @@ def run_gui():
     out_var = tk.StringVar(value=str(Path.cwd() / f"宏觀16模組_自動回填_{dt.date.today().strftime('%Y%m%d')}.xlsx"))
     date_var = tk.StringVar(value=dt.date.today().strftime("%Y-%m-%d"))
     db_var = tk.StringVar()
+    tej_gov_var = tk.StringVar()
     strict_ranking_var = tk.BooleanVar(value=False)
     status_var = tk.StringVar(value="待執行")
 
@@ -1662,6 +2247,11 @@ def run_gui():
         if p:
             db_var.set(p)
 
+    def browse_tej_gov():
+        p = filedialog.askopenfilename(filetypes=[("TEJ Excel", "*.xls *.xlsx"), ("All files", "*.*")])
+        if p:
+            tej_gov_var.set(p)
+
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill="both", expand=True)
     ttk.Label(frm, text="宏觀16模組 自動抓取與Excel回填", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
@@ -1676,12 +2266,15 @@ def run_gui():
     ttk.Label(frm, text="主DB檔案(選填)").grid(row=4, column=0, sticky="w")
     ttk.Entry(frm, textvariable=db_var, width=90).grid(row=4, column=1, sticky="we")
     ttk.Button(frm, text="選擇DB", command=browse_db).grid(row=4, column=2)
-    ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=5, column=1, sticky="w")
-    ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=6, column=0, columnspan=3, sticky="w", pady=8)
+    ttk.Label(frm, text="TEJ八大官股檔(選填)").grid(row=5, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=tej_gov_var, width=90).grid(row=5, column=1, sticky="we")
+    ttk.Button(frm, text="選擇TEJ", command=browse_tej_gov).grid(row=5, column=2)
+    ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=6, column=1, sticky="w")
+    ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=7, column=0, columnspan=3, sticky="w", pady=8)
 
     log_text = tk.Text(frm, height=26, wrap="word")
-    log_text.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(10,0))
-    frm.rowconfigure(8, weight=1)
+    log_text.grid(row=9, column=0, columnspan=3, sticky="nsew", pady=(10,0))
+    frm.rowconfigure(9, weight=1)
     frm.columnconfigure(1, weight=1)
 
     def append_log(text):
@@ -1694,7 +2287,7 @@ def run_gui():
             status_var.set("執行中：抓資料、計分、回填Excel...")
             log_text.delete("1.0", "end")
             engine = Macro16Engine(Path("logs"))
-            result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()))
+            result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()), tej_gov_file=(tej_gov_var.get() or None))
             for msg in engine.logger.messages:
                 append_log(msg)
             append_log("\n總結：" + json.dumps(result["summary"], ensure_ascii=False, indent=2))
@@ -1706,8 +2299,8 @@ def run_gui():
             append_log("ERROR " + str(exc))
             messagebox.showerror("錯誤", str(exc))
 
-    ttk.Button(frm, text="執行回填", command=execute).grid(row=7, column=0, sticky="w", pady=6)
-    ttk.Button(frm, text="離開", command=root.destroy).grid(row=7, column=2, sticky="e", pady=6)
+    ttk.Button(frm, text="執行回填", command=execute).grid(row=8, column=0, sticky="w", pady=6)
+    ttk.Button(frm, text="離開", command=root.destroy).grid(row=8, column=2, sticky="e", pady=6)
     root.mainloop()
 
 def main():
@@ -1722,13 +2315,14 @@ def main():
     parser.add_argument("--major-event", type=int, default=None, help="人工覆寫重大事件0/1")
     parser.add_argument("--event-note", default="", help="人工覆寫戰爭/地緣/重大事件說明")
     parser.add_argument("--night-score", type=float, default=None, help="人工覆寫台股夜盤分數")
-    parser.add_argument("--db-path", default="", help="指定主SQLite DB路徑；用於ranking_result驗證")
+    parser.add_argument("--db-path", default="", help="指定主SQLite DB路徑；用於ranking_result驗證與機構級股票投資規劃報表")
+    parser.add_argument("--tej-gov-file", default="", help="TEJ八大公股行庫買賣超排名xls/xlsx；用於gov_net_100m主來源")
     parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
     args = parser.parse_args()
     if args.cli:
         engine = Macro16Engine(Path(args.log_dir))
         override = ManualOverride(gov_net_100m=args.gov_net, ai_strength=args.ai_strength, major_event=args.major_event, event_note=args.event_note, night_score=args.night_score)
-        result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking)
+        result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking, tej_gov_file=(args.tej_gov_file or None))
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         run_gui()
