@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.5.1-sop-macro16-refill-fixed"
+VERSION = "2.5.2-sop-macro16-top-output-restored"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -63,11 +63,13 @@ MODULES = [
     "官股", "台股指數", "成交量", "AI產業", "OTC", "台股夜盤"
 ]
 
-# SOP V2.1：正式輸出模式分離。
-# macro_refill：只輸出「市場輸入 / 宏觀16模組 / V2技術引擎」三頁。
+# SOP V2.2：正式輸出模式分離。
+# macro_refill：正式日常模式＝宏觀16修正頁 + 原本TOP/00~09報表（若有DB），不得刪除TOP輸出。
+# macro_only：只輸出「市場輸入 / 宏觀16模組 / V2技術引擎」三頁，用於單純驗證宏觀回填。
 # institutional_report：只輸出00~09機構級報表。
 # all：完整debug與機構報表全輸出。
 REPORT_MODE_MACRO = "macro_refill"
+REPORT_MODE_MACRO_ONLY = "macro_only"
 REPORT_MODE_INSTITUTIONAL = "institutional_report"
 REPORT_MODE_ALL = "all"
 MACRO_REFILL_SHEETS = ["市場輸入", "宏觀16模組", "V2技術引擎"]
@@ -1132,21 +1134,29 @@ class FieldCompletionValidator:
         return issues
 
 class MacroRefillValidator:
-    """SOP V2.1 P0-01/P0-02：macro_refill模式只允許三頁與宏觀16命名。"""
+    """SOP V2.2：只在 macro_only 模式清成三頁；macro_refill 不得刪除 TOP/00~09 報表。"""
     def __init__(self, logger: Macro16Logger):
         self.logger = logger
 
-    def enforce_macro_sheets(self, wb):
+    def ensure_macro_sheets(self, wb):
+        """保留既有報表，只確保宏觀三頁存在並移到前面。"""
         if not wb.sheetnames:
             wb.create_sheet("市場輸入")
         for required in MACRO_REFILL_SHEETS:
             if required not in wb.sheetnames:
                 wb.create_sheet(required)
+        front = [wb[name] for name in MACRO_REFILL_SHEETS if name in wb.sheetnames]
+        rest = [ws for ws in wb._sheets if ws.title not in MACRO_REFILL_SHEETS]
+        wb._sheets = front + rest
+        return wb
+
+    def enforce_macro_only_sheets(self, wb):
+        """macro_only 專用：只保留宏觀三頁。"""
+        self.ensure_macro_sheets(wb)
         for name in list(wb.sheetnames):
             if name not in MACRO_REFILL_SHEETS:
                 del wb[name]
-                self.logger.info(f"MACRO_REFILL_REMOVE_EXTRA_SHEET sheet={name}")
-        # 依指定順序排序
+                self.logger.info(f"MACRO_ONLY_REMOVE_EXTRA_SHEET sheet={name}")
         wb._sheets = [wb[name] for name in MACRO_REFILL_SHEETS]
         return wb
 
@@ -2073,8 +2083,21 @@ class ExcelWriter:
             if wb.sheetnames == ["Sheet"]:
                 wb["Sheet"].title = "市場輸入"
         report_mode = report_mode or REPORT_MODE_MACRO
+        validator = MacroRefillValidator(self.logger)
         if report_mode == REPORT_MODE_MACRO:
-            MacroRefillValidator(self.logger).enforce_macro_sheets(wb)
+            # 正式日常模式：修正宏觀16，但不得關閉/刪除原本TOP與00~09報表。
+            validator.ensure_macro_sheets(wb)
+            self._write_market_input(wb, market)
+            self._write_macro_modules(wb, scores)
+            self._write_technical(wb, tech)
+            if institutional_report is not None:
+                InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result)
+                self.logger.info("MACRO_REFILL_TOP_OUTPUT_RESTORED sheets=00_09_institutional_reports")
+            else:
+                self.logger.warning("MACRO_REFILL_TOP_OUTPUT_SKIPPED reason=未提供DB或InstitutionalReportEngine失敗，無法產出TOP報表")
+        elif report_mode == REPORT_MODE_MACRO_ONLY:
+            # 單純驗證宏觀回填時才只保留三頁。
+            validator.enforce_macro_only_sheets(wb)
             self._write_market_input(wb, market)
             self._write_macro_modules(wb, scores)
             self._write_technical(wb, tech)
@@ -2442,7 +2465,7 @@ def run_gui():
     ttk.Button(frm, text="選擇TEJ", command=browse_tej_gov).grid(row=5, column=2)
     ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=6, column=1, sticky="w")
     ttk.Label(frm, text="輸出模式").grid(row=7, column=0, sticky="w")
-    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_MACRO, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL], width=28, state="readonly").grid(row=7, column=1, sticky="w")
+    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL], width=28, state="readonly").grid(row=7, column=1, sticky="w")
     ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=8, column=0, columnspan=3, sticky="w", pady=8)
 
     log_text = tk.Text(frm, height=26, wrap="word")
@@ -2491,7 +2514,7 @@ def main():
     parser.add_argument("--db-path", default="", help="指定主SQLite DB路徑；用於ranking_result驗證與機構級股票投資規劃報表")
     parser.add_argument("--tej-gov-file", default="", help="TEJ八大公股行庫買賣超排名xls/xlsx；用於gov_net_100m主來源")
     parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
-    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL], help="輸出模式：macro_refill只輸出3頁；institutional_report只輸出00~09；all輸出完整debug")
+    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL], help="輸出模式：macro_refill輸出宏觀16+TOP/00~09；macro_only只輸出3頁；institutional_report只輸出00~09；all輸出完整debug")
     args = parser.parse_args()
     if args.cli:
         engine = Macro16Engine(Path(args.log_dir))
