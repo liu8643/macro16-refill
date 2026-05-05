@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.5.0-p0-institutional-tej-market5day"
+VERSION = "2.5.1-sop-macro16-refill-fixed"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -62,6 +62,16 @@ MODULES = [
     "美債10Y", "原油", "戰爭/地緣", "CPI", "非農", "外資",
     "官股", "台股指數", "成交量", "AI產業", "OTC", "台股夜盤"
 ]
+
+# SOP V2.1：正式輸出模式分離。
+# macro_refill：只輸出「市場輸入 / 宏觀16模組 / V2技術引擎」三頁。
+# institutional_report：只輸出00~09機構級報表。
+# all：完整debug與機構報表全輸出。
+REPORT_MODE_MACRO = "macro_refill"
+REPORT_MODE_INSTITUTIONAL = "institutional_report"
+REPORT_MODE_ALL = "all"
+MACRO_REFILL_SHEETS = ["市場輸入", "宏觀16模組", "V2技術引擎"]
+
 
 YAHOO_SYMBOLS = {
     "美股-S&P500": "^GSPC",
@@ -720,18 +730,86 @@ class SourceConnector:
             self.logger.parsed_value("us_president_policy_event", signal, "Reuters US", raw.date)
         return raw
 
+    def _normalize_gov_unit_to_100m(self, value: float, unit: str = "") -> float:
+        """SOP V2.1 P0-04：官股數字統一轉為億元。"""
+        unit = str(unit or "")
+        if "億元" in unit or unit == "億" or "億" in unit:
+            return float(value)
+        if "萬" in unit:
+            return float(value) / 10000.0
+        # 若頁面未給單位，Wantgoo/HiStock常見顯示為億元；保守以億元處理並留證據。
+        return float(value)
+
+    def _parse_public_bank_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        SOP V2.1 第十四章：Wantgoo/第三方八大官股備援Parser。
+        目標只做備援回填與P0_WARN，不冒充官方資料。
+        """
+        if not text:
+            return None
+        clean = html_lib.unescape(re.sub(r"\s+", " ", str(text)))
+        patterns = [
+            r"(?:八大|官股|公股|八大官股|八大公股)[^。；;\n]{0,80}?(買超|賣超|買賣超|淨買超|淨賣超)?[^-+0-9]{0,20}([-+−]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(億元|億|萬)?",
+            r"(買超|賣超|買賣超|淨買超|淨賣超)[^。；;\n]{0,40}?(?:八大|官股|公股)?[^-+0-9]{0,20}([-+−]?\d+(?:,\d{3})*(?:\.\d+)?)\s*(億元|億|萬)?",
+        ]
+        candidates = []
+        for pat in patterns:
+            for m in re.finditer(pat, clean):
+                words = " ".join([g for g in m.groups() if g])
+                nums = re.findall(r"[-+−]?\d+(?:,\d{3})*(?:\.\d+)?", words)
+                if not nums:
+                    continue
+                num_text = nums[-1].replace(",", "").replace("−", "-")
+                try:
+                    val = float(num_text)
+                except Exception:
+                    continue
+                unit_m = re.search(r"(億元|億|萬)", words)
+                unit = unit_m.group(1) if unit_m else "億"
+                if any(k in words for k in ["賣超", "淨賣超"]) and val > 0:
+                    val = -val
+                val_100m = self._normalize_gov_unit_to_100m(val, unit)
+                # 排除明顯不是金額的日期/代號小數。
+                if abs(val_100m) < 0.01 or abs(val_100m) > 5000:
+                    continue
+                candidates.append({"gov_net_100m": round(val_100m, 2), "matched_text": m.group(0)[:180], "unit": unit})
+        if not candidates:
+            return None
+        # 優先選擇包含八大/官股/公股的片段。
+        candidates.sort(key=lambda x: (0 if any(k in x["matched_text"] for k in ["八大", "官股", "公股"]) else 1, -abs(x["gov_net_100m"])))
+        best = candidates[0]
+        sig = "偏多" if best["gov_net_100m"] > 0 else "偏空" if best["gov_net_100m"] < 0 else "中性"
+        best.update({"gov_signal": sig, "gov_score": 1 if sig == "偏多" else -1 if sig == "偏空" else 0, "source_rule": "Wantgoo/第三方八大官股備援Parser；P0_WARN，不冒充官方"})
+        return best
+
     def fetch_wantgoo_public_bank(self, url: str = SOURCE_URLS["wantgoo_public_bank"]) -> RawData:
         raw = self.fetch_text_snapshot("官股整理", url, "Wantgoo", "WARN")
-        if raw.status == "OK" and raw.value:
-            text = raw.value.get("snippet", "")
+        if raw.value:
+            text = raw.value.get("snippet", "") if isinstance(raw.value, dict) else str(raw.value)
+            parsed = self._parse_public_bank_text(text)
             nums = [self._to_float(x) for x in re.findall(r"-?\d+(?:,\d{3})*(?:\.\d+)?", text)]
             nums = [x for x in nums if not math.isnan(x)]
-            if nums:
+            if parsed:
+                raw.value.update(parsed)
                 raw.value["gov_hint_values"] = nums[:20]
+                raw.status = "OK"
+                raw.data_status = "OK"
+                raw.parse_status = "PARSE_OK"
+                raw.confidence = 0.55
+                raw.message = "Wantgoo八大官股備援解析完成；依SOP標示P0_WARN，只作備援回填"
+                raw.raw_file_path = self.logger.write_raw_evidence("官股整理", raw.value, parsed=parsed, status="OK", url=url, message=raw.message)
+                self.logger.parsed_value("wantgoo_gov_net_100m", parsed.get("gov_net_100m"), "Wantgoo備援", raw.date)
+            elif nums:
+                raw.value["gov_hint_values"] = nums[:20]
+                raw.status = "WARN"
+                raw.data_status = "NO_PARSED_VALUE"
+                raw.parse_status = "NO_PARSED_VALUE"
+                raw.message = "Wantgoo頁面已取得且有數字，但未能定位八大官股淨買賣超欄位"
                 self.logger.parsed_value("wantgoo_gov_hint_values", nums[:5], "Wantgoo", raw.date)
             else:
                 raw.status = "WARN"
                 raw.data_status = "NO_PARSED_VALUE"
+                raw.parse_status = "NO_PARSED_VALUE"
                 raw.message = "Wantgoo頁面已取得但未解析出官股數字"
         return raw
 
@@ -1007,6 +1085,71 @@ class SourceConnector:
             return math.nan
         return float(s)
 
+
+class MarketNarrativeBuilder:
+    """SOP V2.1 P1-01：市場輸入交易判讀模板化。"""
+    def build(self, market: MarketInput) -> str:
+        parts = []
+        if market.close is not None and market.ma5 is not None:
+            parts.append(f"台股收盤{market.close:.2f}，{'站上' if market.close >= market.ma5 else '跌破'}5MA {market.ma5:.2f}")
+        if market.foreign_net_100m is not None:
+            parts.append(f"外資{'買超' if market.foreign_net_100m >= 0 else '賣超'}{abs(market.foreign_net_100m):.2f}億元")
+        else:
+            parts.append("外資資料未完成")
+        if market.gov_net_100m is not None:
+            parts.append(f"官股/八大公股{'買超' if market.gov_net_100m >= 0 else '賣超'}{abs(market.gov_net_100m):.2f}億元")
+        else:
+            parts.append("官股資料未完成，需TEJ或備援來源")
+        if market.turnover_100m is not None and market.avg_turnover_5d_100m is not None:
+            vol_state = "放量" if market.turnover_100m > market.avg_turnover_5d_100m * 1.05 else "量能正常/未明顯放大"
+            parts.append(f"成交值{market.turnover_100m:.2f}億元，5日均量{market.avg_turnover_5d_100m:.2f}億元，{vol_state}")
+        if market.major_event:
+            parts.append("重大事件風險=1，需降倉禁追高")
+        else:
+            parts.append("重大事件風險=0")
+        return "；".join(parts) + "。"
+
+class FieldCompletionValidator:
+    """SOP V2.1 P0-03：核心欄位最終完成規則。"""
+    CORE_FIELDS = ["base_date", "close", "high", "low", "ma5", "turnover_100m", "avg_turnover_5d_100m", "foreign_net_100m"]
+    STRICT_FIELDS = ["gov_net_100m"]
+
+    def __init__(self, logger: Macro16Logger):
+        self.logger = logger
+
+    def validate_market_input(self, market: MarketInput, strict_gov: bool = False) -> List[str]:
+        issues = []
+        for field in self.CORE_FIELDS:
+            val = getattr(market, field, None)
+            if val is None or val == "":
+                issues.append(f"P0欄位未完成:{field}")
+        if strict_gov and market.gov_net_100m is None:
+            issues.append("P0欄位未完成:gov_net_100m，需TEJ或Wantgoo備援解析/人工覆寫")
+        elif market.gov_net_100m is None:
+            issues.append("P0_WARN:gov_net_100m未完成，正式檔會標示未取得，不可假OK")
+        for issue in issues:
+            self.logger.warning("FIELD_COMPLETION " + issue)
+        return issues
+
+class MacroRefillValidator:
+    """SOP V2.1 P0-01/P0-02：macro_refill模式只允許三頁與宏觀16命名。"""
+    def __init__(self, logger: Macro16Logger):
+        self.logger = logger
+
+    def enforce_macro_sheets(self, wb):
+        if not wb.sheetnames:
+            wb.create_sheet("市場輸入")
+        for required in MACRO_REFILL_SHEETS:
+            if required not in wb.sheetnames:
+                wb.create_sheet(required)
+        for name in list(wb.sheetnames):
+            if name not in MACRO_REFILL_SHEETS:
+                del wb[name]
+                self.logger.info(f"MACRO_REFILL_REMOVE_EXTRA_SHEET sheet={name}")
+        # 依指定順序排序
+        wb._sheets = [wb[name] for name in MACRO_REFILL_SHEETS]
+        return wb
+
 class DataProcessor:
     def __init__(self, logger: Macro16Logger):
         self.logger = logger
@@ -1085,8 +1228,9 @@ class DataProcessor:
             self.logger.parsed_value("market.ma5", market.ma5, "TWSE跨月5日", market.base_date)
             self.logger.parsed_value("market.avg_turnover_5d_100m", market.avg_turnover_5d_100m, "TWSE跨月5日", market.base_date)
 
-        gov = raw.get("官股") or raw.get("八大官股")
-        if gov and gov.status == "OK" and getattr(gov, "parse_status", "") == "PARSE_OK" and isinstance(gov.value, dict) and gov.value.get("gov_net_100m") is not None:
+        gov_candidates = [raw.get("官股"), raw.get("八大官股"), raw.get("官股整理")]
+        gov = next((g for g in gov_candidates if g and getattr(g, "parse_status", "") == "PARSE_OK" and isinstance(g.value, dict) and g.value.get("gov_net_100m") is not None), None)
+        if gov:
             market.gov_net_100m = round(float(gov.value.get("gov_net_100m")), 2)
             market.source_4 = self._source_note(gov)
             self.logger.parsed_value("market.gov_net_100m", market.gov_net_100m, gov.source, gov.date)
@@ -1262,11 +1406,11 @@ class ScoringEngine:
         if value is None:
             source = raw.source if raw else "TWSE券商報表"
             msg = raw.message if raw else "未取得TWSE券商報表"
-            return ModuleScore("官股", msg, 0.0, 0, 0.0, "官股主來源固定為TWSE券商報表；未解析出明確數字時列WARN，不可改用Wantgoo當主判斷。", source, raw.date if raw else market.base_date, "官股資料不足，不納入主判斷", "WARN")
+            return ModuleScore("官股", msg, 0.0, 0, 0.0, "官股主來源為TEJ八大公股行庫；TEJ缺檔時可用Wantgoo備援解析並標P0_WARN；未解析出明確數字時不得假OK。", source, raw.date if raw else market.base_date, "官股資料不足，不納入主判斷", "WARN")
         direction = 1 if value > 0 else (-1 if value < 0 else 0)
         strength = min(1.0, max(0.3, abs(value)/100)) if direction else 0.2
         weighted = round(direction*strength,2)
-        return ModuleScore("官股", f"{value:.2f}億元", strength, direction, weighted, "已依Excel指定來源TWSE券商報表解析官股/政策資金方向；買超代表承接支撐，賣超代表政策資金未護盤。", raw.source if raw else "TWSE券商報表", market.base_date, "視為支撐判斷，不等於追價依據", "OK")
+        return ModuleScore("官股", f"{value:.2f}億元", strength, direction, weighted, "已依SOP解析官股/八大公股資金方向；TEJ為主來源，Wantgoo只作P0_WARN備援。買超代表承接支撐，賣超代表政策資金未護盤。", raw.source if raw else "TEJ/Wantgoo", market.base_date, "視為支撐判斷，不等於追價依據", "OK")
     def score_taiex(self, raw, market):
         if market.close is None or market.ma5 is None:
             return self.score_neutral("台股指數", raw, "台股收盤或5MA不足，列中性")
@@ -1915,7 +2059,7 @@ class ExcelWriter:
         self.warn_fill = PatternFill("solid", fgColor="FFF2CC")
         self.thin = Side(style="thin", color="D9E2F3")
 
-    def write(self, template: Optional[str], out_path: str, market: MarketInput, scores: List[ModuleScore], tech: TechnicalRisk, summary: Dict[str, str], logs: List[str], raw: Optional[Dict[str, RawData]] = None, institutional_report: Optional[Dict[str, Any]] = None, gov_result: Optional[Dict[str, Any]] = None, market5_result: Optional[Dict[str, Any]] = None) -> str:
+    def write(self, template: Optional[str], out_path: str, market: MarketInput, scores: List[ModuleScore], tech: TechnicalRisk, summary: Dict[str, str], logs: List[str], raw: Optional[Dict[str, RawData]] = None, institutional_report: Optional[Dict[str, Any]] = None, gov_result: Optional[Dict[str, Any]] = None, market5_result: Optional[Dict[str, Any]] = None, report_mode: str = REPORT_MODE_MACRO) -> str:
         if template and Path(template).exists():
             try:
                 wb = load_workbook(template)
@@ -1925,18 +2069,36 @@ class ExcelWriter:
                 wb = Workbook()
         else:
             wb = Workbook()
-        # V2.5：若有DB報告，先輸出00~09機構等級股票投資規劃，並驗證欄位一致性。
-        if institutional_report is not None:
-            InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result)
-        self._write_market_input(wb, market)
-        self._write_macro_modules(wb, scores)
-        self._write_technical(wb, tech)
-        self._write_audit(wb, market, scores, tech, summary, logs)
-        self._write_data_source_status(wb, market, raw or {})
-        self._write_evidence_index(wb, raw or {})
+            # 新檔第一個預設Sheet重新命名，避免產生Sheet頁。
+            if wb.sheetnames == ["Sheet"]:
+                wb["Sheet"].title = "市場輸入"
+        report_mode = report_mode or REPORT_MODE_MACRO
+        if report_mode == REPORT_MODE_MACRO:
+            MacroRefillValidator(self.logger).enforce_macro_sheets(wb)
+            self._write_market_input(wb, market)
+            self._write_macro_modules(wb, scores)
+            self._write_technical(wb, tech)
+        elif report_mode == REPORT_MODE_INSTITUTIONAL:
+            # institutional_report模式只輸出00~09，不混入macro/debug頁。
+            for name in list(wb.sheetnames):
+                del wb[name]
+            if institutional_report is not None:
+                InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result)
+            else:
+                ws = wb.create_sheet("00_執行摘要")
+                ws.append(["項目", "內容"]); ws.append(["狀態", "未提供DB，無法產出institutional_report"])
+        else:
+            if institutional_report is not None:
+                InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result)
+            self._write_market_input(wb, market)
+            self._write_macro_modules(wb, scores)
+            self._write_technical(wb, tech)
+            self._write_audit(wb, market, scores, tech, summary, logs)
+            self._write_data_source_status(wb, market, raw or {})
+            self._write_evidence_index(wb, raw or {})
         self._format_all(wb)
         wb.save(out_path)
-        self.logger.info(f"Excel已輸出：{out_path}")
+        self.logger.info(f"Excel已輸出：{out_path} report_mode={report_mode}")
         return out_path
 
     def _sheet(self, wb, name):
@@ -1955,24 +2117,22 @@ class ExcelWriter:
         ws.append(values)
         ws.append([])
         ws.append(["欄位說明", "本表由主程式自動回填。若數值為空白/None，代表資料來源未取得，程式不編造數字，請依Log與回填紀錄修正資料來源或人工確認。"] + [None]*(len(headers)-2))
-        judge = []
-        if market.close and market.ma5:
-            judge.append(f"收盤 {market.close} {'站上' if market.close >= market.ma5 else '跌破'} 5MA {market.ma5}")
-        if market.foreign_net_100m is None:
-            judge.append("外資未取得")
-        if market.turnover_100m is None:
-            judge.append("成交值未取得")
-        ws.append(["交易判讀", "；".join(judge) if judge else "資料不足，需檢查來源與Log。"] + [None]*(len(headers)-2))
+        ws.append(["交易判讀", MarketNarrativeBuilder().build(market)] + [None]*(len(headers)-2))
 
     def _write_macro_modules(self, wb, scores: List[ModuleScore]):
-        ws = self._sheet(wb, "宏觀15模組")
+        # SOP V2.1 P0-02：正式Sheet必須是宏觀16模組，不得再建立宏觀15模組。
+        ws = self._sheet(wb, "宏觀16模組")
         ws.append(["模組", "風險/強度分數(0-1)", "方向(+1/0/-1)", "加權分數", "說明", "資料來源", "資料時間"])
-        for s in scores:
-            ws.append([s.module, s.strength, s.direction, s.weighted_score, s.explanation, s.source, s.data_time])
+        for item in scores:
+            weighted = round(float(item.strength or 0) * int(item.direction or 0), 2)
+            # 以ScoringEngine輸出為主，若空值則強制回補，避免D欄空白。
+            if item.weighted_score is not None:
+                weighted = item.weighted_score
+            ws.append([item.module, item.strength, item.direction, weighted, item.explanation, item.source, item.data_time])
         ws.append([])
         ws.append(["補充欄位", "狀態", "數據/事件", "交易用途"] )
-        for s in scores:
-            ws.append([s.module, s.status, s.data_text, s.trade_usage])
+        for item in scores:
+            ws.append([item.module, item.status, item.data_text, item.trade_usage])
 
     def _write_technical(self, wb, tech: TechnicalRisk):
         ws = self._sheet(wb, "V2技術引擎")
@@ -2138,7 +2298,7 @@ class Macro16Engine:
         self.writer = ExcelWriter(self.logger)
         self.word_evidence_writer = WordEvidenceReportWriter(self.logger)
 
-    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None) -> Dict[str, Any]:
+    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
@@ -2170,14 +2330,20 @@ class Macro16Engine:
         raw["ISW衝突分析"] = self.source.fetch_isw_conflict()
         raw["CNN重大新聞"] = self.source.fetch_cnn_major_news()
         raw["美國總統"] = self.source.fetch_trump_public_news()
-        # V2.5 P0：TEJ八大官股為主來源；TWSE T86與Wantgoo只作佐證。
+        # V2.5.1 SOP：TEJ為主來源；TEJ缺檔時，Wantgoo/第三方備援必須嘗試解析gov_net_100m並標P0_WARN。
         gov_result = TEJGovBankEngine(tej_gov_file, self.logger).parse()
-        if gov_result.get("status") == "OK":
-            raw["官股"] = RawData("官股", gov_result, gov_result.get("actual_date", ""), "TEJ八大公股行庫", tej_gov_file or "", self.source._today_str(), "OK", gov_result.get("message", ""), actual_twse_date or "", gov_result.get("actual_date", ""), False, 0, "OK", gov_result.get("message", ""), "PARSE_OK", confidence=0.95)
-        else:
-            raw["官股"] = RawData("官股", gov_result, "", "TEJ八大公股行庫", tej_gov_file or "", self.source._today_str(), "WARN", gov_result.get("message", "TEJ未提供"), actual_twse_date or "", "", False, 0, "NO_PARSED_VALUE", gov_result.get("message", ""), "NO_PARSED_VALUE", confidence=0.0)
-        raw["官股TWSE佐證"] = self.source.fetch_twse_broker_report(base_date=actual_twse_date)
         raw["官股整理"] = self.source.fetch_wantgoo_public_bank()
+        if gov_result.get("status") == "OK" and gov_result.get("gov_net_100m") is not None:
+            raw["官股"] = RawData("官股", gov_result, gov_result.get("actual_date", ""), "TEJ八大公股行庫", tej_gov_file or "", self.source._today_str(), "OK", gov_result.get("message", ""), actual_twse_date or "", gov_result.get("actual_date", ""), False, 0, "OK", gov_result.get("message", ""), "PARSE_OK", confidence=0.95)
+        elif raw.get("官股整理") and raw["官股整理"].parse_status == "PARSE_OK" and isinstance(raw["官股整理"].value, dict) and raw["官股整理"].value.get("gov_net_100m") is not None:
+            fallback_value = dict(raw["官股整理"].value)
+            fallback_value["status"] = "P0_WARN"
+            fallback_value["message"] = "TEJ未提供，使用Wantgoo備援解析；正式標P0_WARN，不冒充官方資料"
+            raw["官股"] = RawData("官股", fallback_value, raw["官股整理"].date, "Wantgoo八大官股備援(P0_WARN)", raw["官股整理"].url, self.source._today_str(), "OK", fallback_value["message"], actual_twse_date or "", raw["官股整理"].date, False, 0, "OK", fallback_value["message"], "PARSE_OK", confidence=0.55)
+            self.logger.warning("GOV_FALLBACK_USED source=Wantgoo status=P0_WARN")
+        else:
+            raw["官股"] = RawData("官股", gov_result, "", "TEJ八大公股行庫", tej_gov_file or "", self.source._today_str(), "WARN", gov_result.get("message", "TEJ未提供且Wantgoo備援未解析"), actual_twse_date or "", "", False, 0, "NO_PARSED_VALUE", gov_result.get("message", ""), "NO_PARSED_VALUE", confidence=0.0)
+        raw["官股TWSE佐證"] = self.source.fetch_twse_broker_report(base_date=actual_twse_date)
         raw["AI產業"] = self.source.fetch_ai_industry_news()
         raw["IEK產業分析"] = self.source.fetch_iek_industry()
         raw["排行分析"] = self.source.fetch_ranking_result_db(db_path=db_path, strict=strict_ranking)
@@ -2204,15 +2370,19 @@ class Macro16Engine:
                 pass
         market = self.processor.build_market_input(raw, base_date or "")
         market = self.processor.apply_manual_override(market, override)
+        completion_issues = FieldCompletionValidator(self.logger).validate_market_input(market, strict_gov=False)
         scores = self.scoring.score_all(raw, market)
         macro_total = round(sum(s.weighted_score for s in scores), 2)
         tech = self.indicator.compute(market, macro_total)
         summary = self.explain.build_summary(macro_total, tech)
         warnings = self.audit.check(market, scores, tech)
+        warnings = (locals().get("completion_issues", []) or []) + warnings
         if warnings:
             summary["QA警告"] = "; ".join(warnings[:8])
-        output = self.writer.write(template, out_path, market, scores, tech, summary, self.logger.messages, raw, institutional_report=institutional_report, gov_result=locals().get("gov_result"), market5_result=locals().get("market5_result"))
-        evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
+        output = self.writer.write(template, out_path, market, scores, tech, summary, self.logger.messages, raw, institutional_report=institutional_report, gov_result=locals().get("gov_result"), market5_result=locals().get("market5_result"), report_mode=report_mode)
+        evidence_word = ""
+        if report_mode == REPORT_MODE_ALL:
+            evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
         self.logger.info("執行完成")
         return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file)}
 
@@ -2230,6 +2400,7 @@ def run_gui():
     db_var = tk.StringVar()
     tej_gov_var = tk.StringVar()
     strict_ranking_var = tk.BooleanVar(value=False)
+    report_mode_var = tk.StringVar(value=REPORT_MODE_MACRO)
     status_var = tk.StringVar(value="待執行")
 
     def browse_template():
@@ -2270,11 +2441,13 @@ def run_gui():
     ttk.Entry(frm, textvariable=tej_gov_var, width=90).grid(row=5, column=1, sticky="we")
     ttk.Button(frm, text="選擇TEJ", command=browse_tej_gov).grid(row=5, column=2)
     ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=6, column=1, sticky="w")
-    ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=7, column=0, columnspan=3, sticky="w", pady=8)
+    ttk.Label(frm, text="輸出模式").grid(row=7, column=0, sticky="w")
+    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_MACRO, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL], width=28, state="readonly").grid(row=7, column=1, sticky="w")
+    ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=8, column=0, columnspan=3, sticky="w", pady=8)
 
     log_text = tk.Text(frm, height=26, wrap="word")
-    log_text.grid(row=9, column=0, columnspan=3, sticky="nsew", pady=(10,0))
-    frm.rowconfigure(9, weight=1)
+    log_text.grid(row=10, column=0, columnspan=3, sticky="nsew", pady=(10,0))
+    frm.rowconfigure(10, weight=1)
     frm.columnconfigure(1, weight=1)
 
     def append_log(text):
@@ -2287,7 +2460,7 @@ def run_gui():
             status_var.set("執行中：抓資料、計分、回填Excel...")
             log_text.delete("1.0", "end")
             engine = Macro16Engine(Path("logs"))
-            result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()), tej_gov_file=(tej_gov_var.get() or None))
+            result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()), tej_gov_file=(tej_gov_var.get() or None), report_mode=report_mode_var.get())
             for msg in engine.logger.messages:
                 append_log(msg)
             append_log("\n總結：" + json.dumps(result["summary"], ensure_ascii=False, indent=2))
@@ -2299,8 +2472,8 @@ def run_gui():
             append_log("ERROR " + str(exc))
             messagebox.showerror("錯誤", str(exc))
 
-    ttk.Button(frm, text="執行回填", command=execute).grid(row=8, column=0, sticky="w", pady=6)
-    ttk.Button(frm, text="離開", command=root.destroy).grid(row=8, column=2, sticky="e", pady=6)
+    ttk.Button(frm, text="執行回填", command=execute).grid(row=9, column=0, sticky="w", pady=6)
+    ttk.Button(frm, text="離開", command=root.destroy).grid(row=9, column=2, sticky="e", pady=6)
     root.mainloop()
 
 def main():
@@ -2318,11 +2491,12 @@ def main():
     parser.add_argument("--db-path", default="", help="指定主SQLite DB路徑；用於ranking_result驗證與機構級股票投資規劃報表")
     parser.add_argument("--tej-gov-file", default="", help="TEJ八大公股行庫買賣超排名xls/xlsx；用於gov_net_100m主來源")
     parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
+    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL], help="輸出模式：macro_refill只輸出3頁；institutional_report只輸出00~09；all輸出完整debug")
     args = parser.parse_args()
     if args.cli:
         engine = Macro16Engine(Path(args.log_dir))
         override = ManualOverride(gov_net_100m=args.gov_net, ai_strength=args.ai_strength, major_event=args.major_event, event_note=args.event_note, night_score=args.night_score)
-        result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking, tej_gov_file=(args.tej_gov_file or None))
+        result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking, tej_gov_file=(args.tej_gov_file or None), report_mode=args.report_mode)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         run_gui()
