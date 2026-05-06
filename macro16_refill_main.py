@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.5.3-p0-risk-evidence-fixed"
+VERSION = "2.5.4-entry-zone-p0-fixed"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -2002,12 +2002,34 @@ class TradePlanEngine:
         fallback = df["entry_low"].isna() | df["entry_high"].isna() | (close < df["entry_low"])
         df.loc[fallback, "entry_low"] = close * 0.995
         df.loc[fallback, "entry_high"] = close * 1.010
+
+        # P0 FIX v2.5.4：低接區上下限防呆。
+        # 原公式在少數股票的 MA20 與現價距離過大時，可能出現 entry_low > entry_high。
+        # 這不是 Excel 顯示問題，而是交易計畫資料本身的區間邏輯錯誤；因此必須在 TradePlanEngine 層修正。
+        reverse_mask = (
+            df["entry_low"].notna()
+            & df["entry_high"].notna()
+            & (df["entry_low"] > df["entry_high"])
+        )
+        if reverse_mask.any():
+            tmp_entry_low = df.loc[reverse_mask, "entry_low"].copy()
+            df.loc[reverse_mask, "entry_low"] = df.loc[reverse_mask, "entry_high"]
+            df.loc[reverse_mask, "entry_high"] = tmp_entry_low
+            if "entry_zone_fix_flag" not in df.columns:
+                df["entry_zone_fix_flag"] = ""
+            df.loc[reverse_mask, "entry_zone_fix_flag"] = "低接區上下限反向已自動修正"
+
+        if not (df.loc[df["entry_low"].notna() & df["entry_high"].notna(), "entry_low"] <= df.loc[df["entry_low"].notna() & df["entry_high"].notna(), "entry_high"]).all():
+            raise ValueError("P0_FAIL: TradePlanEngine entry_low/entry_high 區間仍存在反向")
+
         df["stop_loss"] = np.minimum(ma60 * 0.97, df["entry_low"] * 0.94) if np is not None else df["entry_low"] * 0.94
         df["stop_loss"] = df["stop_loss"].fillna(df["entry_low"] * 0.94)
         df["target_1"] = np.where(atr.notna(), close + atr * 1.382, close * 1.05) if np is not None else close * 1.05
         df["target_2"] = np.where(atr.notna(), close + atr * 1.618, close * 1.125) if np is not None else close * 1.125
         df["rr"] = ((df["target_1"] - df["entry_high"]) / (df["entry_high"] - df["stop_loss"].replace(0, math.nan))).replace([math.inf, -math.inf], math.nan)
         df["exclude_reason"] = ""
+        if "entry_zone_fix_flag" in df.columns:
+            df.loc[df["entry_zone_fix_flag"].astype(str).ne(""), "exclude_reason"] += "低接區上下限反向已自動修正;"
         df.loc[pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0) < 500, "exclude_reason"] += "成交量不足;"
         df.loc[df["rr"].fillna(0) < 1.2, "exclude_reason"] += "RR不足;"
         df.loc[pd.to_numeric(df.get("rsi", 50), errors="coerce").fillna(50) > 78, "exclude_reason"] += "RSI過熱;"
@@ -2404,7 +2426,7 @@ class Macro16Engine:
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
-        self.logger.info("CHANGELOG v2.5.3: foreign parsed_fields fixed; ISW/CNN/manual event merge; TAIFEX night risk added; gov score by value only")
+        self.logger.info("CHANGELOG v2.5.4: entry_low/entry_high reverse guard fixed in TradePlanEngine only")
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
         raw["台股指數"] = self.source.fetch_twse_taiex_history(requested_date)
