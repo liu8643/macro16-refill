@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.5.2-sop-macro16-top-output-restored"
+VERSION = "2.5.3-p0-risk-evidence-fixed"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -146,6 +146,8 @@ class MarketInput:
     gov_net_100m: Optional[float] = None
     ai_strength: float = 0.5
     major_event: int = 0
+    night_score: Optional[int] = None
+    night_net_lots: Optional[int] = None
     source_1: str = ""
     source_2: str = ""
     source_3: str = ""
@@ -182,6 +184,9 @@ class TechnicalRisk:
     major_event: int
     risk_score: float
     market_judgement: str
+    night_bearish: int = 0
+    night_score: Optional[int] = None
+    night_net_lots: Optional[int] = None
 
 class Macro16Logger:
     def __init__(self, log_dir: Path):
@@ -578,10 +583,26 @@ class SourceConnector:
                                 net_100m = vals[-1] / 100000000
                                 is_fb, fb_days, note = self._fallback_note(query_date, try_date, "TWSE_FOREIGN")
                                 self.logger.info(f"FETCH_OK source=TWSE_FOREIGN query_date={query_date} actual_date={try_date} net_100m={net_100m:.2f} url={url}")
-                                self.logger.raw_snapshot("TWSE_FOREIGN", row_text[:500])
+                                buy_amount = vals[-3] if len(vals) >= 3 else None
+                                sell_amount = vals[-2] if len(vals) >= 2 else None
+                                net_amount = vals[-1] if len(vals) >= 1 else None
+                                parsed = {
+                                    "foreign_net_100m": round(net_100m, 2),
+                                    "buy_amount": buy_amount,
+                                    "sell_amount": sell_amount,
+                                    "net_amount": net_amount,
+                                    "query_date": query_date,
+                                    "actual_date": try_date,
+                                    "source_rule": "TWSE BFI82U/TWT38U 外資及陸資列淨買賣超 / 100000000",
+                                    "raw_row": row_text[:500],
+                                }
+                                raw_path = self.logger.write_raw_evidence(
+                                    "TWSE_FOREIGN", parsed, parsed=parsed, status="OK", url=url,
+                                    message="外資買賣超解析完成，parsed_fields已寫入證據鏈"
+                                )
                                 self.logger.parsed_value("foreign_net_100m", round(net_100m, 2), "TWSE BFI82U/TWT38U", try_date)
                                 return RawData("外資", {"net_100m": net_100m, "raw_hint": row_text[:500]}, self._dash_date(try_date),
-                                               "TWSE三大法人", url, self._today_str(), "OK", note, query_date, try_date, is_fb, fb_days, "OK", note)
+                                               "TWSE三大法人", url, self._today_str(), "OK", note, query_date, try_date, is_fb, fb_days, "OK", note, "PARSE_OK", raw_path, 1.0)
                     text = json.dumps(data, ensure_ascii=False)
                     nums = [self._to_float(x) for x in re.findall(r"-?\d[\d,]*\.?\d*", text)]
                     nums = [x for x in nums if abs(x) > 1000000]
@@ -589,9 +610,20 @@ class SourceConnector:
                         net_100m = nums[-1] / 100000000
                         is_fb, fb_days, note = self._fallback_note(query_date, try_date, "TWSE_FOREIGN")
                         msg = "使用fallback解析；" + note if note else "使用fallback解析"
+                        parsed = {
+                            "foreign_net_100m": round(net_100m, 2),
+                            "query_date": query_date,
+                            "actual_date": try_date,
+                            "source_rule": "TWSE三大法人數值fallback解析 / 100000000",
+                            "raw_excerpt": text[:500],
+                        }
                         self.logger.warning(f"外資語意列未找到，使用數值fallback source={url}, query_date={query_date}, actual_date={try_date}, net_100m={net_100m:.2f}")
+                        raw_path = self.logger.write_raw_evidence(
+                            "TWSE_FOREIGN", parsed, parsed=parsed, status="WARN", url=url,
+                            message=msg + "；已寫入foreign_net_100m parsed_fields"
+                        )
                         return RawData("外資", {"net_100m": net_100m, "raw_hint": text[:500]}, self._dash_date(try_date),
-                                       "TWSE三大法人-fallback", url, self._today_str(), "WARN", msg, query_date, try_date, is_fb, fb_days, "OK", msg)
+                                       "TWSE三大法人-fallback", url, self._today_str(), "WARN", msg, query_date, try_date, is_fb, fb_days, "OK", msg, "PARSE_OK", raw_path, 0.8)
                     self._official_no_data("TWSE_FOREIGN", query_date, try_date, url, data)
                 except Exception as exc:
                     last_error = str(exc)
@@ -781,7 +813,7 @@ class SourceConnector:
         candidates.sort(key=lambda x: (0 if any(k in x["matched_text"] for k in ["八大", "官股", "公股"]) else 1, -abs(x["gov_net_100m"])))
         best = candidates[0]
         sig = "偏多" if best["gov_net_100m"] > 0 else "偏空" if best["gov_net_100m"] < 0 else "中性"
-        best.update({"gov_signal": sig, "gov_score": 1 if sig == "偏多" else -1 if sig == "偏空" else 0, "source_rule": "Wantgoo/第三方八大官股備援Parser；P0_WARN，不冒充官方"})
+        best.update({"gov_signal": sig, "gov_score": 1 if sig == "偏多" else -1 if sig == "偏空" else 0, "source_rule": "Wantgoo/八大官股資料頁解析；來源保留供追溯，分數只依數值"})
         return best
 
     def fetch_wantgoo_public_bank(self, url: str = SOURCE_URLS["wantgoo_public_bank"]) -> RawData:
@@ -798,7 +830,7 @@ class SourceConnector:
                 raw.data_status = "OK"
                 raw.parse_status = "PARSE_OK"
                 raw.confidence = 0.55
-                raw.message = "Wantgoo八大官股備援解析完成；依SOP標示P0_WARN，只作備援回填"
+                raw.message = "Wantgoo八大官股資料解析完成；來源保留供追溯，分數只依數值"
                 raw.raw_file_path = self.logger.write_raw_evidence("官股整理", raw.value, parsed=parsed, status="OK", url=url, message=raw.message)
                 self.logger.parsed_value("wantgoo_gov_net_100m", parsed.get("gov_net_100m"), "Wantgoo備援", raw.date)
             elif nums:
@@ -1109,6 +1141,15 @@ class MarketNarrativeBuilder:
             parts.append("重大事件風險=1，需降倉禁追高")
         else:
             parts.append("重大事件風險=0")
+        if market.night_score is not None:
+            if market.night_score < 0:
+                lots = f"{market.night_net_lots}口" if market.night_net_lots is not None else "淨空"
+                parts.append(f"夜盤外資偏空({lots})，盤前風險需加分")
+            elif market.night_score > 0:
+                lots = f"{market.night_net_lots}口" if market.night_net_lots is not None else "淨多"
+                parts.append(f"夜盤外資偏多({lots})")
+            else:
+                parts.append("夜盤外資中性")
         return "；".join(parts) + "。"
 
 class FieldCompletionValidator:
@@ -1193,6 +1234,28 @@ class DataProcessor:
             self.logger.info(f"MANUAL_OVERRIDE field=major_event old={old} new={override.major_event} note={override.event_note}")
         return market
 
+    def _merge_major_event(self, raw: Dict[str, RawData]) -> Tuple[int, List[Tuple[str, int, str]]]:
+        """P0：合併 Reuters/ISW/CNN/人工事件來源，避免單一來源失敗造成重大事件被漏判。"""
+        candidates = ["戰爭/地緣", "戰爭/停火", "ISW衝突分析", "CNN重大新聞"]
+        events: List[Tuple[str, int, str]] = []
+        for key in candidates:
+            item = raw.get(key)
+            value = 0
+            source = ""
+            try:
+                source = item.source if item else ""
+                if item and isinstance(item.value, dict):
+                    value = int(item.value.get("major_event", 0) or 0)
+            except Exception:
+                value = 0
+            events.append((key, value, source))
+        merged = max([v for _, v, _ in events], default=0)
+        active_sources = [f"{k}:{v}:{s}" for k, v, s in events if v]
+        self.logger.info(f"MARKET_EVENT_MERGE merged={merged} detail={events}")
+        if active_sources:
+            self.logger.parsed_value("market.major_event_sources", ";".join(active_sources), "EventMerge", "latest")
+        return merged, events
+
     def build_market_input(self, raw: Dict[str, RawData], base_date: str = "") -> MarketInput:
         market = MarketInput()
         taiex = raw.get("台股指數")
@@ -1259,14 +1322,28 @@ class DataProcessor:
         else:
             market.ai_strength = 0.5
 
-        geo = raw.get("戰爭/地緣")
-        if geo and geo.status == "OK" and isinstance(geo.value, dict) and geo.value.get("major_event") is not None:
-            market.major_event = int(geo.value.get("major_event"))
+        merged_event, event_details = self._merge_major_event(raw)
+        market.major_event = int(merged_event or 0)
+        event_sources = [f"{k}:{v}:{s}" for k, v, s in event_details if v]
+        if event_sources:
             if not market.source_4:
-                market.source_4 = self._source_note(geo)
-            self.logger.parsed_value("market.major_event", market.major_event, geo.source, geo.date)
+                market.source_4 = "重大事件來源=" + ";".join(event_sources)
+            self.logger.parsed_value("market.major_event", market.major_event, "EventMerge", "latest")
         else:
-            market.major_event = 0
+            self.logger.parsed_value("market.major_event", market.major_event, "EventMerge", "latest")
+
+        night = raw.get("台股夜盤")
+        if night and night.status == "OK" and isinstance(night.value, dict):
+            try:
+                market.night_score = int(night.value.get("night_score", 0) or 0)
+            except Exception:
+                market.night_score = 0
+            try:
+                market.night_net_lots = int(night.value.get("net_lots")) if night.value.get("net_lots") is not None else None
+            except Exception:
+                market.night_net_lots = None
+            self.logger.parsed_value("market.night_score", market.night_score, night.source, night.date)
+            self.logger.parsed_value("market.night_net_lots", market.night_net_lots, night.source, night.date)
 
         self.logger.info(f"市場輸入標準化完成：{asdict(market)}")
         return market
@@ -1414,13 +1491,13 @@ class ScoringEngine:
     def score_gov(self, raw, market):
         value = market.gov_net_100m
         if value is None:
-            source = raw.source if raw else "TWSE券商報表"
-            msg = raw.message if raw else "未取得TWSE券商報表"
-            return ModuleScore("官股", msg, 0.0, 0, 0.0, "官股主來源為TEJ八大公股行庫；TEJ缺檔時可用Wantgoo備援解析並標P0_WARN；未解析出明確數字時不得假OK。", source, raw.date if raw else market.base_date, "官股資料不足，不納入主判斷", "WARN")
+            source = raw.source if raw else "官股資料來源"
+            msg = raw.message if raw else "官股資料未取得"
+            return ModuleScore("官股", msg, 0.0, 0, 0.0, "官股資料未取得，不編造數字；取得後分數只依gov_net_100m數值，不因來源不同扣分。", source, raw.date if raw else market.base_date, "官股資料不足，不納入主判斷", "WARN")
         direction = 1 if value > 0 else (-1 if value < 0 else 0)
         strength = min(1.0, max(0.3, abs(value)/100)) if direction else 0.2
         weighted = round(direction*strength,2)
-        return ModuleScore("官股", f"{value:.2f}億元", strength, direction, weighted, "已依SOP解析官股/八大公股資金方向；TEJ為主來源，Wantgoo只作P0_WARN備援。買超代表承接支撐，賣超代表政策資金未護盤。", raw.source if raw else "TEJ/Wantgoo", market.base_date, "視為支撐判斷，不等於追價依據", "OK")
+        return ModuleScore("官股", f"{value:.2f}億元", strength, direction, weighted, "官股/八大公股資金方向已解析；分數只依數值，不因來源不同扣分。買超代表承接支撐，賣超代表政策資金未護盤。", raw.source if raw else "官股資料來源", market.base_date, "視為支撐判斷，不等於追價依據", "OK")
     def score_taiex(self, raw, market):
         if market.close is None or market.ma5 is None:
             return self.score_neutral("台股指數", raw, "台股收盤或5MA不足，列中性")
@@ -1478,7 +1555,11 @@ class IndicatorEngine:
         lower_low = int(market.low is not None and market.prev_low is not None and market.low < market.prev_low)
         volume_expansion = int(market.turnover_100m is not None and market.avg_turnover_5d_100m is not None and market.turnover_100m > market.avg_turnover_5d_100m * 1.05)
         major_event = int(market.major_event or 0)
-        risk_score = below_ma5 + lower_high + lower_low + volume_expansion + major_event
+        night_score = market.night_score if market.night_score is not None else 0
+        night_bearish = int(night_score < 0)
+        risk_score = below_ma5 + lower_high + lower_low + volume_expansion + major_event + night_bearish
+        if night_bearish:
+            self.logger.info(f"NIGHT_RISK_APPLIED night_score={market.night_score} net_lots={market.night_net_lots}")
         if macro_total >= 3 and risk_score <= 1:
             judgement = "強多 / 允許交易"
         elif macro_total >= 1 and risk_score <= 2:
@@ -1489,8 +1570,8 @@ class IndicatorEngine:
             judgement = "震盪偏空 / 降倉禁追高"
         else:
             judgement = "中性震盪 / 只做最高勝率標的"
-        self.logger.info(f"V2技術引擎完成：risk_score={risk_score}, judgement={judgement}")
-        return TechnicalRisk(below_ma5, lower_high, lower_low, volume_expansion, major_event, risk_score, judgement)
+        self.logger.info(f"V2技術引擎完成：risk_score={risk_score}, judgement={judgement}, night_bearish={night_bearish}")
+        return TechnicalRisk(below_ma5, lower_high, lower_low, volume_expansion, major_event, risk_score, judgement, night_bearish, market.night_score, market.night_net_lots)
 
 class ExplanationEngine:
     def build_summary(self, macro_total: float, tech: TechnicalRisk) -> Dict[str, str]:
@@ -2052,7 +2133,7 @@ class InstitutionalExcelWriter:
         ws = self._sheet(wb, "09_來源與限制")
         ws.append(["項目", "內容"])
         ws.append(["資料來源", "stock_system DB + TEJ八大公股行庫（若提供）+ TWSE/TPEX/TAIFEX宏觀來源"])
-        ws.append(["TEJ八大官股", "本版已提供TEJGovBankEngine；缺檔時標P0_WARN，不得用Wantgoo冒充主資料"])
+        ws.append(["官股/八大公股", "TEJ或Wantgoo等來源只作證據追溯；只要gov_net_100m解析正確，分數只依數值，不因來源不同扣分"])
         ws.append(["Macro16跨月5日", "本版已提供Market5DayEngine；不足5日標P0_FAIL，停止市場技術判斷"])
         ws.append(["格式驗收", "00~09固定；03~08共用30欄；不得新增第10頁"])
         errors = ReportValidator().validate_workbook(wb)
@@ -2159,9 +2240,9 @@ class ExcelWriter:
 
     def _write_technical(self, wb, tech: TechnicalRisk):
         ws = self._sheet(wb, "V2技術引擎")
-        ws.append(["跌破5MA", "高不過高", "低破低", "放量", "重大事件", "技術/風險分數", "大盤判定"])
-        ws.append([tech.below_ma5, tech.lower_high, tech.lower_low, tech.volume_expansion, tech.major_event, tech.risk_score, tech.market_judgement])
-        ws.append(["判讀說明", "收盤<5MA為1", "最高<前高為1", "最低<前低為1", "成交值>5日均量*1.05為1", "需有明確來源", "五項加總", "供下單清單參考"])
+        ws.append(["跌破5MA", "高不過高", "低破低", "放量", "重大事件", "夜盤偏空", "技術/風險分數", "大盤判定", "夜盤分數", "夜盤外資淨口數"])
+        ws.append([tech.below_ma5, tech.lower_high, tech.lower_low, tech.volume_expansion, tech.major_event, getattr(tech, "night_bearish", 0), tech.risk_score, tech.market_judgement, getattr(tech, "night_score", None), getattr(tech, "night_net_lots", None)])
+        ws.append(["判讀說明", "收盤<5MA為1", "最高<前高為1", "最低<前低為1", "成交值>5日均量*1.05為1", "合併Reuters/ISW/CNN/manual", "night_score<0為1", "六項加總", "供下單清單參考", "TAIFEX解析值", "TAIFEX外資淨多空口數"])
 
     def _write_audit(self, wb, market: MarketInput, scores: List[ModuleScore], tech: TechnicalRisk, summary: Dict[str,str], logs: List[str]):
         name = f"回填紀錄_{market.base_date.replace('-', '') if market.base_date else dt.date.today().strftime('%Y%m%d')}"
@@ -2323,6 +2404,7 @@ class Macro16Engine:
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
+        self.logger.info("CHANGELOG v2.5.3: foreign parsed_fields fixed; ISW/CNN/manual event merge; TAIFEX night risk added; gov score by value only")
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
         raw["台股指數"] = self.source.fetch_twse_taiex_history(requested_date)
@@ -2360,10 +2442,10 @@ class Macro16Engine:
             raw["官股"] = RawData("官股", gov_result, gov_result.get("actual_date", ""), "TEJ八大公股行庫", tej_gov_file or "", self.source._today_str(), "OK", gov_result.get("message", ""), actual_twse_date or "", gov_result.get("actual_date", ""), False, 0, "OK", gov_result.get("message", ""), "PARSE_OK", confidence=0.95)
         elif raw.get("官股整理") and raw["官股整理"].parse_status == "PARSE_OK" and isinstance(raw["官股整理"].value, dict) and raw["官股整理"].value.get("gov_net_100m") is not None:
             fallback_value = dict(raw["官股整理"].value)
-            fallback_value["status"] = "P0_WARN"
-            fallback_value["message"] = "TEJ未提供，使用Wantgoo備援解析；正式標P0_WARN，不冒充官方資料"
-            raw["官股"] = RawData("官股", fallback_value, raw["官股整理"].date, "Wantgoo八大官股備援(P0_WARN)", raw["官股整理"].url, self.source._today_str(), "OK", fallback_value["message"], actual_twse_date or "", raw["官股整理"].date, False, 0, "OK", fallback_value["message"], "PARSE_OK", confidence=0.55)
-            self.logger.warning("GOV_FALLBACK_USED source=Wantgoo status=P0_WARN")
+            fallback_value["status"] = "OK"
+            fallback_value["message"] = "TEJ未提供，使用Wantgoo八大官股資料解析；來源保留供追溯，分數只依數值"
+            raw["官股"] = RawData("官股", fallback_value, raw["官股整理"].date, "Wantgoo八大官股資料", raw["官股整理"].url, self.source._today_str(), "OK", fallback_value["message"], actual_twse_date or "", raw["官股整理"].date, False, 0, "OK", fallback_value["message"], "PARSE_OK", confidence=1.0)
+            self.logger.info(f"GOV_DATA_ACCEPTED source=Wantgoo value={fallback_value.get('gov_net_100m')}")
         else:
             raw["官股"] = RawData("官股", gov_result, "", "TEJ八大公股行庫", tej_gov_file or "", self.source._today_str(), "WARN", gov_result.get("message", "TEJ未提供且Wantgoo備援未解析"), actual_twse_date or "", "", False, 0, "NO_PARSED_VALUE", gov_result.get("message", ""), "NO_PARSED_VALUE", confidence=0.0)
         raw["官股TWSE佐證"] = self.source.fetch_twse_broker_report(base_date=actual_twse_date)
