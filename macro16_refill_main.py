@@ -53,8 +53,8 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.7.1-teacher-phase5-safe-series-diagnostics"
-STRATEGY_VERSION = "teacher_strategy_v1.3_phase5_safe_series_20260511"
+VERSION = "2.7.2-teacher-phase5-semantic-fix"
+STRATEGY_VERSION = "teacher_strategy_v1.4_phase5_semantic_fix_20260511"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -1622,13 +1622,13 @@ EXPECTED_INSTITUTIONAL_SHEETS = [
     "04_成長模型TOP30", "05_價值模型TOP30", "06_低位階候選",
     "07_老師點名股檢核", "08_排除與風險", "09_來源與限制",
     "10_老師策略驗收", "11_修改追蹤", "12_策略命中驗證",
-    "13_LOW_BUY候選", "14_WATCH觀察池", "15_AVOID排除清單", "16_BUY_LOW_BUY放行原因"
+    "13_LOW_BUY候選", "14_WATCH觀察池", "15_AVOID排除清單", "16_放行與觀察候選"
 ]
 
 REPORT_COLUMNS = [
     "排名", "代號", "名稱", "市場", "產業", "題材", "老師分類", "老師決策", "決策原因", "決策追蹤", "老師股票池", "核心股狀態",
     "K線警訊", "波段修正", "避開/換股", "現價",
-    "低接區", "停損", "目標1", "目標2", "RR", "是否可下單",
+    "低接區", "停損", "目標1", "目標2", "RR", "是否可下單", "老師執行狀態",
     "老師總分", "成長分", "價值分", "EPS_TTM", "PE", "殖利率%",
     "營收YoY%", "法人分", "20日漲幅%", "低位階分", "K線分",
     "均線支撐分", "量能健康分", "營收EPS分", "操作策略", "排除原因",
@@ -2077,13 +2077,16 @@ class MarketRegimeEngine:
         df.loc[df["wave_correction_flag"], "market_pullback_type"] = "波段修正"
         df.loc[df["deviation_risk_flag"] & ~df["wave_correction_flag"], "market_pullback_type"] = "乖離過大/禁追高"
         if self.logger:
+            wave_count = int(df["wave_correction_flag"].fillna(False).sum())
             self.logger.strategy_trace("WAVE_CORRECTION", {
                 "rows": int(len(df)),
-                "wave_correction_count": int(df["wave_correction_flag"].fillna(False).sum()),
+                "wave_correction_count": wave_count,
                 "macd_turn_negative_count": int(df["macd_turn_negative"].fillna(False).sum()),
                 "kd_dead_cross_below_80_count": int(df["kd_dead_cross_below_80"].fillna(False).sum()),
                 "deviation_risk_count": int(df["deviation_risk_flag"].fillna(False).sum()),
             })
+            if wave_count == 0:
+                self.logger.warning("WAVE_CORRECTION_ZERO_WARN wave_correction_count=0，請確認macd_hist/macd_hist_prev與KD欄位來源是否完整；此為驗收WARN，不阻斷報表。")
         return df
 
 class SakataRiskPatternEngine:
@@ -2262,6 +2265,8 @@ class TeacherDecisionEngine:
         rr = _safe_series(df, "rr", default=0).fillna(0)
         close = _safe_series(df, "close")
         entry_high = _safe_series(df, "entry_high")
+        entry_low = _safe_series(df, "entry_low")
+        high20 = _safe_series(df, "high20_prev")
         low_base = _safe_series(df, "low_base_score", default=50).fillna(50)
         low_base_reversal = _safe_bool_series(df, "low_base_reversal_flag")
         hard_avoid = _safe_bool_series(df, "hard_avoid_flag")
@@ -2285,13 +2290,14 @@ class TeacherDecisionEngine:
             & ~hard_avoid
             & (close <= entry_high * 1.05)
         )
+        breakout_or_pullback_confirm = low_base_reversal | (close > high20) | soft_released
         buy = (
-            (score >= 68)
+            (score >= 72)
             & (rr >= 1.55)
-            & low_base_reversal
+            & breakout_or_pullback_confirm
             & core_ok
             & ~hard_avoid
-            & (close <= entry_high * 1.025)
+            & (close <= entry_high * 1.035)
             & ~wave
             & k_warning.eq("")
         )
@@ -2353,15 +2359,42 @@ class TeacherDecisionEngine:
             else:
                 pool.append("觀察")
         df["teacher_pool_type"] = pool
+
+        # Phase5 semantic fix：以老師五態重新同步 YES / WAIT / NO，避免 YES 與 BUY/LOW_BUY 語義打架。
+        in_entry_zone = close.notna() & entry_low.notna() & entry_high.notna() & (close >= entry_low) & (close <= entry_high)
+        df["teacher_execution_status"] = "NO"
+        df["teacher_execution_reason"] = ""
+        df["是否可下單"] = "NO"
+        buy_mask = df["teacher_decision"].eq("BUY")
+        low_buy_mask = df["teacher_decision"].eq("LOW_BUY")
+        watch_mask = df["teacher_decision"].eq("WATCH")
+        reduce_mask2 = df["teacher_decision"].eq("REDUCE")
+        avoid_mask2 = df["teacher_decision"].eq("AVOID")
+        df.loc[buy_mask, "teacher_execution_status"] = "YES"
+        df.loc[buy_mask, "teacher_execution_reason"] = "BUY主攻：核心風向未轉弱、無硬性排除、RR與位置符合"
+        df.loc[low_buy_mask & in_entry_zone, "teacher_execution_status"] = "YES"
+        df.loc[low_buy_mask & in_entry_zone, "teacher_execution_reason"] = "LOW_BUY且已進入低接區，可分批"
+        df.loc[low_buy_mask & ~in_entry_zone, "teacher_execution_status"] = "WAIT"
+        df.loc[low_buy_mask & ~in_entry_zone, "teacher_execution_reason"] = "LOW_BUY但尚未進入低接區，等待回落"
+        df.loc[watch_mask & ~hard_avoid & (rr >= 1.20), "teacher_execution_status"] = "WAIT"
+        df.loc[watch_mask & ~hard_avoid & (rr >= 1.20), "teacher_execution_reason"] = "WATCH：條件未完整確認，只觀察不主攻"
+        df.loc[reduce_mask2, "teacher_execution_status"] = "NO"
+        df.loc[reduce_mask2, "teacher_execution_reason"] = "REDUCE：壓力或波段風險，禁止新增"
+        df.loc[avoid_mask2, "teacher_execution_status"] = "NO"
+        df.loc[avoid_mask2, "teacher_execution_reason"] = "AVOID：硬性排除或核心風向轉弱"
+        df["是否可下單"] = df["teacher_execution_status"]
+
         if self.logger:
             counts = df["teacher_decision"].value_counts(dropna=False).to_dict()
             self.logger.strategy_trace("TEACHER_DECISION_SUMMARY", counts)
+            self.logger.strategy_trace("TEACHER_EXECUTION_SUMMARY", df["teacher_execution_status"].value_counts(dropna=False).to_dict())
             if int((df["teacher_decision"].isin(["BUY", "LOW_BUY"])).sum()) == 0:
                 self.logger.warning("TEACHER_DECISION_STRICT_WARNING BUY與LOW_BUY皆為0，請檢查RR/低位階翻多/硬性風險條件")
             for _, r in df.sort_values(["teacher_score", "rr"], ascending=False).head(30).iterrows():
                 self.logger.strategy_trace("DECISION_TRACE", {
                     "stock": str(r.get("stock_id", "")).zfill(4),
                     "decision": r.get("teacher_decision", ""),
+                    "execution": r.get("teacher_execution_status", ""),
                     "reason": r.get("teacher_decision_reason", ""),
                     "release": r.get("decision_release_reason", ""),
                     "score": round(_safe_float(r.get("teacher_score"),0), 2),
@@ -2678,9 +2711,11 @@ class TeacherFullReportBuilder:
         for col in score_cols:
             if col not in df.columns:
                 df[col] = 0
-        final = df[(teacher_decision.isin(["BUY", "LOW_BUY", "WATCH"])) & (~exclude_flag)].sort_values(score_cols, ascending=False).head(15)
+        execution_status = df.get("teacher_execution_status", pd.Series("NO", index=df.index)).astype(str)
+        final = df[(teacher_decision.isin(["BUY", "LOW_BUY", "WATCH"])) & (~teacher_decision.eq("AVOID"))].sort_values(score_cols, ascending=False).head(15)
         if final.empty:
             final = df[~teacher_decision.eq("AVOID")].sort_values(score_cols, ascending=False).head(15)
+        release_or_watch = df[teacher_decision.isin(["BUY", "LOW_BUY"]) | execution_status.eq("WAIT") | df.get("avoid_level", pd.Series("", index=df.index)).astype(str).eq("SOFT_RELEASED")].sort_values(["teacher_score", "rr"], ascending=False)
         datasets = {
             "final_top15": final,
             "growth_top30": df.sort_values("growth_score", ascending=False).head(30),
@@ -2692,7 +2727,7 @@ class TeacherFullReportBuilder:
             "watch": df[teacher_decision.eq("WATCH")].sort_values(["teacher_score", "rr"], ascending=False),
             "avoid": df[teacher_decision.eq("AVOID")].sort_values(["teacher_score", "rr"], ascending=False),
             "reduce": df[teacher_decision.eq("REDUCE")].sort_values(["teacher_score", "rr"], ascending=False),
-            "release": df[teacher_decision.isin(["BUY", "LOW_BUY"]) | df.get("avoid_level", pd.Series("", index=df.index)).astype(str).eq("SOFT_RELEASED")].sort_values(["teacher_score", "rr"], ascending=False),
+            "release": release_or_watch,
         }
         if self.logger:
             self.logger.strategy_trace("TEACHER_FULL_REPORT_BUILDER", {k: int(len(v)) for k, v in datasets.items() if v is not None})
@@ -2734,7 +2769,7 @@ class InstitutionalExcelWriter:
                 i, str(r.get("stock_id", "")).zfill(4), name, r.get("market", ""), r.get("industry", r.get("industry_master", "")), r.get("theme", r.get("sub_theme", "")), r.get("老師分類", ""),
                 r.get("teacher_decision", "WATCH"), r.get("teacher_decision_reason", ""), r.get("decision_trace", ""), r.get("teacher_pool_type", ""), r.get("core_leader_state", ""),
                 r.get("k_warning_type", ""), r.get("market_pullback_type", ""), r.get("swap_reason", ""), round(float(r.get("close", 0) or 0),2),
-                f"{round(float(r.get('entry_low',0) or 0),2)}~{round(float(r.get('entry_high',0) or 0),2)}", round(float(r.get("stop_loss",0) or 0),2), round(float(r.get("target_1",0) or 0),2), round(float(r.get("target_2",0) or 0),2), round(float(r.get("rr",0) or 0),2), r.get("是否可下單", "NO"),
+                f"{round(float(r.get('entry_low',0) or 0),2)}~{round(float(r.get('entry_high',0) or 0),2)}", round(float(r.get("stop_loss",0) or 0),2), round(float(r.get("target_1",0) or 0),2), round(float(r.get("target_2",0) or 0),2), round(float(r.get("rr",0) or 0),2), r.get("是否可下單", "NO"), r.get("teacher_execution_status", r.get("是否可下單", "NO")),
                 round(float(r.get("teacher_score",0) or 0),2), round(float(r.get("growth_score",0) or 0),2), round(float(r.get("value_score",0) or 0),2), round(float(r.get("eps_ttm", r.get("valuation_eps_ttm",0)) or 0),2), round(float(r.get("pe",0) or 0),2), round(float(r.get("dividend_yield",0) or 0),2),
                 round(float(r.get("yoy", r.get("revenue_yoy",0)) or 0),2), round(float(r.get("institutional_score",0) or 0),2), round(float(r.get("pct_20d",0) or 0),2), round(float(r.get("low_base_score",0) or 0),2), round(float(r.get("kline_score",0) or 0),2),
                 round(float(r.get("ma_support_score",0) or 0),2), round(float(r.get("volume_health_score",0) or 0),2), round(float(r.get("revenue_eps_score",0) or 0),2), r.get("操作策略", ""), r.get("exclude_reason", ""),
@@ -2756,6 +2791,17 @@ class InstitutionalExcelWriter:
         ws.append(["YES", int((df["是否可下單"]=="YES").sum())])
         ws.append(["WAIT", int((df["是否可下單"]=="WAIT").sum())])
         ws.append(["NO", int((df["是否可下單"]=="NO").sum())])
+        ws.append(["老師執行狀態YES", int((df.get("teacher_execution_status", pd.Series(index=df.index)).astype(str)=="YES").sum())])
+        ws.append(["老師執行狀態WAIT", int((df.get("teacher_execution_status", pd.Series(index=df.index)).astype(str)=="WAIT").sum())])
+        ws.append(["老師執行狀態NO", int((df.get("teacher_execution_status", pd.Series(index=df.index)).astype(str)=="NO").sum())])
+        gov_source = str((gov_result or {}).get("source", ""))
+        if "TEJ" in gov_source:
+            gov_level = "正式"
+        elif gov_result and (gov_result or {}).get("gov_net_100m") is not None:
+            gov_level = "備援"
+        else:
+            gov_level = "缺資料/佐證"
+        ws.append(["官股資料等級", gov_level])
         ws.append([])
         ws.append(["老師五態決策統計", "數量"])
         for decision in ["BUY", "LOW_BUY", "WATCH", "REDUCE", "AVOID"]:
@@ -2808,7 +2854,7 @@ class InstitutionalExcelWriter:
             ("13_LOW_BUY候選", datasets["low_buy"], 100),
             ("14_WATCH觀察池", datasets["watch"], 200),
             ("15_AVOID排除清單", datasets["avoid"], 300),
-            ("16_BUY_LOW_BUY放行原因", datasets["release"], 200),
+            ("16_放行與觀察候選", datasets["release"], 200),
         ]
         for sheet, data, topn in report_sheet_map:
             ws = self._sheet(wb, sheet)
@@ -2840,7 +2886,7 @@ class InstitutionalExcelWriter:
             ("CoreLeader狀態", "core_leader_state" in df.columns, "PASS" if "core_leader_state" in df.columns else "FAIL", str(df.get("core_leader_state", pd.Series(["NE"])).iloc[0]) if len(df) else ""),
             ("阪田警訊", "k_warning_type" in df.columns, "PASS" if "k_warning_type" in df.columns else "FAIL", int(df.get("k_warning_type", pd.Series("", index=df.index)).astype(str).ne("").sum()) if "k_warning_type" in df.columns else 0),
             ("避開換股", "swap_reason" in df.columns, "PASS" if "swap_reason" in df.columns else "FAIL", int(df.get("swap_reason", pd.Series("", index=df.index)).astype(str).ne("").sum()) if "swap_reason" in df.columns else 0),
-            ("波段修正", "wave_correction_flag" in df.columns, "PASS" if "wave_correction_flag" in df.columns else "FAIL", int(df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False).sum()) if "wave_correction_flag" in df.columns else 0),
+            ("波段修正", "wave_correction_flag" in df.columns, "WARN" if ("wave_correction_flag" in df.columns and int(df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False).sum()) == 0) else ("PASS" if "wave_correction_flag" in df.columns else "FAIL"), int(df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False).sum()) if "wave_correction_flag" in df.columns else 0),
             ("低位階翻多", "low_base_reversal_flag" in df.columns, "PASS" if "low_base_reversal_flag" in df.columns else "FAIL", int(df.get("low_base_reversal_flag", pd.Series(False, index=df.index)).fillna(False).sum()) if "low_base_reversal_flag" in df.columns else 0),
             ("Hard/Soft Avoid", "hard_avoid_flag" in df.columns and "soft_avoid_flag" in df.columns, "PASS" if "hard_avoid_flag" in df.columns and "soft_avoid_flag" in df.columns else "FAIL", f"hard={int(df.get('hard_avoid_flag', pd.Series(False,index=df.index)).fillna(False).sum()) if 'hard_avoid_flag' in df.columns else 0};soft={int(df.get('soft_avoid_flag', pd.Series(False,index=df.index)).fillna(False).sum()) if 'soft_avoid_flag' in df.columns else 0}"),
         ]
@@ -2862,11 +2908,15 @@ class InstitutionalExcelWriter:
         ws.append(["P5-03", "LowBaseReversalEngine", "已修改", "LowBaseReversalEngine", "新增low_base_reversal_flag與LOW_BASE_REVERSAL_SUMMARY"] )
         ws.append(["P5-04", "Avoid hard/soft分層", "已修改", "AvoidSwapEngine", "soft avoid可被低位階翻多覆蓋，hard avoid不可覆蓋"] )
         ws.append(["P5-05", "BUY/LOW_BUY重平衡", "已修改", "TeacherDecisionEngine", "先擋硬風險，再依LowBase/RR/Score/Core決策"] )
-        ws.append(["P5-06", "新增13~16分池Sheet", "已修改", "InstitutionalExcelWriter", "新增LOW_BUY候選/WATCH觀察/AVOID排除/放行原因"] )
+        ws.append(["P5-06", "新增13~16分池Sheet", "已修改", "InstitutionalExcelWriter", "新增LOW_BUY候選/WATCH觀察/AVOID排除/放行與觀察候選"] )
         ws.append(["P5-07", "Strategy Validation", "已修改", "12_策略命中驗證", "保留待追蹤；新增樣本分布與後續計算接口"] )
         ws.append(["P5-08", "GUI/CLI語意", "已修改", "run_gui / argparse", "新增macro_teacher/teacher_full模式並更新說明"] )
         ws.append(["P5-09", "報表缺失防呆", "已修改", "ReportValidator/ExcelWriter", "輸出後檢查00~16，缺失寫TEACHER_REPORT_VALIDATE_FAIL"] )
-        ws.append(["P5-10", "成熟度標記", "已修改", "VERSION/STRATEGY_VERSION", "升級為2.7.0-teacher-phase5-fullreport"] )
+        ws.append(["P5-10", "成熟度標記", "已修改", "VERSION/STRATEGY_VERSION", "升級為2.7.2-teacher-phase5-semantic-fix"] )
+        ws.append(["P6-01", "YES/WAIT/NO語義同步", "已修改", "TeacherDecisionEngine", "以老師五態重新同步是否可下單與teacher_execution_status，避免YES與BUY/LOW_BUY打架"] )
+        ws.append(["P6-02", "16表名稱修正", "已修改", "EXPECTED_INSTITUTIONAL_SHEETS/Writer", "16_BUY_LOW_BUY放行原因改為16_放行與觀察候選，避免內含WATCH時語義錯誤"] )
+        ws.append(["P6-03", "波段修正零樣本WARN", "已修改", "MarketRegimeEngine/10_老師策略驗收", "wave_correction_count=0改列WARN並寫入log，不再誤判為完全PASS"] )
+        ws.append(["P6-04", "官股資料等級", "已修改", "00_執行摘要", "新增正式/備援/缺資料等級，TEJ未提供時不偽裝正式"] )
         ws.append(["P0-10", "策略命中驗證", "已修改", "12_策略命中驗證", "若有未來價格資料則計算，否則明確標示待追蹤"] )
         ws = self._sheet(wb, "12_策略命中驗證")
         ws.append(["項目", "內容"])
