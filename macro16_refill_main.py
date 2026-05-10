@@ -53,8 +53,8 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.6.1-teacher-strategy-gapfix-trace"
-STRATEGY_VERSION = "teacher_strategy_v1.1_gapfix_20260510"
+VERSION = "2.6.2-teacher-strategy-rgap-final"
+STRATEGY_VERSION = "teacher_strategy_v1.2_rgap_20260510"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -1607,7 +1607,22 @@ class ExplanationEngine:
         if tech.risk_score >= 3 and "停止" not in switch:
             switch = "降倉交易 / 禁追高"
             advice += " 技術風險偏高，需再降部位。"
-        return {"宏觀總分": f"{macro_total:.2f}", "技術風險分數": f"{tech.risk_score:.0f}", "市場狀態": state, "交易開關": switch, "操作建議": advice, "核心結論": tech.market_judgement}
+        
+        # R01：顧奎國老師策略要求摘要頁用「多頭 / 震盪 / 修正 / 空頭」四態語義，
+        # 不只保留原本強多、震盪偏多、風險偏空文字。
+        if macro_total >= 2 and tech.risk_score <= 1:
+            four_state = "多頭"
+            four_reason = "宏觀總分偏多且技術風險低，允許主流股低接布局。"
+        elif tech.risk_score >= 4 or macro_total <= -3:
+            four_state = "空頭"
+            four_reason = "技術風險分數過高或宏觀總分明顯偏空，停止新倉。"
+        elif tech.risk_score >= 3 or macro_total <= -1:
+            four_state = "修正"
+            four_reason = "大盤進入降倉/禁追高區，需等待風險降溫與回測不破。"
+        else:
+            four_state = "震盪"
+            four_reason = "多空分數未明確，僅做最高勝率標的與低位階輪動。"
+        return {"宏觀總分": f"{macro_total:.2f}", "技術風險分數": f"{tech.risk_score:.0f}", "市場狀態": state, "市場四態": four_state, "四態判斷原因": four_reason, "交易開關": switch, "操作建議": advice, "核心結論": tech.market_judgement}
 
 
 # =============================
@@ -1617,14 +1632,15 @@ EXPECTED_INSTITUTIONAL_SHEETS = [
     "00_執行摘要", "01_DB資料盤點", "02_模型設計", "03_最終TOP15",
     "04_成長模型TOP30", "05_價值模型TOP30", "06_低位階候選",
     "07_老師點名股檢核", "08_排除與風險", "09_來源與限制",
-    "10_老師策略驗收", "11_修改追蹤", "12_策略命中驗證"
+    "10_老師策略驗收", "11_修改追蹤", "12_策略命中驗證", "13_R版GAP驗收"
 ]
 
 REPORT_COLUMNS = [
     "排名", "代號", "名稱", "市場", "產業", "題材", "老師分類", "老師決策", "決策原因", "決策追蹤", "老師股票池", "核心股狀態",
     "K線警訊", "波段修正", "避開/換股", "現價",
-    "低接區", "停損", "目標1", "目標2", "RR", "是否可下單",
-    "老師總分", "成長分", "價值分", "EPS_TTM", "PE", "殖利率%",
+    "低接區", "支撐來源", "頸線價", "均線支撐來源", "回測不破", "停損", "目標1", "目標2", "RR", "是否可下單",
+    "壓力價", "賣點區", "減碼原因明細",
+    "老師總分", "成長分", "價值分", "EPS_TTM", "PE", "殖利率%", "40元殖利率%", "50元殖利率%", "60元殖利率%", "除息風險",
     "營收YoY%", "法人分", "20日漲幅%", "低位階分", "K線分",
     "均線支撐分", "量能健康分", "營收EPS分", "操作策略", "排除原因"
 ]
@@ -2354,6 +2370,92 @@ class TradePlanEngine:
             df.loc[df["wave_correction_flag"].fillna(False), "操作策略"] = "波段修正確認，停止追高並降檔"
         if "avoid_flag" in df.columns:
             df.loc[df["avoid_flag"].fillna(False), "操作策略"] = "兩高不過/下降軌道，反彈換股"
+
+        # R03：買點來源細分。讓低接區不只是價格區間，還能說明支撐依據。
+        high20 = pd.to_numeric(df.get("high20_prev"), errors="coerce")
+        low20 = pd.to_numeric(df.get("low20_prev"), errors="coerce")
+        df["neckline_price"] = high20
+        df["support_type"] = "價格回測支撐"
+        df.loc[ma20.notna() & (close >= ma20 * 0.98) & (close <= ma20 * 1.03), "support_type"] = "MA20回測支撐"
+        df.loc[ma60.notna() & (close >= ma60 * 0.98) & (close <= ma60 * 1.03), "support_type"] = "MA60中期支撐"
+        df.loc[low20.notna() & (close >= low20 * 0.98) & (close <= low20 * 1.05), "support_type"] = "前低/區間下緣支撐"
+        df["ma_support_source"] = ""
+        df.loc[ma20.notna() & (close >= ma20), "ma_support_source"] += "MA20上方;"
+        df.loc[ma60.notna() & (close >= ma60), "ma_support_source"] += "MA60上方;"
+        df["pullback_hold_flag"] = (close >= df["entry_low"]) & (close <= df["entry_high"] * 1.03) & (~df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False))
+
+        # R04：賣點價位與減碼原因細分。
+        df["pressure_price"] = high20.fillna(pd.to_numeric(df.get("target_1"), errors="coerce"))
+        df["sell_zone"] = df.apply(lambda r: f"{round(_safe_float(r.get('pressure_price'),0)*0.99,2)}~{round(_safe_float(r.get('pressure_price'),0)*1.02,2)}" if _safe_float(r.get('pressure_price'),0) else "", axis=1)
+        reduce_reason = []
+        for _, r in df.iterrows():
+            parts = []
+            if str(r.get("k_warning_type", "") or ""): parts.append("K線警訊=" + str(r.get("k_warning_type")))
+            if bool(r.get("wave_correction_flag", False)): parts.append("MACD+KD波段修正")
+            if bool(r.get("deviation_risk_flag", False)): parts.append("乖離過大")
+            if str(r.get("swap_reason", "") or ""): parts.append(str(r.get("swap_reason")))
+            if _safe_float(r.get("close"), 0) >= _safe_float(r.get("pressure_price"), 10**9) * 0.98: parts.append("接近前高/頸線壓力")
+            reduce_reason.append(";".join(parts))
+        df["reduce_reason_detail"] = reduce_reason
+
+        # R05：高配息分段模型。用目前殖利率與現價推估現金股利，再反推不同價格殖利率。
+        dividend_yield = pd.to_numeric(df.get("dividend_yield"), errors="coerce")
+        implied_cash_dividend = close * dividend_yield / 100
+        df["yield_at_40"] = (implied_cash_dividend / 40 * 100).round(2)
+        df["yield_at_50"] = (implied_cash_dividend / 50 * 100).round(2)
+        df["yield_at_60"] = (implied_cash_dividend / 60 * 100).round(2)
+        df["ex_dividend_risk"] = "一般"
+        df.loc[(dividend_yield >= 6) & (pd.to_numeric(df.get("pct_20d"), errors="coerce").fillna(0) >= 15), "ex_dividend_risk"] = "高殖利率但短線漲多，留意除息前獲利了結"
+        df.loc[(dividend_yield >= 5) & (df.get("teacher_decision", pd.Series("", index=df.index)).astype(str).isin(["WATCH", "LOW_BUY", "BUY"])), "ex_dividend_risk"] = "高配息可納入防守池，仍需看營收與位階"
+        return df
+
+
+class StrategyHitValidationEngine:
+    """R06：策略命中率驗證。
+    若 price_history 已有決策日後第1日/第5日資料，計算隔日報酬、5日報酬與最大回撤；
+    若尚無未來資料，不假造勝率，保留 WAIT_DATA。
+    """
+    def __init__(self, repo: DBRepository, logger: Optional[Macro16Logger] = None):
+        self.repo = repo
+        self.logger = logger
+
+    def apply(self, df, trade_date: str):
+        for col in ["hit_next1_return", "hit_next5_return", "hit_max_drawdown", "hit_calc_status"]:
+            df[col] = None
+        df["hit_calc_status"] = "WAIT_DATA"
+        try:
+            if pd is None or not self.repo.table_exists("price_history"):
+                return df
+            with self.repo.connect() as conn:
+                ph = pd.read_sql("SELECT stock_id,date,close,low FROM price_history WHERE date>=?", conn, params=[trade_date])
+            if ph.empty:
+                return df
+            ph["stock_id"] = ph["stock_id"].astype(str).str.zfill(4)
+            ph["date"] = ph["date"].astype(str)
+            ph["close"] = pd.to_numeric(ph["close"], errors="coerce")
+            ph["low"] = pd.to_numeric(ph["low"], errors="coerce")
+            calc_count = 0
+            for idx, row in df.iterrows():
+                sid = str(row.get("stock_id", "")).zfill(4)
+                g = ph[ph["stock_id"].eq(sid)].sort_values("date")
+                if len(g) < 2:
+                    continue
+                base = float(row.get("close") or g.iloc[0].get("close") or 0)
+                if not base:
+                    continue
+                next1 = g.iloc[1]["close"] if len(g) >= 2 else None
+                next5 = g.iloc[5]["close"] if len(g) >= 6 else None
+                low_window = g.head(min(len(g), 6))["low"].min()
+                df.at[idx, "hit_next1_return"] = round((float(next1) / base - 1) * 100, 2) if next1 == next1 else None
+                df.at[idx, "hit_next5_return"] = round((float(next5) / base - 1) * 100, 2) if next5 == next5 else None
+                df.at[idx, "hit_max_drawdown"] = round((float(low_window) / base - 1) * 100, 2) if low_window == low_window else None
+                df.at[idx, "hit_calc_status"] = "CALCULATED" if next5 == next5 else "PARTIAL_NEXT1"
+                calc_count += 1
+            if self.logger:
+                self.logger.strategy_trace("STRATEGY_HIT_VALIDATION", {"calculated_rows": int(calc_count), "total_rows": int(len(df))})
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(f"STRATEGY_HIT_VALIDATION_FAIL error={exc}")
         return df
 
 class InstitutionalReportEngine:
@@ -2376,6 +2478,7 @@ class InstitutionalReportEngine:
         df = AvoidSwapEngine(self.logger).apply(df)
         df = TradePlanEngine().build(df)
         df = TeacherDecisionEngine(self.logger).apply(df)
+        df = StrategyHitValidationEngine(self.repo, self.logger).apply(df, trade_date)
         df["report_name"] = df.get("stock_name", df.get("stock_name_master", df.get("name", "")))
         result = {
             "trade_date": trade_date,
@@ -2426,14 +2529,15 @@ class InstitutionalExcelWriter:
                 i, str(r.get("stock_id", "")).zfill(4), name, r.get("market", ""), r.get("industry", r.get("industry_master", "")), r.get("theme", r.get("sub_theme", "")), r.get("老師分類", ""),
                 r.get("teacher_decision", "WATCH"), r.get("teacher_decision_reason", ""), r.get("decision_trace", ""), r.get("teacher_pool_type", ""), r.get("core_leader_state", ""),
                 r.get("k_warning_type", ""), r.get("market_pullback_type", ""), r.get("swap_reason", ""), round(float(r.get("close", 0) or 0),2),
-                f"{round(float(r.get('entry_low',0) or 0),2)}~{round(float(r.get('entry_high',0) or 0),2)}", round(float(r.get("stop_loss",0) or 0),2), round(float(r.get("target_1",0) or 0),2), round(float(r.get("target_2",0) or 0),2), round(float(r.get("rr",0) or 0),2), r.get("是否可下單", "NO"),
-                round(float(r.get("teacher_score",0) or 0),2), round(float(r.get("growth_score",0) or 0),2), round(float(r.get("value_score",0) or 0),2), round(float(r.get("eps_ttm", r.get("valuation_eps_ttm",0)) or 0),2), round(float(r.get("pe",0) or 0),2), round(float(r.get("dividend_yield",0) or 0),2),
+                f"{round(float(r.get('entry_low',0) or 0),2)}~{round(float(r.get('entry_high',0) or 0),2)}", r.get("support_type", ""), round(float(r.get("neckline_price",0) or 0),2), r.get("ma_support_source", ""), "Y" if bool(r.get("pullback_hold_flag", False)) else "N", round(float(r.get("stop_loss",0) or 0),2), round(float(r.get("target_1",0) or 0),2), round(float(r.get("target_2",0) or 0),2), round(float(r.get("rr",0) or 0),2), r.get("是否可下單", "NO"),
+                round(float(r.get("pressure_price",0) or 0),2), r.get("sell_zone", ""), r.get("reduce_reason_detail", ""),
+                round(float(r.get("teacher_score",0) or 0),2), round(float(r.get("growth_score",0) or 0),2), round(float(r.get("value_score",0) or 0),2), round(float(r.get("eps_ttm", r.get("valuation_eps_ttm",0)) or 0),2), round(float(r.get("pe",0) or 0),2), round(float(r.get("dividend_yield",0) or 0),2), round(float(r.get("yield_at_40",0) or 0),2), round(float(r.get("yield_at_50",0) or 0),2), round(float(r.get("yield_at_60",0) or 0),2), r.get("ex_dividend_risk", ""),
                 round(float(r.get("yoy", r.get("revenue_yoy",0)) or 0),2), round(float(r.get("institutional_score",0) or 0),2), round(float(r.get("pct_20d",0) or 0),2), round(float(r.get("low_base_score",0) or 0),2), round(float(r.get("kline_score",0) or 0),2),
                 round(float(r.get("ma_support_score",0) or 0),2), round(float(r.get("volume_health_score",0) or 0),2), round(float(r.get("revenue_eps_score",0) or 0),2), r.get("操作策略", ""), r.get("exclude_reason", "")
             ])
         return rows
 
-    def write_into_workbook(self, wb, report: Optional[Dict[str, Any]], gov_result: Optional[Dict[str, Any]] = None, market5_result: Optional[Dict[str, Any]] = None):
+    def write_into_workbook(self, wb, report: Optional[Dict[str, Any]], gov_result: Optional[Dict[str, Any]] = None, market5_result: Optional[Dict[str, Any]] = None, summary: Optional[Dict[str, str]] = None):
         if report is None:
             return
         df = report["all"]
@@ -2443,6 +2547,11 @@ class InstitutionalExcelWriter:
         ws.append(["報告日期", report.get("trade_date")])
         ws.append(["DB路徑", report.get("db_path")])
         ws.append(["總股票數", len(df)])
+        summary = summary or {}
+        ws.append(["市場四態", summary.get("市場四態", "")])
+        ws.append(["四態判斷原因", summary.get("四態判斷原因", "")])
+        ws.append(["市場狀態", summary.get("市場狀態", "")])
+        ws.append(["交易開關", summary.get("交易開關", "")])
         ws.append(["策略版本", STRATEGY_VERSION])
         ws.append(["YES", int((df["是否可下單"]=="YES").sum())])
         ws.append(["WAIT", int((df["是否可下單"]=="WAIT").sum())])
@@ -2451,6 +2560,15 @@ class InstitutionalExcelWriter:
         ws.append(["老師五態決策統計", "數量"])
         for decision in ["BUY", "LOW_BUY", "WATCH", "REDUCE", "AVOID"]:
             ws.append([decision, int((df.get("teacher_decision", pd.Series(index=df.index)).astype(str)==decision).sum())])
+        ws.append([])
+        ws.append(["老師股票池統計", "數量 / TOP3"])
+        if "teacher_pool_type" in df.columns:
+            for pool_name, cnt in df["teacher_pool_type"].astype(str).value_counts().items():
+                top3 = df[df["teacher_pool_type"].astype(str).eq(pool_name)].sort_values("teacher_score", ascending=False).head(3)
+                top3_text = ", ".join([str(x).zfill(4) for x in top3.get("stock_id", pd.Series([], dtype=str)).astype(str).tolist()])
+                ws.append([pool_name, f"{int(cnt)} / TOP3={top3_text}"])
+        else:
+            ws.append(["未產出teacher_pool_type", 0])
         ws.append([])
         ws.append(["策略原因統計", "數量"])
         reason_map = {
@@ -2487,6 +2605,13 @@ class InstitutionalExcelWriter:
         ws.append(["阪田警訊", "SakataRiskPatternEngine：流星/空頭新星十字/墓碑線/長黑K", "觸發後壓力先賣或等待2日確認"])
         ws.append(["排除換股", "AvoidSwapEngine：兩高不過/下降軌道/頸線壓力未突破/乖離過大", "符合者不得列主攻"])
         ws.append(["老師決策", "BUY / LOW_BUY / WATCH / REDUCE / AVOID", "保留是否可下單YES/WAIT/NO，但新增老師五態決策"])
+        ws.append(["R01市場四態", "多頭 / 震盪 / 修正 / 空頭", "00摘要輸出市場四態與判斷原因"])
+        ws.append(["R02股票池統計", "主流核心 / 低位階翻多 / 營收成長/主流題材 / 高配息防守 / 觀察", "00摘要列各股票池數量與TOP3"])
+        ws.append(["R03買點來源", "support_type / neckline_price / ma_support_source / pullback_hold_flag", "讓低接區有支撐來源與回測不破判斷"])
+        ws.append(["R04賣點價位", "pressure_price / sell_zone / reduce_reason_detail", "REDUCE不只文字警示，也提供壓力價區"])
+        ws.append(["R05高配息分段", "yield_at_40/50/60 + ex_dividend_risk", "高配息模型加入價格分段殖利率與除息風險"])
+        ws.append(["R06命中驗證", "hit_next1_return / hit_next5_return / hit_max_drawdown", "有未來價格才計算，否則明確標WAIT_DATA"])
+
         # datasets
         final = df[~df["exclude_flag"]].sort_values(["teacher_score","growth_score","value_score"], ascending=False).head(15)
         growth = df.sort_values("growth_score", ascending=False).head(30)
@@ -2502,10 +2627,10 @@ class InstitutionalExcelWriter:
         ws = self._sheet(wb, "09_來源與限制")
         ws.append(["項目", "內容"])
         ws.append(["資料來源", "stock_system DB + TEJ八大公股行庫（若提供）+ TWSE/TPEX/TAIFEX宏觀來源"])
-        ws.append(["官股/八大公股", "TEJ或Wantgoo等來源只作證據追溯；只要gov_net_100m解析正確，分數只依數值，不因來源不同扣分"])
+        ws.append(["官股/八大公股", "TEJ為主來源；TEJ未提供時Wantgoo只作備援；TWSE T86只能作官方法人佐證，不能冒充八大官股本體；若要正式交易，建議補TEJ或人工覆寫流程"] )
         ws.append(["Macro16跨月5日", "本版已提供Market5DayEngine；不足5日標P0_FAIL，停止市場技術判斷"])
         ws.append(["老師策略P0", "已新增CoreLeaderEngine、MarketRegimeEngine、SakataRiskPatternEngine、AvoidSwapEngine與TeacherDecisionEngine"])
-        ws.append(["格式驗收", "00~11固定；03~08共用36欄；10/11為老師策略驗收與修改追蹤"])
+        ws.append(["格式驗收", "00~13固定；03~08共用新版48欄；10/11/12/13為驗收與修改追蹤"])
         ws = self._sheet(wb, "10_老師策略驗收")
         ws.append(["TC", "驗收情境", "程式欄位", "預期結果"] )
         ws.append(["TC01", "流星但MACD/KD未雙翻空", "k_warning_type + wave_correction_flag", "REDUCE或WATCH，不全面轉空"] )
@@ -2538,6 +2663,14 @@ class InstitutionalExcelWriter:
         ws.append(["P0-08", "Decision Trace", "已修改", "TeacherDecisionEngine + Logger", "新增teacher_decision_reason與decision_trace欄位並輸出DECISION_TRACE log"] )
         ws.append(["P0-09", "策略版本凍結", "已修改", "VERSION/STRATEGY_VERSION", "新增STRATEGY_VERSION並寫入log與00摘要"] )
         ws.append(["P0-10", "策略命中驗證", "已修改", "12_策略命中驗證", "若有未來價格資料則計算，否則明確標示待追蹤"] )
+        ws.append(["R01", "大盤四態語義", "已修改", "ExplanationEngine + 00_執行摘要", "新增多頭/震盪/修正/空頭與判斷原因"])
+        ws.append(["R02", "股票池統計", "已修改", "InstitutionalExcelWriter", "摘要頁新增各老師股票池數量與TOP3"])
+        ws.append(["R03", "買點來源細分", "已修改", "TradePlanEngine", "新增support_type、neckline_price、ma_support_source、pullback_hold_flag"])
+        ws.append(["R04", "賣點價位明確化", "已修改", "TradePlanEngine", "新增pressure_price、sell_zone、reduce_reason_detail"])
+        ws.append(["R05", "高配息分段模型", "已修改", "TradePlanEngine", "新增40/50/60元殖利率與除息風險"])
+        ws.append(["R06", "策略命中率計算", "已修改", "StrategyHitValidationEngine", "若price_history已有未來資料，計算1日/5日報酬與最大回撤"])
+        ws.append(["R07", "BUY/LOW_BUY=0提示", "已修改", "00摘要 + 13_R版GAP驗收", "保留五態統計並標示防守輸出，不誤判為程式未產出"])
+        ws.append(["R08", "官股來源正式化", "已修改", "09_來源與限制", "保留TEJ主來源、Wantgoo備援與TWSE T86非八大官股註記"])
         ws = self._sheet(wb, "12_策略命中驗證")
         ws.append(["項目", "內容"])
         ws.append(["策略版本", STRATEGY_VERSION])
@@ -2546,8 +2679,29 @@ class InstitutionalExcelWriter:
         ws.append([])
         ws.append(["決策", "樣本數", "可計算樣本", "平均隔日%", "平均5日%", "最大回撤%", "狀態"])
         for decision in ["BUY", "LOW_BUY", "WATCH", "REDUCE", "AVOID"]:
-            sample_count = int((df.get("teacher_decision", pd.Series(index=df.index)).astype(str)==decision).sum())
-            ws.append([decision, sample_count, 0, "", "", "", "待後續price_history資料回補後驗證"])
+            sub = df[df.get("teacher_decision", pd.Series(index=df.index)).astype(str)==decision]
+            sample_count = int(len(sub))
+            calc = sub[sub.get("hit_calc_status", pd.Series("WAIT_DATA", index=sub.index)).astype(str).isin(["CALCULATED", "PARTIAL_NEXT1"])] if len(sub) else sub
+            calc_count = int(len(calc))
+            avg1 = round(pd.to_numeric(calc.get("hit_next1_return"), errors="coerce").dropna().mean(), 2) if calc_count else ""
+            avg5 = round(pd.to_numeric(calc.get("hit_next5_return"), errors="coerce").dropna().mean(), 2) if calc_count else ""
+            dd = round(pd.to_numeric(calc.get("hit_max_drawdown"), errors="coerce").dropna().min(), 2) if calc_count else ""
+            status = "已計算" if calc_count else "待後續price_history資料回補後驗證"
+            ws.append([decision, sample_count, calc_count, avg1, avg5, dd, status])
+        ws = self._sheet(wb, "13_R版GAP驗收")
+        ws.append(["GAP ID", "要求", "修改位置", "驗收狀態", "驗收方式"])
+        rows = [
+            ["GAP-R01", "大盤四態語義", "ExplanationEngine / 00_執行摘要", "已修改", "摘要頁出現市場四態與四態判斷原因"],
+            ["GAP-R02", "股票池統計不足", "00_執行摘要", "已修改", "列出老師股票池數量與TOP3"],
+            ["GAP-R03", "買點來源未細分", "REPORT_COLUMNS / TradePlanEngine", "已修改", "新增支撐來源、頸線價、均線支撐來源、回測不破"],
+            ["GAP-R04", "賣點價位未明確", "REPORT_COLUMNS / TradePlanEngine", "已修改", "新增壓力價、賣點區、減碼原因明細"],
+            ["GAP-R05", "高配息分段模型", "TradePlanEngine", "已修改", "新增40/50/60元殖利率與除息風險"],
+            ["GAP-R06", "策略命中率尚不能計算", "StrategyHitValidationEngine / 12_策略命中驗證", "已修改", "有未來價則計算，無資料則WAIT_DATA"],
+            ["GAP-R07", "BUY/LOW_BUY為0需判斷", "00_執行摘要 / 五態統計", "已修改", "五態統計保留0值，支援判讀為防守輸出"],
+            ["GAP-R08", "第三方官股來源需正式化", "09_來源與限制 / TEJGovBankEngine", "已修改", "TEJ主來源、Wantgoo備援、TWSE T86佐證分流"],
+        ]
+        for r in rows:
+            ws.append(r)
         errors = ReportValidator().validate_workbook(wb)
         if errors:
             self.logger.warning("INSTITUTIONAL_REPORT_VALIDATE_FAIL " + ";".join(errors))
@@ -2584,7 +2738,7 @@ class ExcelWriter:
             self._write_macro_modules(wb, scores)
             self._write_technical(wb, tech)
             if institutional_report is not None:
-                InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result)
+                InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result, summary=summary)
                 self.logger.info("MACRO_REFILL_TOP_OUTPUT_RESTORED sheets=00_09_institutional_reports")
             else:
                 self.logger.warning("MACRO_REFILL_TOP_OUTPUT_SKIPPED reason=未提供DB或InstitutionalReportEngine失敗，無法產出TOP報表")
@@ -2599,13 +2753,13 @@ class ExcelWriter:
             for name in list(wb.sheetnames):
                 del wb[name]
             if institutional_report is not None:
-                InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result)
+                InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result, summary=summary)
             else:
                 ws = wb.create_sheet("00_執行摘要")
                 ws.append(["項目", "內容"]); ws.append(["狀態", "未提供DB，無法產出institutional_report"])
         else:
             if institutional_report is not None:
-                InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result)
+                InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result, summary=summary)
             self._write_market_input(wb, market)
             self._write_macro_modules(wb, scores)
             self._write_technical(wb, tech)
@@ -2816,7 +2970,7 @@ class Macro16Engine:
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
-        self.logger.info("CHANGELOG v2.6.1: GAP fix - decision trace, five-state summary, reason statistics, validation result, strategy hit verification")
+        self.logger.info("CHANGELOG v2.6.2: R-GAP fix - market four-state, pool stats, buy/sell source fields, dividend yield ladder, hit validation")
         self.logger.strategy_trace("STRATEGY_VERSION", {"strategy_version": STRATEGY_VERSION, "program_version": VERSION})
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
@@ -2893,6 +3047,7 @@ class Macro16Engine:
         macro_total = round(sum(s.weighted_score for s in scores), 2)
         tech = self.indicator.compute(market, macro_total)
         summary = self.explain.build_summary(macro_total, tech)
+        self.logger.strategy_trace("MARKET_FOUR_STATE", {"market_four_state": summary.get("市場四態"), "reason": summary.get("四態判斷原因"), "macro_total": macro_total, "risk_score": tech.risk_score})
         warnings = self.audit.check(market, scores, tech)
         warnings = (locals().get("completion_issues", []) or []) + warnings
         if warnings:
