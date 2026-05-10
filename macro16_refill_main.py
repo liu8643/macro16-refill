@@ -53,8 +53,8 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.7.0-teacher-phase5-fullreport"
-STRATEGY_VERSION = "teacher_strategy_v1.2_phase5_fullreport_20260510"
+VERSION = "2.7.1-teacher-phase5-safe-series-diagnostics"
+STRATEGY_VERSION = "teacher_strategy_v1.3_phase5_safe_series_20260511"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -1970,6 +1970,83 @@ class DBRepository:
         return pd.DataFrame(out)
 
 
+def _safe_series(df, column: str, default=math.nan, numeric: bool = True):
+    """Phase5 FIX：保證任何欄位都回傳與 df.index 對齊的 pandas Series。
+    目的：避免缺欄、重複欄名、單一 scalar 被 pd.to_numeric 後變成 numpy.float64，
+    導致 .abs() / .fillna() / .notna() 失敗。
+    """
+    if pd is None:
+        return None
+    idx = getattr(df, "index", None)
+    if idx is None:
+        idx = pd.RangeIndex(0)
+    if df is None or column is None:
+        s = pd.Series(default, index=idx)
+    elif hasattr(df, "columns") and column in df.columns:
+        value = df[column]
+        # 若merge後出現重複欄名，df[column] 會是 DataFrame；取第一欄作為主欄位。
+        if isinstance(value, pd.DataFrame):
+            value = value.iloc[:, 0]
+        if isinstance(value, pd.Series):
+            s = value.reindex(idx)
+        else:
+            s = pd.Series(value, index=idx)
+    else:
+        s = pd.Series(default, index=idx)
+    if numeric:
+        s = pd.to_numeric(s, errors="coerce")
+    return s
+
+def _safe_bool_series(df, column: str, default: bool = False):
+    s = _safe_series(df, column, default=default, numeric=False)
+    if s is None:
+        return s
+    return s.fillna(default).astype(bool)
+
+def _safe_str_series(df, column: str, default: str = ""):
+    s = _safe_series(df, column, default=default, numeric=False)
+    if s is None:
+        return s
+    return s.fillna(default).astype(str)
+
+class StageTrace:
+    """InstitutionalReportEngine 階段追蹤，用於精準定位是哪個 Engine / 欄位失敗。"""
+    def __init__(self, logger: Optional[Macro16Logger], stage: str, df_getter=None):
+        self.logger = logger
+        self.stage = stage
+        self.df_getter = df_getter
+
+    def __enter__(self):
+        if self.logger:
+            self.logger.strategy_trace("STAGE_START", {"stage": self.stage})
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.logger:
+            return False
+        if exc_type is None:
+            payload = {"stage": self.stage, "status": "OK"}
+            try:
+                df = self.df_getter() if callable(self.df_getter) else None
+                if df is not None:
+                    payload["rows"] = int(len(df))
+                    payload["columns"] = list(map(str, list(df.columns)[:80]))
+            except Exception:
+                pass
+            self.logger.strategy_trace("STAGE_OK", payload)
+            return False
+        payload = {"stage": self.stage, "status": "FAIL", "error_type": exc_type.__name__, "error": str(exc)}
+        try:
+            df = self.df_getter() if callable(self.df_getter) else None
+            if df is not None:
+                payload["rows"] = int(len(df))
+                payload["columns"] = list(map(str, list(df.columns)[:120]))
+        except Exception as meta_exc:
+            payload["meta_error"] = str(meta_exc)
+        self.logger.strategy_trace("STAGE_FAIL", payload)
+        return False
+
+
 class MarketRegimeEngine:
     """顧奎國老師策略P0：大盤多空總閘與乖離風控。
     原Macro16只用5MA/高低點/量能，本層補上「短線拉回 vs 波段修正」語義。
@@ -1980,20 +2057,22 @@ class MarketRegimeEngine:
     def apply(self, df):
         if df is None or df.empty:
             return df
-        close = pd.to_numeric(df.get("close"), errors="coerce")
-        ma60 = pd.to_numeric(df.get("ma60_final", df.get("ma60_calc")), errors="coerce")
-        macd = pd.to_numeric(df.get("macd_hist"), errors="coerce")
-        macd_prev = pd.to_numeric(df.get("macd_hist_prev"), errors="coerce")
-        k = pd.to_numeric(df.get("kd_k"), errors="coerce")
-        d = pd.to_numeric(df.get("kd_d"), errors="coerce")
-        k_prev = pd.to_numeric(df.get("kd_k_prev"), errors="coerce")
-        d_prev = pd.to_numeric(df.get("kd_d_prev"), errors="coerce")
-        df["deviation_from_ma60"] = ((close - ma60) / ma60.replace(0, math.nan) * 100).replace([math.inf, -math.inf], math.nan)
+        close = _safe_series(df, "close")
+        ma60 = _safe_series(df, "ma60_final")
+        ma60 = ma60.fillna(_safe_series(df, "ma60_calc"))
+        macd = _safe_series(df, "macd_hist")
+        macd_prev = _safe_series(df, "macd_hist_prev")
+        k = _safe_series(df, "kd_k")
+        d = _safe_series(df, "kd_d")
+        k_prev = _safe_series(df, "kd_k_prev")
+        d_prev = _safe_series(df, "kd_d_prev")
+        denom = ma60.replace(0, math.nan)
+        df["deviation_from_ma60"] = ((close - ma60) / denom * 100).replace([math.inf, -math.inf], math.nan)
         df["deviation_risk_flag"] = df["deviation_from_ma60"].abs().fillna(0) >= 20
         df["macd_turn_negative"] = (macd < 0) & (macd_prev >= 0)
         df["macd_near_zero"] = macd.abs().fillna(999) <= 0.20
         df["kd_dead_cross_below_80"] = (k < d) & (k_prev >= d_prev) & (k < 80)
-        df["wave_correction_flag"] = df["macd_turn_negative"] & df["kd_dead_cross_below_80"]
+        df["wave_correction_flag"] = df["macd_turn_negative"].fillna(False) & df["kd_dead_cross_below_80"].fillna(False)
         df["market_pullback_type"] = "短線拉回"
         df.loc[df["wave_correction_flag"], "market_pullback_type"] = "波段修正"
         df.loc[df["deviation_risk_flag"] & ~df["wave_correction_flag"], "market_pullback_type"] = "乖離過大/禁追高"
@@ -2015,11 +2094,11 @@ class SakataRiskPatternEngine:
     def apply(self, df):
         if df is None or df.empty:
             return df
-        o = pd.to_numeric(df.get("last_open"), errors="coerce")
-        h = pd.to_numeric(df.get("last_high"), errors="coerce")
-        l = pd.to_numeric(df.get("last_low"), errors="coerce")
-        c = pd.to_numeric(df.get("close"), errors="coerce")
-        prev_c = pd.to_numeric(df.get("prev_close"), errors="coerce")
+        o = _safe_series(df, "last_open")
+        h = _safe_series(df, "last_high")
+        l = _safe_series(df, "last_low")
+        c = _safe_series(df, "close")
+        prev_c = _safe_series(df, "prev_close")
         body = (c - o).abs()
         rng = (h - l).replace(0, math.nan)
         upper = h - pd.concat([o, c], axis=1).max(axis=1)
@@ -2037,8 +2116,8 @@ class SakataRiskPatternEngine:
             if bool(df.at[i, "long_black_flag"]): labels.append("長黑K")
             warn.append("/".join(labels) if labels else "")
         df["k_warning_type"] = warn
-        df["two_day_break_high"] = pd.to_numeric(df.get("last_high"), errors="coerce") > pd.to_numeric(df.get("high20_prev"), errors="coerce")
-        df["kline_score"] = pd.to_numeric(df.get("kline_score", pd.Series(50, index=df.index)), errors="coerce").fillna(50)
+        df["two_day_break_high"] = _safe_series(df, "last_high") > _safe_series(df, "high20_prev")
+        df["kline_score"] = _safe_series(df, "kline_score", default=50).fillna(50)
         df.loc[df["k_warning_type"].ne(""), "kline_score"] = (df["kline_score"] - 25).clip(0, 100)
         if self.logger:
             self.logger.strategy_trace("SAKATA_PATTERN_SUMMARY", {
@@ -2103,29 +2182,24 @@ class AvoidSwapEngine:
     def apply(self, df):
         if df is None or df.empty:
             return df
-        close = pd.to_numeric(df.get("close"), errors="coerce")
-        ma20 = pd.to_numeric(df.get("ma20_final"), errors="coerce")
-        ma60 = pd.to_numeric(df.get("ma60_final"), errors="coerce")
-        high20 = pd.to_numeric(df.get("high20_prev"), errors="coerce")
-        high60 = pd.to_numeric(df.get("high60_prev"), errors="coerce")
-        prev_high = pd.to_numeric(df.get("prev_high_price"), errors="coerce")
-        prev2_high = pd.to_numeric(df.get("prev2_high_price"), errors="coerce")
-        k_warning = df.get("k_warning_type", pd.Series("", index=df.index)).astype(str)
-        low_base_reversal = df.get("low_base_reversal_flag", pd.Series(False, index=df.index)).fillna(False)
-        wave_correction = df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False)
-        deviation_risk = df.get("deviation_risk_flag", pd.Series(False, index=df.index)).fillna(False)
+        close = _safe_series(df, "close")
+        ma20 = _safe_series(df, "ma20_final")
+        ma60 = _safe_series(df, "ma60_final")
+        high20 = _safe_series(df, "high20_prev")
+        high60 = _safe_series(df, "high60_prev")
+        prev_high = _safe_series(df, "prev_high_price")
+        prev2_high = _safe_series(df, "prev2_high_price")
+        k_warning = _safe_str_series(df, "k_warning_type")
+        low_base_reversal = _safe_bool_series(df, "low_base_reversal_flag")
+        wave_correction = _safe_bool_series(df, "wave_correction_flag")
+        deviation_risk = _safe_bool_series(df, "deviation_risk_flag")
         df["two_high_not_passed_flag"] = (prev_high < high60 * 0.995) & (prev2_high < high60 * 0.995) & (close < high20)
         df["downtrend_flag"] = (close < ma20) & (ma20 < ma60)
         df["neckline_pressure_flag"] = (close < high20) & (high20.notna()) & ((high20 - close) / close.replace(0, math.nan) <= 0.05)
         df["hard_k_risk_flag"] = k_warning.str.contains("長黑K|墓碑線", na=False)
-        hard_reasons = []
-        soft_reasons = []
-        release_reasons = []
-        pressure_states = []
+        hard_reasons, soft_reasons, release_reasons, pressure_states = [], [], [], []
         for i in df.index:
-            hard = []
-            soft = []
-            release = []
+            hard, soft, release = [], [], []
             if bool(df.at[i, "downtrend_flag"]): hard.append("下降軌道")
             if bool(wave_correction.loc[i]): hard.append("MACD+KD波段修正")
             if bool(df.at[i, "hard_k_risk_flag"]): hard.append("硬K線風險")
@@ -2145,13 +2219,14 @@ class AvoidSwapEngine:
         df["soft_avoid_flag"] = df["soft_avoid_reason"].astype(str).ne("")
         df["avoid_flag"] = df["hard_avoid_flag"] | (df["soft_avoid_flag"] & ~low_base_reversal)
         df["swap_reason"] = ""
-        for _, r in df.iterrows():
+        for idx, r in df.iterrows():
             parts = []
             if str(r.get("hard_avoid_reason", "") or ""): parts.append(str(r.get("hard_avoid_reason")))
-            if str(r.get("soft_avoid_reason", "") or "") and not bool(r.get("low_base_reversal_flag", False)): parts.append(str(r.get("soft_avoid_reason")))
+            if str(r.get("soft_avoid_reason", "") or "") and not bool(r.get("low_base_reversal_flag", False)):
+                parts.append(str(r.get("soft_avoid_reason")))
             if str(r.get("soft_avoid_reason", "") or "") and bool(r.get("low_base_reversal_flag", False)) and not str(r.get("hard_avoid_reason", "") or ""):
                 parts.append("軟性壓力已由低位階翻多覆蓋")
-            df.at[r.name, "swap_reason"] = ";".join(parts)
+            df.at[idx, "swap_reason"] = ";".join(parts)
         df["avoid_level"] = "NONE"
         df.loc[df["soft_avoid_flag"], "avoid_level"] = "SOFT"
         df.loc[df["hard_avoid_flag"], "avoid_level"] = "HARD"
@@ -2183,19 +2258,19 @@ class TeacherDecisionEngine:
     def apply(self, df):
         if df is None or df.empty:
             return df
-        score = pd.to_numeric(df.get("teacher_score"), errors="coerce").fillna(0)
-        rr = pd.to_numeric(df.get("rr"), errors="coerce").fillna(0)
-        close = pd.to_numeric(df.get("close"), errors="coerce")
-        entry_high = pd.to_numeric(df.get("entry_high"), errors="coerce")
-        low_base = pd.to_numeric(df.get("low_base_score"), errors="coerce").fillna(50)
-        low_base_reversal = df.get("low_base_reversal_flag", pd.Series(False, index=df.index)).fillna(False)
-        hard_avoid = df.get("hard_avoid_flag", pd.Series(False, index=df.index)).fillna(False)
-        avoid = df.get("avoid_flag", pd.Series(False, index=df.index)).fillna(False)
-        soft_released = df.get("avoid_level", pd.Series("NONE", index=df.index)).astype(str).eq("SOFT_RELEASED")
-        k_warning = df.get("k_warning_type", pd.Series("", index=df.index)).astype(str)
-        wave = df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False)
-        deviation = df.get("deviation_risk_flag", pd.Series(False, index=df.index)).fillna(False)
-        core_state = df.get("core_leader_state", pd.Series("NE", index=df.index)).astype(str)
+        score = _safe_series(df, "teacher_score", default=0).fillna(0)
+        rr = _safe_series(df, "rr", default=0).fillna(0)
+        close = _safe_series(df, "close")
+        entry_high = _safe_series(df, "entry_high")
+        low_base = _safe_series(df, "low_base_score", default=50).fillna(50)
+        low_base_reversal = _safe_bool_series(df, "low_base_reversal_flag")
+        hard_avoid = _safe_bool_series(df, "hard_avoid_flag")
+        avoid = _safe_bool_series(df, "avoid_flag")
+        soft_released = _safe_str_series(df, "avoid_level", default="NONE").eq("SOFT_RELEASED")
+        k_warning = _safe_str_series(df, "k_warning_type")
+        wave = _safe_bool_series(df, "wave_correction_flag")
+        deviation = _safe_bool_series(df, "deviation_risk_flag")
+        core_state = _safe_str_series(df, "core_leader_state", default="NE")
         core_ok = ~core_state.eq("核心轉弱")
         df["teacher_decision"] = "WATCH"
         df.loc[hard_avoid | core_state.eq("核心轉弱"), "teacher_decision"] = "AVOID"
@@ -2335,8 +2410,15 @@ class FeatureBuilder:
         return df
 
 def normalize_series(series, low=None, high=None):
+    """安全正規化：支援 None、scalar、Series，避免 scalar 造成後續運算失敗。"""
+    if pd is None:
+        return series
     if series is None:
         return pd.Series(dtype=float)
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+    if not isinstance(series, pd.Series):
+        series = pd.Series([series])
     s = pd.to_numeric(series, errors="coerce")
     if s.dropna().empty:
         return pd.Series(50, index=s.index)
@@ -2397,17 +2479,17 @@ class LowBaseReversalEngine:
     def apply(self, df):
         if df is None or df.empty:
             return df
-        close = pd.to_numeric(df.get("close"), errors="coerce")
-        ma20 = pd.to_numeric(df.get("ma20_final"), errors="coerce")
-        ma60 = pd.to_numeric(df.get("ma60_final"), errors="coerce")
-        low_base = pd.to_numeric(df.get("low_base_score"), errors="coerce").fillna(50)
-        ma_support = pd.to_numeric(df.get("ma_support_score"), errors="coerce").fillna(50)
-        volume_health = pd.to_numeric(df.get("volume_health_score"), errors="coerce").fillna(50)
-        revenue_eps = pd.to_numeric(df.get("revenue_eps_score"), errors="coerce").fillna(50)
-        k_warning = df.get("k_warning_type", pd.Series("", index=df.index)).astype(str)
-        core_state = df.get("core_leader_state", pd.Series("NE", index=df.index)).astype(str)
-        wave_correction = df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False)
-        deviation_risk = df.get("deviation_risk_flag", pd.Series(False, index=df.index)).fillna(False)
+        close = _safe_series(df, "close")
+        ma20 = _safe_series(df, "ma20_final")
+        ma60 = _safe_series(df, "ma60_final")
+        low_base = _safe_series(df, "low_base_score", default=50).fillna(50)
+        ma_support = _safe_series(df, "ma_support_score", default=50).fillna(50)
+        volume_health = _safe_series(df, "volume_health_score", default=50).fillna(50)
+        revenue_eps = _safe_series(df, "revenue_eps_score", default=50).fillna(50)
+        k_warning = _safe_str_series(df, "k_warning_type")
+        core_state = _safe_str_series(df, "core_leader_state", default="NE")
+        wave_correction = _safe_bool_series(df, "wave_correction_flag")
+        deviation_risk = _safe_bool_series(df, "deviation_risk_flag")
         hard_k_warning = k_warning.str.contains("長黑K|墓碑線", na=False)
         pullback_hold_ma20 = close.notna() & ma20.notna() & (close >= ma20 * 0.97)
         mid_trend_not_broken = close.notna() & ma60.notna() & (close >= ma60 * 0.92)
@@ -2426,16 +2508,11 @@ class LowBaseReversalEngine:
             low_base * 0.35 + ma_support * 0.25 + volume_health * 0.15 + revenue_eps * 0.15
             + (~deviation_risk).astype(int) * 10
         ).clip(0, 100)
-        stage = []
-        reason = []
-        release_reason = []
+        stage, reason, release_reason = [], [], []
         for _, r in df.iterrows():
             parts = []
             if bool(r.get("low_base_reversal_flag", False)):
-                parts.append("低位階分>=58")
-                parts.append("回測MA20不破")
-                parts.append("中期線未破壞")
-                parts.append("量能健康")
+                parts.extend(["低位階分>=58", "回測MA20不破", "中期線未破壞", "量能健康"])
                 if _safe_float(r.get("revenue_eps_score"), 0) >= 55:
                     parts.append("營收/EPS支持")
                 stage.append("第二浪末端/低位階翻多")
@@ -2446,7 +2523,8 @@ class LowBaseReversalEngine:
                 if _safe_float(r.get("low_base_score"), 0) < 58: miss.append("位階不足")
                 if _safe_float(r.get("ma_support_score"), 0) < 55: miss.append("均線支撐不足")
                 if bool(r.get("wave_correction_flag", False)): miss.append("波段修正")
-                if str(r.get("k_warning_type", "")) in ("長黑K", "墓碑線") or any(x in str(r.get("k_warning_type", "")) for x in ["長黑K", "墓碑線"]): miss.append("硬K線風險")
+                warning_text = str(r.get("k_warning_type", ""))
+                if any(x in warning_text for x in ["長黑K", "墓碑線"]): miss.append("硬K線風險")
                 stage.append("未確認")
                 reason.append(";".join(miss) if miss else "條件未完全確認")
                 release_reason.append("")
@@ -2463,24 +2541,16 @@ class LowBaseReversalEngine:
 
 class TradePlanEngine:
     def build(self, df):
-        close = pd.to_numeric(df["close"], errors="coerce")
-        ma20 = pd.to_numeric(df["ma20_final"], errors="coerce")
-        ma60 = pd.to_numeric(df["ma60_final"], errors="coerce")
-        atr = pd.to_numeric(df.get("atr"), errors="coerce")
-        df["entry_low"] = np.maximum(ma20 * 0.98, close * 0.935) if np is not None else close * 0.935
-        df["entry_high"] = np.minimum(ma20 * 1.01, close * 0.965) if np is not None else close * 0.965
+        close = _safe_series(df, "close")
+        ma20 = _safe_series(df, "ma20_final")
+        ma60 = _safe_series(df, "ma60_final")
+        atr = _safe_series(df, "atr")
+        df["entry_low"] = pd.Series(np.maximum(ma20 * 0.98, close * 0.935), index=df.index) if np is not None else close * 0.935
+        df["entry_high"] = pd.Series(np.minimum(ma20 * 1.01, close * 0.965), index=df.index) if np is not None else close * 0.965
         fallback = df["entry_low"].isna() | df["entry_high"].isna() | (close < df["entry_low"])
         df.loc[fallback, "entry_low"] = close * 0.995
         df.loc[fallback, "entry_high"] = close * 1.010
-
-        # P0 FIX v2.5.4：低接區上下限防呆。
-        # 原公式在少數股票的 MA20 與現價距離過大時，可能出現 entry_low > entry_high。
-        # 這不是 Excel 顯示問題，而是交易計畫資料本身的區間邏輯錯誤；因此必須在 TradePlanEngine 層修正。
-        reverse_mask = (
-            df["entry_low"].notna()
-            & df["entry_high"].notna()
-            & (df["entry_low"] > df["entry_high"])
-        )
+        reverse_mask = df["entry_low"].notna() & df["entry_high"].notna() & (df["entry_low"] > df["entry_high"])
         if reverse_mask.any():
             tmp_entry_low = df.loc[reverse_mask, "entry_low"].copy()
             df.loc[reverse_mask, "entry_low"] = df.loc[reverse_mask, "entry_high"]
@@ -2488,42 +2558,39 @@ class TradePlanEngine:
             if "entry_zone_fix_flag" not in df.columns:
                 df["entry_zone_fix_flag"] = ""
             df.loc[reverse_mask, "entry_zone_fix_flag"] = "低接區上下限反向已自動修正"
-
         if not (df.loc[df["entry_low"].notna() & df["entry_high"].notna(), "entry_low"] <= df.loc[df["entry_low"].notna() & df["entry_high"].notna(), "entry_high"]).all():
             raise ValueError("P0_FAIL: TradePlanEngine entry_low/entry_high 區間仍存在反向")
-
-        df["stop_loss"] = np.minimum(ma60 * 0.97, df["entry_low"] * 0.94) if np is not None else df["entry_low"] * 0.94
+        df["stop_loss"] = pd.Series(np.minimum(ma60 * 0.97, df["entry_low"] * 0.94), index=df.index) if np is not None else df["entry_low"] * 0.94
         df["stop_loss"] = df["stop_loss"].fillna(df["entry_low"] * 0.94)
-        df["target_1"] = np.where(atr.notna(), close + atr * 1.382, close * 1.05) if np is not None else close * 1.05
-        df["target_2"] = np.where(atr.notna(), close + atr * 1.618, close * 1.125) if np is not None else close * 1.125
-        df["rr"] = ((df["target_1"] - df["entry_high"]) / (df["entry_high"] - df["stop_loss"].replace(0, math.nan))).replace([math.inf, -math.inf], math.nan)
+        df["target_1"] = pd.Series(np.where(atr.notna(), close + atr * 1.382, close * 1.05), index=df.index) if np is not None else close * 1.05
+        df["target_2"] = pd.Series(np.where(atr.notna(), close + atr * 1.618, close * 1.125), index=df.index) if np is not None else close * 1.125
+        risk_denom = (df["entry_high"] - df["stop_loss"]).replace(0, math.nan)
+        df["rr"] = ((df["target_1"] - df["entry_high"]) / risk_denom).replace([math.inf, -math.inf], math.nan)
         df["exclude_reason"] = ""
         if "entry_zone_fix_flag" in df.columns:
-            df.loc[df["entry_zone_fix_flag"].astype(str).ne(""), "exclude_reason"] += "低接區上下限反向已自動修正;"
-        df.loc[pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0) < 500, "exclude_reason"] += "成交量不足;"
+            df.loc[_safe_str_series(df, "entry_zone_fix_flag").ne(""), "exclude_reason"] += "低接區上下限反向已自動修正;"
+        df.loc[_safe_series(df, "volume", default=0).fillna(0) < 500, "exclude_reason"] += "成交量不足;"
         df.loc[df["rr"].fillna(0) < 1.2, "exclude_reason"] += "RR不足;"
-        df.loc[pd.to_numeric(df.get("rsi", 50), errors="coerce").fillna(50) > 78, "exclude_reason"] += "RSI過熱;"
+        df.loc[_safe_series(df, "rsi", default=50).fillna(50) > 78, "exclude_reason"] += "RSI過熱;"
         if "hard_avoid_reason" in df.columns:
-            df.loc[df["hard_avoid_reason"].astype(str).ne(""), "exclude_reason"] += df.loc[df["hard_avoid_reason"].astype(str).ne(""), "hard_avoid_reason"].astype(str) + ";"
+            mask = _safe_str_series(df, "hard_avoid_reason").ne("")
+            df.loc[mask, "exclude_reason"] += _safe_str_series(df, "hard_avoid_reason")[mask] + ";"
         elif "swap_reason" in df.columns:
-            df.loc[df["swap_reason"].astype(str).ne(""), "exclude_reason"] += df.loc[df["swap_reason"].astype(str).ne(""), "swap_reason"].astype(str) + ";"
+            mask = _safe_str_series(df, "swap_reason").ne("")
+            df.loc[mask, "exclude_reason"] += _safe_str_series(df, "swap_reason")[mask] + ";"
         if "wave_correction_flag" in df.columns:
-            df.loc[df["wave_correction_flag"].fillna(False), "exclude_reason"] += "MACD+KD波段修正;"
+            df.loc[_safe_bool_series(df, "wave_correction_flag"), "exclude_reason"] += "MACD+KD波段修正;"
         df["exclude_flag"] = df["exclude_reason"].ne("")
         df["是否可下單"] = "NO"
-        yes = (df["teacher_score"] >= 55) & (df["rr"] >= 1.5) & (~df["exclude_flag"]) & (close <= df["entry_high"] * 1.03)
-        wait = (df["teacher_score"] >= 55) & (df["rr"] >= 1.5) & (~df["exclude_flag"]) & (~yes)
+        yes = (_safe_series(df, "teacher_score", default=0) >= 55) & (df["rr"].fillna(0) >= 1.5) & (~df["exclude_flag"]) & (close <= df["entry_high"] * 1.03)
+        wait = (_safe_series(df, "teacher_score", default=0) >= 55) & (df["rr"].fillna(0) >= 1.5) & (~df["exclude_flag"]) & (~yes)
         df.loc[yes, "是否可下單"] = "YES"
         df.loc[wait, "是否可下單"] = "WAIT"
         df["操作策略"] = df["是否可下單"].map({"YES":"低接區內可分批", "WAIT":"等待回到低接區或RR改善", "NO":"不符合下單條件"}).fillna("觀察")
-        if "k_warning_type" in df.columns:
-            df.loc[df["k_warning_type"].astype(str).ne(""), "操作策略"] = "K線警訊，壓力先賣/等待2日確認"
-        if "wave_correction_flag" in df.columns:
-            df.loc[df["wave_correction_flag"].fillna(False), "操作策略"] = "波段修正確認，停止追高並降檔"
-        if "avoid_flag" in df.columns:
-            df.loc[df["avoid_flag"].fillna(False), "操作策略"] = "硬性風險或未釋放壓力，反彈換股"
-        if "avoid_level" in df.columns:
-            df.loc[df["avoid_level"].astype(str).eq("SOFT_RELEASED"), "操作策略"] = "低位階翻多覆蓋軟性壓力，可列LOW_BUY觀察"
+        df.loc[_safe_str_series(df, "k_warning_type").ne(""), "操作策略"] = "K線警訊，壓力先賣/等待2日確認"
+        df.loc[_safe_bool_series(df, "wave_correction_flag"), "操作策略"] = "波段修正確認，停止追高並降檔"
+        df.loc[_safe_bool_series(df, "avoid_flag"), "操作策略"] = "硬性風險或未釋放壓力，反彈換股"
+        df.loc[_safe_str_series(df, "avoid_level").eq("SOFT_RELEASED"), "操作策略"] = "低位階翻多覆蓋軟性壓力，可列LOW_BUY觀察"
         return df
 
 class InstitutionalReportEngine:
@@ -2535,28 +2602,50 @@ class InstitutionalReportEngine:
         if pd is None:
             self.logger.warning("pandas未安裝，無法產出機構級股票投資規劃報表")
             return None
-        trade_date = self.repo.get_trade_date()
-        df = self.repo.load_base_universe(trade_date)
-        df = FeatureBuilder().build(df)
-        df = MarketRegimeEngine(self.logger).apply(df)
-        df = SakataRiskPatternEngine(self.logger).apply(df)
-        df = CoreLeaderEngine(self.logger).apply(df)
-        df = DualModelScoringEngine().score(df)
-        df = ReportClassifier().classify(df)
-        df = LowBaseReversalEngine(self.logger).apply(df)
-        df = AvoidSwapEngine(self.logger).apply(df)
-        df = TradePlanEngine().build(df)
-        df = TeacherDecisionEngine(self.logger).apply(df)
-        df["report_name"] = df.get("stock_name", df.get("stock_name_master", df.get("name", "")))
-        result = {
-            "trade_date": trade_date,
-            "db_path": self.repo.db_path,
-            "counts": {t: self.repo.table_count(t) for t in ["ranking_result", "market_snapshot", "price_history", "external_revenue", "external_valuation", "external_institutional", "external_margin", "trade_plan"]},
-            "latest_dates": {t: self.repo.latest_date(t) for t in ["ranking_result", "market_snapshot", "price_history", "external_revenue", "external_valuation", "external_institutional", "external_margin", "trade_plan"]},
-            "all": df
-        }
-        self.logger.info(f"INSTITUTIONAL_REPORT_READY date={trade_date} rows={len(df)}")
-        return result
+        df = None
+        trade_date = ""
+        try:
+            with StageTrace(self.logger, "get_trade_date"):
+                trade_date = self.repo.get_trade_date()
+            with StageTrace(self.logger, "load_base_universe", lambda: df):
+                df = self.repo.load_base_universe(trade_date)
+            stages = [
+                ("FeatureBuilder", lambda x: FeatureBuilder().build(x)),
+                ("MarketRegimeEngine", lambda x: MarketRegimeEngine(self.logger).apply(x)),
+                ("SakataRiskPatternEngine", lambda x: SakataRiskPatternEngine(self.logger).apply(x)),
+                ("CoreLeaderEngine", lambda x: CoreLeaderEngine(self.logger).apply(x)),
+                ("DualModelScoringEngine", lambda x: DualModelScoringEngine().score(x)),
+                ("ReportClassifier", lambda x: ReportClassifier().classify(x)),
+                ("LowBaseReversalEngine", lambda x: LowBaseReversalEngine(self.logger).apply(x)),
+                ("AvoidSwapEngine", lambda x: AvoidSwapEngine(self.logger).apply(x)),
+                ("TradePlanEngine", lambda x: TradePlanEngine().build(x)),
+                ("TeacherDecisionEngine", lambda x: TeacherDecisionEngine(self.logger).apply(x)),
+            ]
+            for stage_name, fn in stages:
+                with StageTrace(self.logger, stage_name, lambda df=df: df):
+                    df = fn(df)
+            with StageTrace(self.logger, "finalize_report_name", lambda: df):
+                df["report_name"] = df.get("stock_name", df.get("stock_name_master", df.get("name", "")))
+            result = {
+                "trade_date": trade_date,
+                "db_path": self.repo.db_path,
+                "counts": {t: self.repo.table_count(t) for t in ["ranking_result", "market_snapshot", "price_history", "external_revenue", "external_valuation", "external_institutional", "external_margin", "trade_plan"]},
+                "latest_dates": {t: self.repo.latest_date(t) for t in ["ranking_result", "market_snapshot", "price_history", "external_revenue", "external_valuation", "external_institutional", "external_margin", "trade_plan"]},
+                "all": df
+            }
+            self.logger.info(f"INSTITUTIONAL_REPORT_READY date={trade_date} rows={len(df)}")
+            return result
+        except Exception as exc:
+            payload = {"db_path": self.repo.db_path, "trade_date": trade_date, "error": str(exc), "error_type": type(exc).__name__}
+            if df is not None:
+                try:
+                    payload["rows"] = int(len(df))
+                    payload["columns"] = list(map(str, list(df.columns)[:160]))
+                    payload["dtypes"] = {str(k): str(v) for k, v in df.dtypes.astype(str).head(80).items()}
+                except Exception as meta_exc:
+                    payload["meta_error"] = str(meta_exc)
+            self.logger.strategy_trace("TEACHER_REPORT_FAIL_DETAIL", payload)
+            raise
 
 class ReportValidator:
     def validate_workbook(self, wb) -> List[str]:
@@ -2612,6 +2701,18 @@ class TeacherFullReportBuilder:
 class InstitutionalExcelWriter:
     def __init__(self, logger: Macro16Logger):
         self.logger = logger
+
+
+    def _write_teacher_failure_diagnostic(self, wb, error_info: Optional[Dict[str, Any]], expected_sheets: Optional[List[str]] = None):
+        ws = self._sheet(wb, "99_老師策略失敗診斷")
+        ws.append(["項目", "內容"])
+        ws.append(["狀態", "老師策略報表未產出，已進入失敗診斷頁"])
+        ws.append(["錯誤摘要", json.dumps(error_info or {}, ensure_ascii=False, default=str)[:3000]])
+        ws.append(["必須存在Sheet", ",".join(expected_sheets or EXPECTED_INSTITUTIONAL_SHEETS)])
+        ws.append(["修正方向", "先修 safe_series / Engine Stage Trace / 欄位型別，再重跑 InstitutionalReportEngine"])
+        ws.append([])
+        ws.append(["驗收規則", "成功時Log必須出現 TEACHER_REPORT_READY；失敗時必須出現 TEACHER_REPORT_FAIL_DETAIL，且本Sheet不得空白。"])
+        self.logger.warning("TEACHER_REPORT_VALIDATE_FAIL diagnostic_sheet=99_老師策略失敗診斷")
 
     def _sheet(self, wb, name):
         if name in wb.sheetnames:
@@ -2799,7 +2900,7 @@ class ExcelWriter:
         self.warn_fill = PatternFill("solid", fgColor="FFF2CC")
         self.thin = Side(style="thin", color="D9E2F3")
 
-    def write(self, template: Optional[str], out_path: str, market: MarketInput, scores: List[ModuleScore], tech: TechnicalRisk, summary: Dict[str, str], logs: List[str], raw: Optional[Dict[str, RawData]] = None, institutional_report: Optional[Dict[str, Any]] = None, gov_result: Optional[Dict[str, Any]] = None, market5_result: Optional[Dict[str, Any]] = None, report_mode: str = REPORT_MODE_MACRO) -> str:
+    def write(self, template: Optional[str], out_path: str, market: MarketInput, scores: List[ModuleScore], tech: TechnicalRisk, summary: Dict[str, str], logs: List[str], raw: Optional[Dict[str, RawData]] = None, institutional_report: Optional[Dict[str, Any]] = None, gov_result: Optional[Dict[str, Any]] = None, market5_result: Optional[Dict[str, Any]] = None, report_mode: str = REPORT_MODE_MACRO, institutional_error: Optional[Dict[str, Any]] = None) -> str:
         if template and Path(template).exists():
             try:
                 wb = load_workbook(template)
@@ -2825,6 +2926,7 @@ class ExcelWriter:
                 self.logger.info("MACRO_REFILL_TEACHER_OUTPUT_RESTORED sheets=00_16_teacher_strategy_reports")
             else:
                 self.logger.warning("MACRO_REFILL_TOP_OUTPUT_SKIPPED reason=未提供DB或InstitutionalReportEngine失敗，無法產出TOP報表")
+                self._write_teacher_failure_diagnostic(wb, institutional_error)
         elif report_mode == REPORT_MODE_MACRO_ONLY:
             # 單純驗證宏觀回填時才只保留三頁。
             validator.enforce_macro_only_sheets(wb)
@@ -2840,6 +2942,7 @@ class ExcelWriter:
             else:
                 ws = wb.create_sheet("00_執行摘要")
                 ws.append(["項目", "內容"]); ws.append(["狀態", "未提供DB，無法產出institutional_report"])
+                self._write_teacher_failure_diagnostic(wb, institutional_error)
         else:
             if institutional_report is not None:
                 InstitutionalExcelWriter(self.logger).write_into_workbook(wb, institutional_report, gov_result=gov_result, market5_result=market5_result)
@@ -3119,11 +3222,14 @@ class Macro16Engine:
         if tpex_otc_raw.status == "OK" and isinstance(tpex_otc_raw.value, dict) and "close" in tpex_otc_raw.value:
             raw["OTC"] = tpex_otc_raw
         institutional_report = None
+        institutional_report_error = None
         if db_path:
             try:
                 institutional_report = InstitutionalReportEngine(db_path, self.logger).run()
             except Exception as exc:
+                institutional_report_error = {"db_path": db_path, "error": str(exc), "error_type": type(exc).__name__}
                 self.logger.warning(f"INSTITUTIONAL_REPORT_FAIL db_path={db_path} error={exc}")
+                self.logger.strategy_trace("TEACHER_REPORT_FAIL_DETAIL", institutional_report_error)
         if override and override.event_note:
             raw["戰爭/地緣"] = self.source.build_manual_raw("戰爭/地緣", {"event_note": override.event_note, "major_event": 1}, override.event_note)
         if override and override.night_score is not None:
@@ -3145,7 +3251,7 @@ class Macro16Engine:
         warnings = (locals().get("completion_issues", []) or []) + warnings
         if warnings:
             summary["QA警告"] = "; ".join(warnings[:8])
-        output = self.writer.write(template, out_path, market, scores, tech, summary, self.logger.messages, raw, institutional_report=institutional_report, gov_result=locals().get("gov_result"), market5_result=locals().get("market5_result"), report_mode=report_mode)
+        output = self.writer.write(template, out_path, market, scores, tech, summary, self.logger.messages, raw, institutional_report=institutional_report, gov_result=locals().get("gov_result"), market5_result=locals().get("market5_result"), report_mode=report_mode, institutional_error=institutional_report_error)
         evidence_word = ""
         if report_mode == REPORT_MODE_ALL:
             evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
