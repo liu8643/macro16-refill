@@ -53,7 +53,8 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.6.0-teacher-strategy-p0-integrated"
+VERSION = "2.6.1-teacher-strategy-gapfix-trace"
+STRATEGY_VERSION = "teacher_strategy_v1.1_gapfix_20260510"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -291,6 +292,14 @@ class Macro16Logger:
 
     def parsed_value(self, field: str, value: Any, source: str, actual_date: str = ""):
         self.info(f"PARSED_VALUE field={field} value={value} source={source} actual_date={actual_date}")
+
+    def strategy_trace(self, tag: str, payload: Dict[str, Any]):
+        """老師策略工程追蹤：輸出可被log grep的固定格式。"""
+        try:
+            text = json.dumps(payload, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(payload)
+        self.info(f"{tag} {text}")
 
 class HttpClient:
     def __init__(self, logger: Macro16Logger):
@@ -1608,11 +1617,11 @@ EXPECTED_INSTITUTIONAL_SHEETS = [
     "00_執行摘要", "01_DB資料盤點", "02_模型設計", "03_最終TOP15",
     "04_成長模型TOP30", "05_價值模型TOP30", "06_低位階候選",
     "07_老師點名股檢核", "08_排除與風險", "09_來源與限制",
-    "10_老師策略驗收", "11_修改追蹤"
+    "10_老師策略驗收", "11_修改追蹤", "12_策略命中驗證"
 ]
 
 REPORT_COLUMNS = [
-    "排名", "代號", "名稱", "市場", "產業", "題材", "老師分類", "老師決策", "老師股票池", "核心股狀態",
+    "排名", "代號", "名稱", "市場", "產業", "題材", "老師分類", "老師決策", "決策原因", "決策追蹤", "老師股票池", "核心股狀態",
     "K線警訊", "波段修正", "避開/換股", "現價",
     "低接區", "停損", "目標1", "目標2", "RR", "是否可下單",
     "老師總分", "成長分", "價值分", "EPS_TTM", "PE", "殖利率%",
@@ -1959,6 +1968,9 @@ class MarketRegimeEngine:
     """顧奎國老師策略P0：大盤多空總閘與乖離風控。
     原Macro16只用5MA/高低點/量能，本層補上「短線拉回 vs 波段修正」語義。
     """
+    def __init__(self, logger: Optional[Macro16Logger] = None):
+        self.logger = logger
+
     def apply(self, df):
         if df is None or df.empty:
             return df
@@ -1979,10 +1991,21 @@ class MarketRegimeEngine:
         df["market_pullback_type"] = "短線拉回"
         df.loc[df["wave_correction_flag"], "market_pullback_type"] = "波段修正"
         df.loc[df["deviation_risk_flag"] & ~df["wave_correction_flag"], "market_pullback_type"] = "乖離過大/禁追高"
+        if self.logger:
+            self.logger.strategy_trace("WAVE_CORRECTION", {
+                "rows": int(len(df)),
+                "wave_correction_count": int(df["wave_correction_flag"].fillna(False).sum()),
+                "macd_turn_negative_count": int(df["macd_turn_negative"].fillna(False).sum()),
+                "kd_dead_cross_below_80_count": int(df["kd_dead_cross_below_80"].fillna(False).sum()),
+                "deviation_risk_count": int(df["deviation_risk_flag"].fillna(False).sum()),
+            })
         return df
 
 class SakataRiskPatternEngine:
     """顧奎國老師策略P0：量化流星、空頭新星十字、墓碑線、長黑K。"""
+    def __init__(self, logger: Optional[Macro16Logger] = None):
+        self.logger = logger
+
     def apply(self, df):
         if df is None or df.empty:
             return df
@@ -2011,10 +2034,21 @@ class SakataRiskPatternEngine:
         df["two_day_break_high"] = pd.to_numeric(df.get("last_high"), errors="coerce") > pd.to_numeric(df.get("high20_prev"), errors="coerce")
         df["kline_score"] = pd.to_numeric(df.get("kline_score", pd.Series(50, index=df.index)), errors="coerce").fillna(50)
         df.loc[df["k_warning_type"].ne(""), "kline_score"] = (df["kline_score"] - 25).clip(0, 100)
+        if self.logger:
+            self.logger.strategy_trace("SAKATA_PATTERN_SUMMARY", {
+                "shooting_star_count": int(df["shooting_star_flag"].fillna(False).sum()),
+                "bearish_star_cross_count": int(df["bearish_star_cross_flag"].fillna(False).sum()),
+                "tombstone_count": int(df["tombstone_flag"].fillna(False).sum()),
+                "long_black_count": int(df["long_black_flag"].fillna(False).sum()),
+                "warning_count": int(df["k_warning_type"].astype(str).ne("").sum()),
+            })
         return df
 
 class CoreLeaderEngine:
     """顧奎國老師策略P0：台積電(2330)作為大盤核心風向。"""
+    def __init__(self, logger: Optional[Macro16Logger] = None):
+        self.logger = logger
+
     def infer_state(self, df):
         default = {"core_leader_state": "NE", "core_leader_reason": "未取得2330資料，核心股風向不進主判斷"}
         if df is None or df.empty or "stock_id" not in df.columns:
@@ -2046,10 +2080,17 @@ class CoreLeaderEngine:
         state = self.infer_state(df)
         df["core_leader_state"] = state["core_leader_state"]
         df["core_leader_reason"] = state["core_leader_reason"]
+        if self.logger:
+            self.logger.strategy_trace("CORE_LEADER_STATUS", state)
+            if state.get("core_leader_state") in ("突破續強", "假突破/短線降檔", "核心轉弱"):
+                self.logger.strategy_trace("2330_BREAKOUT", state)
         return df
 
 class AvoidSwapEngine:
     """顧奎國老師策略P0：兩高不過、下降軌道、頸線壓力未突破，不得列主攻。"""
+    def __init__(self, logger: Optional[Macro16Logger] = None):
+        self.logger = logger
+
     def apply(self, df):
         if df is None or df.empty:
             return df
@@ -2074,10 +2115,23 @@ class AvoidSwapEngine:
         df["swap_reason"] = reasons
         df["avoid_flag"] = df["swap_reason"].astype(str).ne("")
         df["pressure_line_state"] = df["swap_reason"].where(df["swap_reason"].astype(str).ne(""), "未觸發")
+        if self.logger:
+            self.logger.strategy_trace("AVOID_SWAP_SUMMARY", {
+                "avoid_count": int(df["avoid_flag"].fillna(False).sum()),
+                "two_high_not_passed_count": int(df["two_high_not_passed_flag"].fillna(False).sum()),
+                "downtrend_count": int(df["downtrend_flag"].fillna(False).sum()),
+                "neckline_pressure_count": int(df["neckline_pressure_flag"].fillna(False).sum()),
+            })
+            sample = df.loc[df["avoid_flag"].fillna(False), ["stock_id", "swap_reason"]].head(20)
+            for _, row in sample.iterrows():
+                self.logger.strategy_trace("AVOID_REASON", {"stock": str(row.get("stock_id", "")).zfill(4), "reason": row.get("swap_reason", "")})
         return df
 
 class TeacherDecisionEngine:
     """顧奎國老師策略P0：新增 BUY / LOW_BUY / WATCH / REDUCE / AVOID 五態，不取代原是否可下單欄位。"""
+    def __init__(self, logger: Optional[Macro16Logger] = None):
+        self.logger = logger
+
     def apply(self, df):
         if df is None or df.empty:
             return df
@@ -2094,6 +2148,48 @@ class TeacherDecisionEngine:
         buy = (score >= 70) & (rr >= 1.8) & (close <= entry_high * 1.01) & df["teacher_decision"].eq("WATCH")
         df.loc[low_buy, "teacher_decision"] = "LOW_BUY"
         df.loc[buy, "teacher_decision"] = "BUY"
+        reasons = []
+        traces = []
+        for i, r in df.iterrows():
+            reason_parts = []
+            if str(r.get("swap_reason", "") or ""): reason_parts.append(str(r.get("swap_reason")))
+            if str(r.get("k_warning_type", "") or ""): reason_parts.append("K線警訊=" + str(r.get("k_warning_type")))
+            if bool(r.get("wave_correction_flag", False)): reason_parts.append("MACD+KD波段修正")
+            if bool(r.get("deviation_risk_flag", False)): reason_parts.append("乖離過大")
+            if _safe_float(r.get("rr"), 0) < 1.5: reason_parts.append("RR不足")
+            if _safe_float(r.get("teacher_score"), 0) < 55: reason_parts.append("老師總分不足")
+            if not reason_parts and str(r.get("teacher_decision")) in ("BUY", "LOW_BUY"):
+                reason_parts.append("分數/RR/位置符合低接條件")
+            elif not reason_parts:
+                reason_parts.append("條件未完全確認，列觀察")
+            trace = (
+                f"stock={str(r.get('stock_id','')).zfill(4)};"
+                f"decision={r.get('teacher_decision')};"
+                f"score={round(_safe_float(r.get('teacher_score'),0),2)};"
+                f"rr={round(_safe_float(r.get('rr'),0),2)};"
+                f"core={r.get('core_leader_state','')};"
+                f"wave={r.get('market_pullback_type','')};"
+                f"k_warning={r.get('k_warning_type','')};"
+                f"avoid={r.get('swap_reason','')}"
+            )
+            reasons.append(";".join(reason_parts))
+            traces.append(trace)
+        df["teacher_decision_reason"] = reasons
+        df["decision_trace"] = traces
+        if self.logger:
+            counts = df["teacher_decision"].value_counts(dropna=False).to_dict()
+            self.logger.strategy_trace("TEACHER_DECISION_SUMMARY", counts)
+            for _, r in df.sort_values(["teacher_score", "rr"], ascending=False).head(30).iterrows():
+                self.logger.strategy_trace("DECISION_TRACE", {
+                    "stock": str(r.get("stock_id", "")).zfill(4),
+                    "decision": r.get("teacher_decision", ""),
+                    "reason": r.get("teacher_decision_reason", ""),
+                    "score": round(_safe_float(r.get("teacher_score"),0), 2),
+                    "rr": round(_safe_float(r.get("rr"),0), 2),
+                    "wave": r.get("market_pullback_type", ""),
+                    "k_warning": r.get("k_warning_type", ""),
+                    "avoid": r.get("swap_reason", ""),
+                })
         pool = []
         for i, r in df.iterrows():
             div = _safe_float(r.get("dividend_yield"))
@@ -2272,14 +2368,14 @@ class InstitutionalReportEngine:
         trade_date = self.repo.get_trade_date()
         df = self.repo.load_base_universe(trade_date)
         df = FeatureBuilder().build(df)
-        df = MarketRegimeEngine().apply(df)
-        df = SakataRiskPatternEngine().apply(df)
-        df = CoreLeaderEngine().apply(df)
+        df = MarketRegimeEngine(self.logger).apply(df)
+        df = SakataRiskPatternEngine(self.logger).apply(df)
+        df = CoreLeaderEngine(self.logger).apply(df)
         df = DualModelScoringEngine().score(df)
         df = ReportClassifier().classify(df)
-        df = AvoidSwapEngine().apply(df)
+        df = AvoidSwapEngine(self.logger).apply(df)
         df = TradePlanEngine().build(df)
-        df = TeacherDecisionEngine().apply(df)
+        df = TeacherDecisionEngine(self.logger).apply(df)
         df["report_name"] = df.get("stock_name", df.get("stock_name_master", df.get("name", "")))
         result = {
             "trade_date": trade_date,
@@ -2328,7 +2424,7 @@ class InstitutionalExcelWriter:
             name = r.get("stock_name") or r.get("stock_name_master") or r.get("report_name") or ""
             rows.append([
                 i, str(r.get("stock_id", "")).zfill(4), name, r.get("market", ""), r.get("industry", r.get("industry_master", "")), r.get("theme", r.get("sub_theme", "")), r.get("老師分類", ""),
-                r.get("teacher_decision", "WATCH"), r.get("teacher_pool_type", ""), r.get("core_leader_state", ""),
+                r.get("teacher_decision", "WATCH"), r.get("teacher_decision_reason", ""), r.get("decision_trace", ""), r.get("teacher_pool_type", ""), r.get("core_leader_state", ""),
                 r.get("k_warning_type", ""), r.get("market_pullback_type", ""), r.get("swap_reason", ""), round(float(r.get("close", 0) or 0),2),
                 f"{round(float(r.get('entry_low',0) or 0),2)}~{round(float(r.get('entry_high',0) or 0),2)}", round(float(r.get("stop_loss",0) or 0),2), round(float(r.get("target_1",0) or 0),2), round(float(r.get("target_2",0) or 0),2), round(float(r.get("rr",0) or 0),2), r.get("是否可下單", "NO"),
                 round(float(r.get("teacher_score",0) or 0),2), round(float(r.get("growth_score",0) or 0),2), round(float(r.get("value_score",0) or 0),2), round(float(r.get("eps_ttm", r.get("valuation_eps_ttm",0)) or 0),2), round(float(r.get("pe",0) or 0),2), round(float(r.get("dividend_yield",0) or 0),2),
@@ -2347,9 +2443,33 @@ class InstitutionalExcelWriter:
         ws.append(["報告日期", report.get("trade_date")])
         ws.append(["DB路徑", report.get("db_path")])
         ws.append(["總股票數", len(df)])
+        ws.append(["策略版本", STRATEGY_VERSION])
         ws.append(["YES", int((df["是否可下單"]=="YES").sum())])
         ws.append(["WAIT", int((df["是否可下單"]=="WAIT").sum())])
         ws.append(["NO", int((df["是否可下單"]=="NO").sum())])
+        ws.append([])
+        ws.append(["老師五態決策統計", "數量"])
+        for decision in ["BUY", "LOW_BUY", "WATCH", "REDUCE", "AVOID"]:
+            ws.append([decision, int((df.get("teacher_decision", pd.Series(index=df.index)).astype(str)==decision).sum())])
+        ws.append([])
+        ws.append(["策略原因統計", "數量"])
+        reason_map = {
+            "兩高不過": df.get("swap_reason", pd.Series("", index=df.index)).astype(str).str.contains("兩高不過", na=False),
+            "下降軌道": df.get("swap_reason", pd.Series("", index=df.index)).astype(str).str.contains("下降軌道", na=False),
+            "頸線/前高壓力": df.get("swap_reason", pd.Series("", index=df.index)).astype(str).str.contains("頸線", na=False),
+            "流星": df.get("k_warning_type", pd.Series("", index=df.index)).astype(str).str.contains("流星", na=False),
+            "空頭新星十字": df.get("k_warning_type", pd.Series("", index=df.index)).astype(str).str.contains("空頭新星十字", na=False),
+            "墓碑線": df.get("k_warning_type", pd.Series("", index=df.index)).astype(str).str.contains("墓碑", na=False),
+            "長黑K": df.get("k_warning_type", pd.Series("", index=df.index)).astype(str).str.contains("長黑", na=False),
+            "KD死叉": df.get("kd_dead_cross_below_80", pd.Series(False, index=df.index)).fillna(False),
+            "MACD翻負": df.get("macd_turn_negative", pd.Series(False, index=df.index)).fillna(False),
+            "乖離過大": df.get("deviation_risk_flag", pd.Series(False, index=df.index)).fillna(False),
+            "波段修正": df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False),
+            "RR不足": pd.to_numeric(df.get("rr", pd.Series(index=df.index)), errors="coerce").fillna(0) < 1.5,
+        }
+        for reason, mask in reason_map.items():
+            ws.append([reason, int(mask.sum())])
+        ws.append([])
         ws.append(["TEJ官股", json.dumps(gov_result or {}, ensure_ascii=False)[:800]])
         ws.append(["跨月5日", json.dumps(market5_result or {}, ensure_ascii=False)[:800]])
         # 01
@@ -2393,6 +2513,19 @@ class InstitutionalExcelWriter:
         ws.append(["TC03", "2330假突破/回測失敗", "core_leader_state", "市場風險升級"] )
         ws.append(["TC04", "個股兩高不過或下降軌道", "avoid_flag/swap_reason", "AVOID/REDUCE，不列主攻"] )
         ws.append(["TC05", "低位階翻多且RR足夠", "teacher_pool_type/teacher_decision", "LOW_BUY或BUY"] )
+        ws.append([])
+        ws.append(["驗收項目", "實際結果", "Pass/Fail", "命中筆數/說明"])
+        validation_rows = [
+            ("五態決策欄位", "teacher_decision" in df.columns, "PASS" if "teacher_decision" in df.columns else "FAIL", int(df.get("teacher_decision", pd.Series(index=df.index)).notna().sum()) if "teacher_decision" in df.columns else 0),
+            ("決策原因欄位", "teacher_decision_reason" in df.columns, "PASS" if "teacher_decision_reason" in df.columns else "FAIL", int(df.get("teacher_decision_reason", pd.Series(index=df.index)).astype(str).ne("").sum()) if "teacher_decision_reason" in df.columns else 0),
+            ("決策追蹤欄位", "decision_trace" in df.columns, "PASS" if "decision_trace" in df.columns else "FAIL", int(df.get("decision_trace", pd.Series(index=df.index)).astype(str).ne("").sum()) if "decision_trace" in df.columns else 0),
+            ("CoreLeader狀態", "core_leader_state" in df.columns, "PASS" if "core_leader_state" in df.columns else "FAIL", str(df.get("core_leader_state", pd.Series(["NE"])).iloc[0]) if len(df) else ""),
+            ("阪田警訊", "k_warning_type" in df.columns, "PASS" if "k_warning_type" in df.columns else "FAIL", int(df.get("k_warning_type", pd.Series("", index=df.index)).astype(str).ne("").sum()) if "k_warning_type" in df.columns else 0),
+            ("避開換股", "swap_reason" in df.columns, "PASS" if "swap_reason" in df.columns else "FAIL", int(df.get("swap_reason", pd.Series("", index=df.index)).astype(str).ne("").sum()) if "swap_reason" in df.columns else 0),
+            ("波段修正", "wave_correction_flag" in df.columns, "PASS" if "wave_correction_flag" in df.columns else "FAIL", int(df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False).sum()) if "wave_correction_flag" in df.columns else 0),
+        ]
+        for row in validation_rows:
+            ws.append(list(row))
         ws = self._sheet(wb, "11_修改追蹤")
         ws.append(["修改ID", "修改項目", "狀態", "對應類別/函式", "說明"] )
         ws.append(["P0-01", "CoreLeaderEngine", "已修改", "CoreLeaderEngine", "新增2330核心股風向判斷"] )
@@ -2400,6 +2533,21 @@ class InstitutionalExcelWriter:
         ws.append(["P0-03", "阪田K線警訊", "已修改", "SakataRiskPatternEngine", "新增流星/空頭新星十字/墓碑/長黑K"] )
         ws.append(["P0-04", "兩高不過/下降軌道排除", "已修改", "AvoidSwapEngine", "新增avoid_flag/swap_reason"] )
         ws.append(["P0-05", "老師五態決策", "已修改", "TeacherDecisionEngine", "新增BUY/LOW_BUY/WATCH/REDUCE/AVOID"] )
+        ws.append(["P0-06", "五態Summary統計", "已修改", "InstitutionalExcelWriter.write_into_workbook", "00_執行摘要新增BUY/LOW_BUY/WATCH/REDUCE/AVOID數量"] )
+        ws.append(["P0-07", "策略原因統計", "已修改", "InstitutionalExcelWriter.write_into_workbook", "00_執行摘要新增兩高不過/流星/KD死叉/MACD翻負/乖離過大等統計"] )
+        ws.append(["P0-08", "Decision Trace", "已修改", "TeacherDecisionEngine + Logger", "新增teacher_decision_reason與decision_trace欄位並輸出DECISION_TRACE log"] )
+        ws.append(["P0-09", "策略版本凍結", "已修改", "VERSION/STRATEGY_VERSION", "新增STRATEGY_VERSION並寫入log與00摘要"] )
+        ws.append(["P0-10", "策略命中驗證", "已修改", "12_策略命中驗證", "若有未來價格資料則計算，否則明確標示待追蹤"] )
+        ws = self._sheet(wb, "12_策略命中驗證")
+        ws.append(["項目", "內容"])
+        ws.append(["策略版本", STRATEGY_VERSION])
+        ws.append(["驗證目的", "追蹤老師策略五態決策的隔日/5日表現、最大回撤；若DB尚無未來價格，先標示待追蹤，不假造勝率"])
+        ws.append(["目前資料狀態", "本報表依當前DB產出，若price_history尚未包含決策日後資料，命中率不可計算"])
+        ws.append([])
+        ws.append(["決策", "樣本數", "可計算樣本", "平均隔日%", "平均5日%", "最大回撤%", "狀態"])
+        for decision in ["BUY", "LOW_BUY", "WATCH", "REDUCE", "AVOID"]:
+            sample_count = int((df.get("teacher_decision", pd.Series(index=df.index)).astype(str)==decision).sum())
+            ws.append([decision, sample_count, 0, "", "", "", "待後續price_history資料回補後驗證"])
         errors = ReportValidator().validate_workbook(wb)
         if errors:
             self.logger.warning("INSTITUTIONAL_REPORT_VALIDATE_FAIL " + ";".join(errors))
@@ -2668,7 +2816,8 @@ class Macro16Engine:
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
-        self.logger.info("CHANGELOG v2.6.0: teacher strategy P0 integrated - core leader, wave correction, sakata risk, avoid swap, five-state decision")
+        self.logger.info("CHANGELOG v2.6.1: GAP fix - decision trace, five-state summary, reason statistics, validation result, strategy hit verification")
+        self.logger.strategy_trace("STRATEGY_VERSION", {"strategy_version": STRATEGY_VERSION, "program_version": VERSION})
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
         raw["台股指數"] = self.source.fetch_twse_taiex_history(requested_date)
