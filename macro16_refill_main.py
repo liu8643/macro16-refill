@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.5.4-entry-zone-p0-fixed"
+VERSION = "2.6.0-teacher-strategy-p0-integrated"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -1607,11 +1607,13 @@ class ExplanationEngine:
 EXPECTED_INSTITUTIONAL_SHEETS = [
     "00_執行摘要", "01_DB資料盤點", "02_模型設計", "03_最終TOP15",
     "04_成長模型TOP30", "05_價值模型TOP30", "06_低位階候選",
-    "07_老師點名股檢核", "08_排除與風險", "09_來源與限制"
+    "07_老師點名股檢核", "08_排除與風險", "09_來源與限制",
+    "10_老師策略驗收", "11_修改追蹤"
 ]
 
 REPORT_COLUMNS = [
-    "排名", "代號", "名稱", "市場", "產業", "題材", "老師分類", "現價",
+    "排名", "代號", "名稱", "市場", "產業", "題材", "老師分類", "老師決策", "老師股票池", "核心股狀態",
+    "K線警訊", "波段修正", "避開/換股", "現價",
     "低接區", "停損", "目標1", "目標2", "RR", "是否可下單",
     "老師總分", "成長分", "價值分", "EPS_TTM", "PE", "殖利率%",
     "營收YoY%", "法人分", "20日漲幅%", "低位階分", "K線分",
@@ -1914,8 +1916,214 @@ class DBRepository:
             ma60_calc = close.tail(60).mean() if len(close) >= 60 else math.nan
             vol5 = vol.tail(5).mean() if len(vol) >= 5 else math.nan
             vol20 = vol.tail(20).mean() if len(vol) >= 20 else math.nan
-            out.append({"stock_id": str(sid).zfill(4), "pos_120d": pos120, "pct_20d": pct20, "ma20_calc": ma20_calc, "ma60_calc": ma60_calc, "vol5": vol5, "vol20": vol20})
+            ma5_calc = close.tail(5).mean() if len(close) >= 5 else math.nan
+            ma65_calc = close.tail(65).mean() if len(close) >= 65 else ma60_calc
+            prev_close = close.iloc[-2] if len(close) >= 2 else math.nan
+            last_open = pd.to_numeric(g.get("open"), errors="coerce").iloc[-1] if "open" in g.columns and len(g) else math.nan
+            last_high = high.iloc[-1] if len(high) else math.nan
+            last_low = low.iloc[-1] if len(low) else math.nan
+            prev_high = high.iloc[-2] if len(high) >= 2 else math.nan
+            prev2_high = high.iloc[-3] if len(high) >= 3 else math.nan
+            high20_prev = high.iloc[:-1].tail(20).max() if len(high) >= 21 else math.nan
+            high60_prev = high.iloc[:-1].tail(60).max() if len(high) >= 61 else math.nan
+            low20_prev = low.iloc[:-1].tail(20).min() if len(low) >= 21 else math.nan
+            ema12 = close.ewm(span=12, adjust=False).mean() if len(close) >= 12 else pd.Series(dtype=float)
+            ema26 = close.ewm(span=26, adjust=False).mean() if len(close) >= 26 else pd.Series(dtype=float)
+            macd_dif = (ema12 - ema26) if len(ema26) else pd.Series(dtype=float)
+            macd_dea = macd_dif.ewm(span=9, adjust=False).mean() if len(macd_dif) >= 9 else pd.Series(dtype=float)
+            macd_hist = (macd_dif - macd_dea) if len(macd_dea) else pd.Series(dtype=float)
+            macd_hist_last = macd_hist.iloc[-1] if len(macd_hist) else math.nan
+            macd_hist_prev = macd_hist.iloc[-2] if len(macd_hist) >= 2 else math.nan
+            low9 = low.rolling(9).min()
+            high9 = high.rolling(9).max()
+            rsv = (close - low9) / (high9 - low9).replace(0, math.nan) * 100
+            k = rsv.ewm(com=2, adjust=False).mean()
+            d = k.ewm(com=2, adjust=False).mean()
+            k_last = k.iloc[-1] if len(k) else math.nan
+            d_last = d.iloc[-1] if len(d) else math.nan
+            k_prev = k.iloc[-2] if len(k) >= 2 else math.nan
+            d_prev = d.iloc[-2] if len(d) >= 2 else math.nan
+            out.append({
+                "stock_id": str(sid).zfill(4), "pos_120d": pos120, "pct_20d": pct20,
+                "ma5_calc": ma5_calc, "ma20_calc": ma20_calc, "ma60_calc": ma60_calc, "ma65_calc": ma65_calc,
+                "vol5": vol5, "vol20": vol20, "last_open": last_open, "last_high": last_high, "last_low": last_low,
+                "prev_close": prev_close, "prev_high_price": prev_high, "prev2_high_price": prev2_high,
+                "high20_prev": high20_prev, "high60_prev": high60_prev, "low20_prev": low20_prev,
+                "macd_hist": macd_hist_last, "macd_hist_prev": macd_hist_prev,
+                "kd_k": k_last, "kd_d": d_last, "kd_k_prev": k_prev, "kd_d_prev": d_prev
+            })
         return pd.DataFrame(out)
+
+
+class MarketRegimeEngine:
+    """顧奎國老師策略P0：大盤多空總閘與乖離風控。
+    原Macro16只用5MA/高低點/量能，本層補上「短線拉回 vs 波段修正」語義。
+    """
+    def apply(self, df):
+        if df is None or df.empty:
+            return df
+        close = pd.to_numeric(df.get("close"), errors="coerce")
+        ma60 = pd.to_numeric(df.get("ma60_final", df.get("ma60_calc")), errors="coerce")
+        macd = pd.to_numeric(df.get("macd_hist"), errors="coerce")
+        macd_prev = pd.to_numeric(df.get("macd_hist_prev"), errors="coerce")
+        k = pd.to_numeric(df.get("kd_k"), errors="coerce")
+        d = pd.to_numeric(df.get("kd_d"), errors="coerce")
+        k_prev = pd.to_numeric(df.get("kd_k_prev"), errors="coerce")
+        d_prev = pd.to_numeric(df.get("kd_d_prev"), errors="coerce")
+        df["deviation_from_ma60"] = ((close - ma60) / ma60.replace(0, math.nan) * 100).replace([math.inf, -math.inf], math.nan)
+        df["deviation_risk_flag"] = df["deviation_from_ma60"].abs().fillna(0) >= 20
+        df["macd_turn_negative"] = (macd < 0) & (macd_prev >= 0)
+        df["macd_near_zero"] = macd.abs().fillna(999) <= 0.20
+        df["kd_dead_cross_below_80"] = (k < d) & (k_prev >= d_prev) & (k < 80)
+        df["wave_correction_flag"] = df["macd_turn_negative"] & df["kd_dead_cross_below_80"]
+        df["market_pullback_type"] = "短線拉回"
+        df.loc[df["wave_correction_flag"], "market_pullback_type"] = "波段修正"
+        df.loc[df["deviation_risk_flag"] & ~df["wave_correction_flag"], "market_pullback_type"] = "乖離過大/禁追高"
+        return df
+
+class SakataRiskPatternEngine:
+    """顧奎國老師策略P0：量化流星、空頭新星十字、墓碑線、長黑K。"""
+    def apply(self, df):
+        if df is None or df.empty:
+            return df
+        o = pd.to_numeric(df.get("last_open"), errors="coerce")
+        h = pd.to_numeric(df.get("last_high"), errors="coerce")
+        l = pd.to_numeric(df.get("last_low"), errors="coerce")
+        c = pd.to_numeric(df.get("close"), errors="coerce")
+        prev_c = pd.to_numeric(df.get("prev_close"), errors="coerce")
+        body = (c - o).abs()
+        rng = (h - l).replace(0, math.nan)
+        upper = h - pd.concat([o, c], axis=1).max(axis=1)
+        lower = pd.concat([o, c], axis=1).min(axis=1) - l
+        df["shooting_star_flag"] = (upper >= body * 2) & ((body / rng) <= 0.35) & ((h - c) / rng >= 0.45)
+        df["tombstone_flag"] = (upper >= rng * 0.60) & (lower <= rng * 0.10) & ((body / rng) <= 0.25)
+        df["bearish_star_cross_flag"] = ((body / rng) <= 0.15) & (prev_c.notna()) & (c >= prev_c * 1.02)
+        df["long_black_flag"] = (c < o) & ((o - c) / rng >= 0.60)
+        warn = []
+        for i in df.index:
+            labels = []
+            if bool(df.at[i, "shooting_star_flag"]): labels.append("流星")
+            if bool(df.at[i, "bearish_star_cross_flag"]): labels.append("空頭新星十字")
+            if bool(df.at[i, "tombstone_flag"]): labels.append("墓碑線")
+            if bool(df.at[i, "long_black_flag"]): labels.append("長黑K")
+            warn.append("/".join(labels) if labels else "")
+        df["k_warning_type"] = warn
+        df["two_day_break_high"] = pd.to_numeric(df.get("last_high"), errors="coerce") > pd.to_numeric(df.get("high20_prev"), errors="coerce")
+        df["kline_score"] = pd.to_numeric(df.get("kline_score", pd.Series(50, index=df.index)), errors="coerce").fillna(50)
+        df.loc[df["k_warning_type"].ne(""), "kline_score"] = (df["kline_score"] - 25).clip(0, 100)
+        return df
+
+class CoreLeaderEngine:
+    """顧奎國老師策略P0：台積電(2330)作為大盤核心風向。"""
+    def infer_state(self, df):
+        default = {"core_leader_state": "NE", "core_leader_reason": "未取得2330資料，核心股風向不進主判斷"}
+        if df is None or df.empty or "stock_id" not in df.columns:
+            return default
+        sid = df["stock_id"].astype(str).str.zfill(4)
+        if not sid.eq("2330").any():
+            return default
+        r = df.loc[sid.eq("2330")].iloc[0]
+        close = _safe_float(r.get("close"))
+        ma20 = _safe_float(r.get("ma20_final"))
+        ma60 = _safe_float(r.get("ma60_final"))
+        high20 = _safe_float(r.get("high20_prev"))
+        warning = str(r.get("k_warning_type", "") or "")
+        if high20 and close and close > high20:
+            state, reason = "突破續強", "2330突破近20日壓力，主流續強"
+        elif close and ma20 and close >= ma20 and (not warning):
+            state, reason = "回測不破", "2330守住MA20/回測不破，仍屬多方拉回"
+        elif close and ma20 and close < ma20 and (ma60 and close >= ma60):
+            state, reason = "假突破/短線降檔", "2330跌回MA20下方但未破中期線，降追價"
+        elif close and ma60 and close < ma60:
+            state, reason = "核心轉弱", "2330跌破MA60，市場風險升級"
+        else:
+            state, reason = "觀察", "2330資料不足，僅列觀察"
+        if warning:
+            reason += f"；K線警訊={warning}"
+        return {"core_leader_state": state, "core_leader_reason": reason}
+
+    def apply(self, df):
+        state = self.infer_state(df)
+        df["core_leader_state"] = state["core_leader_state"]
+        df["core_leader_reason"] = state["core_leader_reason"]
+        return df
+
+class AvoidSwapEngine:
+    """顧奎國老師策略P0：兩高不過、下降軌道、頸線壓力未突破，不得列主攻。"""
+    def apply(self, df):
+        if df is None or df.empty:
+            return df
+        close = pd.to_numeric(df.get("close"), errors="coerce")
+        ma20 = pd.to_numeric(df.get("ma20_final"), errors="coerce")
+        ma60 = pd.to_numeric(df.get("ma60_final"), errors="coerce")
+        high20 = pd.to_numeric(df.get("high20_prev"), errors="coerce")
+        high60 = pd.to_numeric(df.get("high60_prev"), errors="coerce")
+        prev_high = pd.to_numeric(df.get("prev_high_price"), errors="coerce")
+        prev2_high = pd.to_numeric(df.get("prev2_high_price"), errors="coerce")
+        df["two_high_not_passed_flag"] = (prev_high < high60 * 0.995) & (prev2_high < high60 * 0.995) & (close < high20)
+        df["downtrend_flag"] = (close < ma20) & (ma20 < ma60)
+        df["neckline_pressure_flag"] = (close < high20) & (high20.notna()) & ((high20 - close) / close.replace(0, math.nan) <= 0.05)
+        reasons = []
+        for i in df.index:
+            r = []
+            if bool(df.at[i, "two_high_not_passed_flag"]): r.append("兩高不過")
+            if bool(df.at[i, "downtrend_flag"]): r.append("下降軌道")
+            if bool(df.at[i, "neckline_pressure_flag"]): r.append("頸線/前高壓力未突破")
+            if bool(df.at[i, "deviation_risk_flag"]): r.append("乖離過大禁追高")
+            reasons.append(";".join(r))
+        df["swap_reason"] = reasons
+        df["avoid_flag"] = df["swap_reason"].astype(str).ne("")
+        df["pressure_line_state"] = df["swap_reason"].where(df["swap_reason"].astype(str).ne(""), "未觸發")
+        return df
+
+class TeacherDecisionEngine:
+    """顧奎國老師策略P0：新增 BUY / LOW_BUY / WATCH / REDUCE / AVOID 五態，不取代原是否可下單欄位。"""
+    def apply(self, df):
+        if df is None or df.empty:
+            return df
+        score = pd.to_numeric(df.get("teacher_score"), errors="coerce").fillna(0)
+        rr = pd.to_numeric(df.get("rr"), errors="coerce").fillna(0)
+        close = pd.to_numeric(df.get("close"), errors="coerce")
+        entry_high = pd.to_numeric(df.get("entry_high"), errors="coerce")
+        low_base = pd.to_numeric(df.get("low_base_score"), errors="coerce").fillna(50)
+        df["teacher_decision"] = "WATCH"
+        df.loc[df.get("avoid_flag", False).fillna(False), "teacher_decision"] = "AVOID"
+        reduce_mask = (df.get("k_warning_type", pd.Series("", index=df.index)).astype(str).ne("")) | df.get("deviation_risk_flag", pd.Series(False, index=df.index)).fillna(False) | df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False)
+        df.loc[reduce_mask & ~df["teacher_decision"].eq("AVOID"), "teacher_decision"] = "REDUCE"
+        low_buy = (score >= 55) & (rr >= 1.5) & (low_base >= 55) & (close <= entry_high * 1.03) & df["teacher_decision"].eq("WATCH")
+        buy = (score >= 70) & (rr >= 1.8) & (close <= entry_high * 1.01) & df["teacher_decision"].eq("WATCH")
+        df.loc[low_buy, "teacher_decision"] = "LOW_BUY"
+        df.loc[buy, "teacher_decision"] = "BUY"
+        pool = []
+        for i, r in df.iterrows():
+            div = _safe_float(r.get("dividend_yield"))
+            rev = _safe_float(r.get("yoy", r.get("revenue_yoy")))
+            theme = str(r.get("theme", "") or "") + " " + str(r.get("sub_theme", "") or "") + " " + str(r.get("industry", "") or "")
+            if str(r.get("stock_id", "")).zfill(4) == "2330":
+                pool.append("主流核心")
+            elif _safe_float(r.get("low_base_score")) >= 60 and _safe_float(r.get("ma_support_score")) >= 60:
+                pool.append("低位階翻多")
+            elif rev >= 20 or any(k in theme for k in ["AI", "半導體", "CPO", "伺服器", "散熱"]):
+                pool.append("營收成長/主流題材")
+            elif div >= 4:
+                pool.append("高配息防守")
+            else:
+                pool.append("觀察")
+        df["teacher_pool_type"] = pool
+        return df
+
+def _safe_float(v, default=math.nan):
+    try:
+        if v is None:
+            return default
+        if isinstance(v, str) and not v.strip():
+            return default
+        x = float(v)
+        if math.isnan(x):
+            return default
+        return x
+    except Exception:
+        return default
 
 class FeatureBuilder:
     def build(self, df):
@@ -2033,6 +2241,10 @@ class TradePlanEngine:
         df.loc[pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0) < 500, "exclude_reason"] += "成交量不足;"
         df.loc[df["rr"].fillna(0) < 1.2, "exclude_reason"] += "RR不足;"
         df.loc[pd.to_numeric(df.get("rsi", 50), errors="coerce").fillna(50) > 78, "exclude_reason"] += "RSI過熱;"
+        if "swap_reason" in df.columns:
+            df.loc[df["swap_reason"].astype(str).ne(""), "exclude_reason"] += df.loc[df["swap_reason"].astype(str).ne(""), "swap_reason"].astype(str) + ";"
+        if "wave_correction_flag" in df.columns:
+            df.loc[df["wave_correction_flag"].fillna(False), "exclude_reason"] += "MACD+KD波段修正;"
         df["exclude_flag"] = df["exclude_reason"].ne("")
         df["是否可下單"] = "NO"
         yes = (df["teacher_score"] >= 55) & (df["rr"] >= 1.5) & (~df["exclude_flag"]) & (close <= df["entry_high"] * 1.03)
@@ -2040,6 +2252,12 @@ class TradePlanEngine:
         df.loc[yes, "是否可下單"] = "YES"
         df.loc[wait, "是否可下單"] = "WAIT"
         df["操作策略"] = df["是否可下單"].map({"YES":"低接區內可分批", "WAIT":"等待回到低接區或RR改善", "NO":"不符合下單條件"}).fillna("觀察")
+        if "k_warning_type" in df.columns:
+            df.loc[df["k_warning_type"].astype(str).ne(""), "操作策略"] = "K線警訊，壓力先賣/等待2日確認"
+        if "wave_correction_flag" in df.columns:
+            df.loc[df["wave_correction_flag"].fillna(False), "操作策略"] = "波段修正確認，停止追高並降檔"
+        if "avoid_flag" in df.columns:
+            df.loc[df["avoid_flag"].fillna(False), "操作策略"] = "兩高不過/下降軌道，反彈換股"
         return df
 
 class InstitutionalReportEngine:
@@ -2054,9 +2272,14 @@ class InstitutionalReportEngine:
         trade_date = self.repo.get_trade_date()
         df = self.repo.load_base_universe(trade_date)
         df = FeatureBuilder().build(df)
+        df = MarketRegimeEngine().apply(df)
+        df = SakataRiskPatternEngine().apply(df)
+        df = CoreLeaderEngine().apply(df)
         df = DualModelScoringEngine().score(df)
         df = ReportClassifier().classify(df)
+        df = AvoidSwapEngine().apply(df)
         df = TradePlanEngine().build(df)
+        df = TeacherDecisionEngine().apply(df)
         df["report_name"] = df.get("stock_name", df.get("stock_name_master", df.get("name", "")))
         result = {
             "trade_date": trade_date,
@@ -2104,7 +2327,9 @@ class InstitutionalExcelWriter:
         for i, (_, r) in enumerate(df.iterrows(), 1):
             name = r.get("stock_name") or r.get("stock_name_master") or r.get("report_name") or ""
             rows.append([
-                i, str(r.get("stock_id", "")).zfill(4), name, r.get("market", ""), r.get("industry", r.get("industry_master", "")), r.get("theme", r.get("sub_theme", "")), r.get("老師分類", ""), round(float(r.get("close", 0) or 0),2),
+                i, str(r.get("stock_id", "")).zfill(4), name, r.get("market", ""), r.get("industry", r.get("industry_master", "")), r.get("theme", r.get("sub_theme", "")), r.get("老師分類", ""),
+                r.get("teacher_decision", "WATCH"), r.get("teacher_pool_type", ""), r.get("core_leader_state", ""),
+                r.get("k_warning_type", ""), r.get("market_pullback_type", ""), r.get("swap_reason", ""), round(float(r.get("close", 0) or 0),2),
                 f"{round(float(r.get('entry_low',0) or 0),2)}~{round(float(r.get('entry_high',0) or 0),2)}", round(float(r.get("stop_loss",0) or 0),2), round(float(r.get("target_1",0) or 0),2), round(float(r.get("target_2",0) or 0),2), round(float(r.get("rr",0) or 0),2), r.get("是否可下單", "NO"),
                 round(float(r.get("teacher_score",0) or 0),2), round(float(r.get("growth_score",0) or 0),2), round(float(r.get("value_score",0) or 0),2), round(float(r.get("eps_ttm", r.get("valuation_eps_ttm",0)) or 0),2), round(float(r.get("pe",0) or 0),2), round(float(r.get("dividend_yield",0) or 0),2),
                 round(float(r.get("yoy", r.get("revenue_yoy",0)) or 0),2), round(float(r.get("institutional_score",0) or 0),2), round(float(r.get("pct_20d",0) or 0),2), round(float(r.get("low_base_score",0) or 0),2), round(float(r.get("kline_score",0) or 0),2),
@@ -2136,10 +2361,12 @@ class InstitutionalExcelWriter:
         # 02
         ws = self._sheet(wb, "02_模型設計")
         ws.append(["模型", "權重/規則", "說明"])
-        ws.append(["老師總分", "低位階20% + K線20% + 均線15% + 量能10% + 營收EPS15% + 殖利率10% + 題材10%", "依Word規格"])
-        ws.append(["YES", "teacher_score>=55 AND RR>=1.5 AND 非排除 AND 現價<=entry_high*1.03", "可下單"])
-        ws.append(["WAIT", "分數與RR足夠但位置未到", "等待低接"])
-        ws.append(["NO", "排除條件或RR不足", "不下單"])
+        ws.append(["老師總分", "低位階20% + 阪田K線20% + 均線15% + 量能10% + 營收EPS15% + 殖利率10% + 題材10%", "依Word/Excel策略SOP落實"])
+        ws.append(["核心股風向", "CoreLeaderEngine：2330突破續強/回測不破/假突破/核心轉弱", "台積電為老師方法的大盤風向核心"])
+        ws.append(["波段修正", "MarketRegimeEngine：MACD翻負 + KD破80死叉", "雙條件成立才視為波段修正，不因單一K棒全面轉空"])
+        ws.append(["阪田警訊", "SakataRiskPatternEngine：流星/空頭新星十字/墓碑線/長黑K", "觸發後壓力先賣或等待2日確認"])
+        ws.append(["排除換股", "AvoidSwapEngine：兩高不過/下降軌道/頸線壓力未突破/乖離過大", "符合者不得列主攻"])
+        ws.append(["老師決策", "BUY / LOW_BUY / WATCH / REDUCE / AVOID", "保留是否可下單YES/WAIT/NO，但新增老師五態決策"])
         # datasets
         final = df[~df["exclude_flag"]].sort_values(["teacher_score","growth_score","value_score"], ascending=False).head(15)
         growth = df.sort_values("growth_score", ascending=False).head(30)
@@ -2157,7 +2384,22 @@ class InstitutionalExcelWriter:
         ws.append(["資料來源", "stock_system DB + TEJ八大公股行庫（若提供）+ TWSE/TPEX/TAIFEX宏觀來源"])
         ws.append(["官股/八大公股", "TEJ或Wantgoo等來源只作證據追溯；只要gov_net_100m解析正確，分數只依數值，不因來源不同扣分"])
         ws.append(["Macro16跨月5日", "本版已提供Market5DayEngine；不足5日標P0_FAIL，停止市場技術判斷"])
-        ws.append(["格式驗收", "00~09固定；03~08共用30欄；不得新增第10頁"])
+        ws.append(["老師策略P0", "已新增CoreLeaderEngine、MarketRegimeEngine、SakataRiskPatternEngine、AvoidSwapEngine與TeacherDecisionEngine"])
+        ws.append(["格式驗收", "00~11固定；03~08共用36欄；10/11為老師策略驗收與修改追蹤"])
+        ws = self._sheet(wb, "10_老師策略驗收")
+        ws.append(["TC", "驗收情境", "程式欄位", "預期結果"] )
+        ws.append(["TC01", "流星但MACD/KD未雙翻空", "k_warning_type + wave_correction_flag", "REDUCE或WATCH，不全面轉空"] )
+        ws.append(["TC02", "MACD翻負且KD破80死叉", "wave_correction_flag", "波段修正，停止追高"] )
+        ws.append(["TC03", "2330假突破/回測失敗", "core_leader_state", "市場風險升級"] )
+        ws.append(["TC04", "個股兩高不過或下降軌道", "avoid_flag/swap_reason", "AVOID/REDUCE，不列主攻"] )
+        ws.append(["TC05", "低位階翻多且RR足夠", "teacher_pool_type/teacher_decision", "LOW_BUY或BUY"] )
+        ws = self._sheet(wb, "11_修改追蹤")
+        ws.append(["修改ID", "修改項目", "狀態", "對應類別/函式", "說明"] )
+        ws.append(["P0-01", "CoreLeaderEngine", "已修改", "CoreLeaderEngine", "新增2330核心股風向判斷"] )
+        ws.append(["P0-02", "MACD+KD波段修正", "已修改", "MarketRegimeEngine", "新增wave_correction_flag與market_pullback_type"] )
+        ws.append(["P0-03", "阪田K線警訊", "已修改", "SakataRiskPatternEngine", "新增流星/空頭新星十字/墓碑/長黑K"] )
+        ws.append(["P0-04", "兩高不過/下降軌道排除", "已修改", "AvoidSwapEngine", "新增avoid_flag/swap_reason"] )
+        ws.append(["P0-05", "老師五態決策", "已修改", "TeacherDecisionEngine", "新增BUY/LOW_BUY/WATCH/REDUCE/AVOID"] )
         errors = ReportValidator().validate_workbook(wb)
         if errors:
             self.logger.warning("INSTITUTIONAL_REPORT_VALIDATE_FAIL " + ";".join(errors))
@@ -2426,7 +2668,7 @@ class Macro16Engine:
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
-        self.logger.info("CHANGELOG v2.5.4: entry_low/entry_high reverse guard fixed in TradePlanEngine only")
+        self.logger.info("CHANGELOG v2.6.0: teacher strategy P0 integrated - core leader, wave correction, sakata risk, avoid swap, five-state decision")
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
         raw["台股指數"] = self.source.fetch_twse_taiex_history(requested_date)
