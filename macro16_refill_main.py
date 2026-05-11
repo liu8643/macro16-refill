@@ -54,7 +54,7 @@ except Exception:
 
 APP_NAME = "Macro16RefillEngine"
 VERSION = "2.7.4-position-engine-fix"
-STRATEGY_VERSION = "teacher_strategy_v1.6_position_engine_fix_20260511"
+STRATEGY_VERSION = "teacher_strategy_v1.7_reduce_page_20260511"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -1622,7 +1622,7 @@ EXPECTED_INSTITUTIONAL_SHEETS = [
     "04_成長模型TOP30", "05_價值模型TOP30", "06_低位階候選",
     "07_老師點名股檢核", "08_排除與風險", "09_來源與限制",
     "10_老師策略驗收", "11_修改追蹤", "12_策略命中驗證",
-    "13_LOW_BUY候選", "14_WATCH觀察池", "15_AVOID排除清單", "16_放行與觀察候選"
+    "13_LOW_BUY候選", "14_WATCH觀察池", "15_AVOID排除清單", "16_放行與觀察候選", "17_REDUCE減碼警示"
 ]
 
 REPORT_COLUMNS = [
@@ -3122,6 +3122,7 @@ class InstitutionalExcelWriter:
             ("14_WATCH觀察池", datasets["watch"], 200),
             ("15_AVOID排除清單", datasets["avoid"], 300),
             ("16_放行與觀察候選", datasets["release"], 200),
+            ("17_REDUCE減碼警示", datasets["reduce"], 300),
         ]
         for sheet, data, topn in report_sheet_map:
             ws = self._sheet(wb, sheet)
@@ -3144,6 +3145,7 @@ class InstitutionalExcelWriter:
         ws.append(["TC05", "低位階翻多且RR足夠", "low_base_reversal_flag/teacher_decision", "LOW_BUY或BUY"] )
         ws.append(["TC06", "軟性頸線壓力但低位階翻多", "avoid_level/decision_release_reason", "SOFT_RELEASED且可進LOW_BUY觀察"] )
         ws.append(["TC07", "硬性風險成立", "hard_avoid_flag", "AVOID，不可被LowBase覆蓋"] )
+        ws.append(["TC08", "已分析但不適合追價/新增", "teacher_decision=REDUCE", "輸出17_REDUCE減碼警示，不混入TOP15主攻"] )
         ws.append([])
         ws.append(["驗收項目", "實際結果", "Pass/Fail", "命中筆數/說明"])
         validation_rows = [
@@ -3189,6 +3191,7 @@ class InstitutionalExcelWriter:
         ws.append(["P8-01", "Position Engine欄位", "已修改", "TeacherPhase5SemanticEngine/REPORT_COLUMNS/_report_rows", "新增wave_phase、breakout_stage、impulse_stage、position_score，修正彩晶類PreBreakout position_score=0問題"] )
         ws.append(["P6-01", "YES/WAIT/NO語義同步", "已修改", "TeacherDecisionEngine", "以老師五態重新同步是否可下單與teacher_execution_status，避免YES與BUY/LOW_BUY打架"] )
         ws.append(["P6-02", "16表名稱修正", "已修改", "EXPECTED_INSTITUTIONAL_SHEETS/Writer", "16_BUY_LOW_BUY放行原因改為16_放行與觀察候選，避免內含WATCH時語義錯誤"] )
+        ws.append(["P9-01", "REDUCE減碼警示頁", "已修改", "EXPECTED_INSTITUTIONAL_SHEETS/TeacherFullReportBuilder/InstitutionalExcelWriter", "新增17_REDUCE減碼警示；REDUCE不混入TOP15主攻，但完整輸出風險資訊與決策原因"] )
         ws.append(["P6-03", "波段修正零樣本WARN", "已修改", "MarketRegimeEngine/10_老師策略驗收", "wave_correction_count=0改列WARN並寫入log，不再誤判為完全PASS"] )
         ws.append(["P6-04", "官股資料等級", "已修改", "00_執行摘要", "新增正式/備援/缺資料等級，TEJ未提供時不偽裝正式"] )
         ws.append(["P0-10", "策略命中驗證", "已修改", "12_策略命中驗證", "若有未來價格資料則計算，否則明確標示待追蹤"] )
