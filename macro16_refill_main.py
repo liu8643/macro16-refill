@@ -53,8 +53,8 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.7.2-teacher-phase5-semantic-fix"
-STRATEGY_VERSION = "teacher_strategy_v1.4_phase5_semantic_fix_20260511"
+VERSION = "2.7.3-teacher-phase5-consistency-fix"
+STRATEGY_VERSION = "teacher_strategy_v1.5_phase5_consistency_fix_20260511"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -1632,7 +1632,10 @@ REPORT_COLUMNS = [
     "老師總分", "成長分", "價值分", "EPS_TTM", "PE", "殖利率%",
     "營收YoY%", "法人分", "20日漲幅%", "低位階分", "K線分",
     "均線支撐分", "量能健康分", "營收EPS分", "操作策略", "排除原因",
-    "低位階翻多", "放行理由", "硬性排除", "軟性排除", "壓力來源"
+    "低位階翻多", "放行理由", "硬性排除", "軟性排除", "壓力來源",
+    "Phase5大波", "Phase5小波", "Phase5修正型態", "Phase5回撤比例", "Phase5反彈性質",
+    "Phase5修正完成", "Phase5逃命反彈", "Phase5推動浪", "Phase5候選池", "Phase5阻擋原因",
+    "期間BUY次數", "期間AVOID次數", "最後降級原因"
 ]
 
 TEACHER_WATCHLIST = [
@@ -2251,6 +2254,136 @@ class AvoidSwapEngine:
                 self.logger.strategy_trace("AVOID_REASON", {"stock": str(row.get("stock_id", "")).zfill(4), "level": row.get("avoid_level", ""), "reason": row.get("swap_reason", "")})
         return df
 
+
+class TeacherPhase5SemanticEngine:
+    """V2.7.3：Phase5語義一致性修正層。
+    目的：把差異分析報告指出的「第3浪訊號 vs 主跌修正浪」、「主升池混入弱反彈」、
+    「修正反彈只剩文字但沒有位置」轉成可被 TeacherDecisionEngine 使用的欄位。
+    本層不取代既有老師模型，而是建立 Phase5 Gate 與候選池，使報表/決策/原因一致。
+    """
+    def __init__(self, logger: Optional[Macro16Logger] = None):
+        self.logger = logger
+
+    def apply(self, df):
+        if df is None or df.empty:
+            return df
+        close = _safe_series(df, "close")
+        ma20 = _safe_series(df, "ma20_final")
+        ma60 = _safe_series(df, "ma60_final")
+        rsi = _safe_series(df, "rsi", default=50).fillna(50)
+        vol5 = _safe_series(df, "vol5")
+        vol20 = _safe_series(df, "vol20")
+        high20 = _safe_series(df, "high20_prev")
+        low20 = _safe_series(df, "low20_prev")
+        high60 = _safe_series(df, "high60_prev")
+        low60 = _safe_series(df, "low60_prev")
+        high120 = _safe_series(df, "high120_prev")
+        low120 = _safe_series(df, "low120_prev")
+        rr = _safe_series(df, "rr", default=0).fillna(0)
+        score = _safe_series(df, "teacher_score", default=0).fillna(0)
+        wave_correction = _safe_bool_series(df, "wave_correction_flag")
+        low_base_reversal = _safe_bool_series(df, "low_base_reversal_flag")
+        hard_avoid = _safe_bool_series(df, "hard_avoid_flag")
+        k_warning = _safe_str_series(df, "k_warning_type")
+        ratio = (vol5 / vol20.replace(0, math.nan)).replace([math.inf, -math.inf], math.nan).fillna(1.0)
+        # 大波：避免只用「第3浪」文字，先判定主升/主跌背景。
+        main_up = close.notna() & ma20.notna() & ma60.notna() & (close >= ma20) & (ma20 >= ma60 * 0.98)
+        main_down = close.notna() & ma20.notna() & ma60.notna() & ((close < ma20) & (ma20 < ma60))
+        box = ~(main_up | main_down)
+        df["phase5_major_wave"] = "大箱型整理"
+        df.loc[main_up, "phase5_major_wave"] = "主升推動浪"
+        df.loc[main_down, "phase5_major_wave"] = "主跌修正浪"
+        # 費波回撤/反彈比例：使用120/60/20日高低點依序取可用區間。
+        swing_high = high120.fillna(high60).fillna(high20)
+        swing_low = low120.fillna(low60).fillna(low20)
+        span = (swing_high - swing_low).replace(0, math.nan)
+        fibo_retrace = ((swing_high - close) / span).where(main_up, (close - swing_low) / span)
+        fibo_retrace = fibo_retrace.clip(lower=0, upper=1.5).fillna(0.5)
+        df["phase5_fibo_retrace"] = fibo_retrace.round(3)
+        zone = pd.Series("0.382~0.618中性回撤", index=df.index)
+        zone.loc[fibo_retrace < 0.382] = "0~0.382淺回/弱反彈"
+        zone.loc[(fibo_retrace >= 0.382) & (fibo_retrace <= 0.618)] = "0.382~0.618健康回撤"
+        zone.loc[(fibo_retrace > 0.618) & (fibo_retrace <= 0.786)] = "0.618~0.786深回撤"
+        zone.loc[fibo_retrace > 0.786] = "0.786以上結構破壞"
+        df["phase5_fibo_retrace_zone"] = zone
+        # 小波定位。
+        minor = pd.Series("小波待確認", index=df.index)
+        minor.loc[main_up & (fibo_retrace <= 0.618) & low_base_reversal] = "第2浪/第4浪拉回"
+        minor.loc[main_up & (close > high20) & (ratio >= 1.2)] = "第3浪推動"
+        minor.loc[main_down & (close < ma20)] = "C浪反彈待確認"
+        minor.loc[main_down & (close >= ma20) & (close < ma60)] = "B浪弱反彈"
+        minor.loc[main_down & (fibo_retrace > 0.618)] = "C浪延伸/深修正"
+        df["phase5_minor_wave"] = minor
+        # 修正型態。
+        corr = pd.Series("修正型態待確認", index=df.index)
+        corr.loc[main_up & low_base_reversal] = "主升回撤修正"
+        corr.loc[main_down & (fibo_retrace <= 0.382)] = "Zigzag弱反彈"
+        corr.loc[main_down & (fibo_retrace > 0.382) & (fibo_retrace <= 0.618)] = "ABC修正反彈"
+        corr.loc[main_down & (fibo_retrace > 0.618)] = "C浪延伸修正"
+        corr.loc[box & (fibo_retrace <= 0.618)] = "箱型整理修正"
+        df["phase5_correction_type"] = corr
+        # 修正完成：必須同時具備站回MA20、量能、RSI、壓力突破任一確認。
+        correction_completed = (
+            close.notna() & ma20.notna() & (close >= ma20)
+            & (ratio >= 1.2)
+            & (rsi >= 45)
+            & ((high20.isna()) | (close >= high20 * 0.995) | low_base_reversal)
+            & ~hard_avoid
+        )
+        df["phase5_correction_completed"] = correction_completed
+        # 逃命反彈/弱反彈：主跌、未站回MA60、量不足或RSI不足，且未完成。
+        escape = main_down & (close < ma60) & (~correction_completed) & ((ratio < 1.0) | (rsi < 50) | (fibo_retrace < 0.5))
+        df["phase5_escape_rally"] = escape
+        rebound = pd.Series("一般反彈", index=df.index)
+        rebound.loc[main_up & low_base_reversal & ~correction_completed] = "主升拉回待確認"
+        rebound.loc[main_up & correction_completed] = "主升拉回完成"
+        rebound.loc[main_down & ~escape] = "跌深技術反彈"
+        rebound.loc[escape] = "逃命反彈"
+        rebound.loc[main_down & (close < low20)] = "反彈失敗"
+        rebound.loc[box & correction_completed] = "箱型突破轉強"
+        df["phase5_rebound_type"] = rebound
+        impulsive = main_up & (close > high20.fillna(close * 9)) & (ratio >= 1.2) & (rsi.between(45, 72)) & ~hard_avoid & ~wave_correction
+        # Wave3預突破：不是推動浪True，但要保留為觀察，不可誤判為主跌。
+        prebreakout = (score >= 70) & (rr >= 1.2) & (main_up | box) & (close >= ma20.fillna(close) * 0.98) & ~hard_avoid & ~wave_correction
+        df["phase5_impulsive_wave"] = impulsive
+        df["phase5_impulse_stage"] = "None"
+        df.loc[prebreakout & ~impulsive, "phase5_impulse_stage"] = "PreBreakout"
+        df.loc[impulsive, "phase5_impulse_stage"] = "Breakout"
+        df.loc[impulsive & (ratio >= 1.8), "phase5_impulse_stage"] = "Expansion"
+        df.loc[main_down & ~impulsive, "phase5_impulse_stage"] = "Failed/Correction"
+        block_reason = pd.Series("", index=df.index)
+        block_reason.loc[escape] = "Phase5逃命反彈：主跌修正浪且修正未完成，禁止追價或主動布局"
+        block_reason.loc[main_down & ~escape & ~correction_completed] = "Phase5主跌弱反彈：大波仍是主跌修正浪，僅可觀察"
+        block_reason.loc[main_up & ~correction_completed & low_base_reversal] = "Phase5主升拉回未完成：等待量價與壓力突破確認"
+        df["phase5_block_reason"] = block_reason
+        df["phase5_hard_block"] = escape | (main_down & ~correction_completed)
+        df["phase5_wait_block"] = (main_up & low_base_reversal & ~correction_completed) | (box & ~correction_completed & ~impulsive)
+        pool = pd.Series("觀察池", index=df.index)
+        pool.loc[df["phase5_hard_block"],] = "高風險反彈池"
+        pool.loc[escape] = "禁追風控池"
+        pool.loc[main_up & low_base_reversal & ~correction_completed] = "主升拉回觀察池"
+        pool.loc[prebreakout & ~impulsive & ~df["phase5_hard_block"]] = "主升預突破觀察池"
+        pool.loc[impulsive] = "主升確認池"
+        df["phase5_candidate_pool"] = pool
+        labels = []
+        for _, r in df.iterrows():
+            label = f"{r.get('phase5_major_wave','')}/{r.get('phase5_minor_wave','')}/{r.get('phase5_rebound_type','')}"
+            if bool(r.get('phase5_escape_rally', False)):
+                label += "（逃命反彈風控）"
+            elif not bool(r.get('phase5_correction_completed', False)) and "反彈" in str(r.get('phase5_rebound_type','')):
+                label += "（修正未完成）"
+            labels.append(label)
+        df["phase5_wave_label"] = labels
+        if self.logger:
+            self.logger.strategy_trace("PHASE5_SEMANTIC_SUMMARY", {
+                "rows": int(len(df)),
+                "escape_rally": int(df["phase5_escape_rally"].fillna(False).sum()),
+                "impulsive_wave": int(df["phase5_impulsive_wave"].fillna(False).sum()),
+                "hard_block": int(df["phase5_hard_block"].fillna(False).sum()),
+                "prebreakout": int(df["phase5_impulse_stage"].astype(str).eq("PreBreakout").sum()),
+            })
+        return df
+
 class TeacherDecisionEngine:
     """Phase5：老師五態決策重平衡。
     決策順序：硬性風險先擋，再由低位階翻多、RR、分數與核心股狀態決定 BUY/LOW_BUY。
@@ -2261,6 +2394,8 @@ class TeacherDecisionEngine:
     def apply(self, df):
         if df is None or df.empty:
             return df
+        # V2.7.3：先建立Phase5語義/風控欄位，再進老師五態決策，避免報表與決策不同步。
+        df = TeacherPhase5SemanticEngine(self.logger).apply(df)
         score = _safe_series(df, "teacher_score", default=0).fillna(0)
         rr = _safe_series(df, "rr", default=0).fillna(0)
         close = _safe_series(df, "close")
@@ -2277,9 +2412,15 @@ class TeacherDecisionEngine:
         deviation = _safe_bool_series(df, "deviation_risk_flag")
         core_state = _safe_str_series(df, "core_leader_state", default="NE")
         core_ok = ~core_state.eq("核心轉弱")
+        phase5_hard_block = _safe_bool_series(df, "phase5_hard_block")
+        phase5_wait_block = _safe_bool_series(df, "phase5_wait_block")
+        phase5_escape = _safe_bool_series(df, "phase5_escape_rally")
+        phase5_impulsive = _safe_bool_series(df, "phase5_impulsive_wave")
+        phase5_pool = _safe_str_series(df, "phase5_candidate_pool")
+        phase5_block_reason = _safe_str_series(df, "phase5_block_reason")
         df["teacher_decision"] = "WATCH"
-        df.loc[hard_avoid | core_state.eq("核心轉弱"), "teacher_decision"] = "AVOID"
-        reduce_mask = ((k_warning.ne("") | wave | deviation) & ~hard_avoid & ~low_base_reversal)
+        df.loc[hard_avoid | core_state.eq("核心轉弱") | phase5_escape, "teacher_decision"] = "AVOID"
+        reduce_mask = ((k_warning.ne("") | wave | deviation | phase5_hard_block) & ~hard_avoid & ~low_base_reversal & ~phase5_escape)
         df.loc[reduce_mask & ~df["teacher_decision"].eq("AVOID"), "teacher_decision"] = "REDUCE"
         low_buy = (
             (score >= 55)
@@ -2288,6 +2429,7 @@ class TeacherDecisionEngine:
             & low_base_reversal
             & core_ok
             & ~hard_avoid
+            & ~phase5_hard_block
             & (close <= entry_high * 1.05)
         )
         breakout_or_pullback_confirm = low_base_reversal | (close > high20) | soft_released
@@ -2297,6 +2439,8 @@ class TeacherDecisionEngine:
             & breakout_or_pullback_confirm
             & core_ok
             & ~hard_avoid
+            & ~phase5_hard_block
+            & (phase5_impulsive | phase5_pool.isin(["主升確認池", "主升預突破觀察池", "主升拉回觀察池"]))
             & (close <= entry_high * 1.035)
             & ~wave
             & k_warning.eq("")
@@ -2310,6 +2454,8 @@ class TeacherDecisionEngine:
             reason_parts = []
             release_parts = []
             if str(r.get("hard_avoid_reason", "") or ""): reason_parts.append("硬性排除=" + str(r.get("hard_avoid_reason")))
+            if str(r.get("phase5_block_reason", "") or ""): reason_parts.append(str(r.get("phase5_block_reason")))
+            if str(r.get("phase5_candidate_pool", "") or ""): release_parts.append("Phase5候選池=" + str(r.get("phase5_candidate_pool")))
             if str(r.get("soft_avoid_reason", "") or ""):
                 if bool(r.get("low_base_reversal_flag", False)) and not str(r.get("hard_avoid_reason", "") or ""):
                     release_parts.append("低位階翻多覆蓋軟性壓力=" + str(r.get("soft_avoid_reason")))
@@ -2335,6 +2481,9 @@ class TeacherDecisionEngine:
                 f"wave={r.get('market_pullback_type','')};"
                 f"k_warning={r.get('k_warning_type','')};"
                 f"avoid_level={r.get('avoid_level','')};"
+                f"phase5={r.get('phase5_wave_label','')};"
+                f"phase5_pool={r.get('phase5_candidate_pool','')};"
+                f"phase5_block={r.get('phase5_block_reason','')};"
                 f"avoid={r.get('swap_reason','')}"
             )
             reasons.append(";".join(reason_parts))
@@ -2359,6 +2508,8 @@ class TeacherDecisionEngine:
             else:
                 pool.append("觀察")
         df["teacher_pool_type"] = pool
+        # V2.7.3：外顯老師股票池優先接Phase5候選池，避免主跌弱反彈混入主升池。
+        df.loc[phase5_pool.astype(str).ne(""), "teacher_pool_type"] = phase5_pool
 
         # Phase5 semantic fix：以老師五態重新同步 YES / WAIT / NO，避免 YES 與 BUY/LOW_BUY 語義打架。
         in_entry_zone = close.notna() & entry_low.notna() & entry_high.notna() & (close >= entry_low) & (close <= entry_high)
@@ -2370,8 +2521,11 @@ class TeacherDecisionEngine:
         watch_mask = df["teacher_decision"].eq("WATCH")
         reduce_mask2 = df["teacher_decision"].eq("REDUCE")
         avoid_mask2 = df["teacher_decision"].eq("AVOID")
-        df.loc[buy_mask, "teacher_execution_status"] = "YES"
-        df.loc[buy_mask, "teacher_execution_reason"] = "BUY主攻：核心風向未轉弱、無硬性排除、RR與位置符合"
+        buy_entry_ok = buy_mask & (in_entry_zone | (close <= entry_high * 1.01)) & ~phase5_hard_block & ~phase5_wait_block
+        df.loc[buy_entry_ok, "teacher_execution_status"] = "YES"
+        df.loc[buy_entry_ok, "teacher_execution_reason"] = "BUY主攻：核心風向未轉弱、無硬性排除、RR與Phase5位置符合"
+        df.loc[buy_mask & ~buy_entry_ok, "teacher_execution_status"] = "WAIT"
+        df.loc[buy_mask & ~buy_entry_ok, "teacher_execution_reason"] = "BUY條件成立但價格/Phase5尚待確認，等待回測或突破確認"
         df.loc[low_buy_mask & in_entry_zone, "teacher_execution_status"] = "YES"
         df.loc[low_buy_mask & in_entry_zone, "teacher_execution_reason"] = "LOW_BUY且已進入低接區，可分批"
         df.loc[low_buy_mask & ~in_entry_zone, "teacher_execution_status"] = "WAIT"
@@ -2382,6 +2536,10 @@ class TeacherDecisionEngine:
         df.loc[reduce_mask2, "teacher_execution_reason"] = "REDUCE：壓力或波段風險，禁止新增"
         df.loc[avoid_mask2, "teacher_execution_status"] = "NO"
         df.loc[avoid_mask2, "teacher_execution_reason"] = "AVOID：硬性排除或核心風向轉弱"
+        df.loc[phase5_escape, "teacher_execution_status"] = "NO"
+        df.loc[phase5_escape, "teacher_execution_reason"] = "Phase5逃命反彈風控：禁止新增"
+        df.loc[phase5_hard_block & ~phase5_escape, "teacher_execution_status"] = "WAIT"
+        df.loc[phase5_hard_block & ~phase5_escape, "teacher_execution_reason"] = "Phase5主跌弱反彈或修正未完成：只觀察不主攻"
         df["是否可下單"] = df["teacher_execution_status"]
 
         if self.logger:
@@ -2403,6 +2561,10 @@ class TeacherDecisionEngine:
                     "wave": r.get("market_pullback_type", ""),
                     "k_warning": r.get("k_warning_type", ""),
                     "avoid": r.get("swap_reason", ""),
+                    "phase5": r.get("phase5_wave_label", ""),
+                    "phase5_pool": r.get("phase5_candidate_pool", ""),
+                    "phase5_block": r.get("phase5_block_reason", ""),
+                    "impulse_stage": r.get("phase5_impulse_stage", ""),
                 })
         return df
 
@@ -2773,7 +2935,10 @@ class InstitutionalExcelWriter:
                 round(float(r.get("teacher_score",0) or 0),2), round(float(r.get("growth_score",0) or 0),2), round(float(r.get("value_score",0) or 0),2), round(float(r.get("eps_ttm", r.get("valuation_eps_ttm",0)) or 0),2), round(float(r.get("pe",0) or 0),2), round(float(r.get("dividend_yield",0) or 0),2),
                 round(float(r.get("yoy", r.get("revenue_yoy",0)) or 0),2), round(float(r.get("institutional_score",0) or 0),2), round(float(r.get("pct_20d",0) or 0),2), round(float(r.get("low_base_score",0) or 0),2), round(float(r.get("kline_score",0) or 0),2),
                 round(float(r.get("ma_support_score",0) or 0),2), round(float(r.get("volume_health_score",0) or 0),2), round(float(r.get("revenue_eps_score",0) or 0),2), r.get("操作策略", ""), r.get("exclude_reason", ""),
-                "Y" if bool(r.get("low_base_reversal_flag", False)) else "", r.get("decision_release_reason", ""), r.get("hard_avoid_reason", ""), r.get("soft_avoid_reason", ""), r.get("pressure_line_state", "")
+                "Y" if bool(r.get("low_base_reversal_flag", False)) else "", r.get("decision_release_reason", ""), r.get("hard_avoid_reason", ""), r.get("soft_avoid_reason", ""), r.get("pressure_line_state", ""),
+                r.get("phase5_major_wave", ""), r.get("phase5_minor_wave", ""), r.get("phase5_correction_type", ""), r.get("phase5_fibo_retrace", ""), r.get("phase5_rebound_type", ""),
+                "Y" if bool(r.get("phase5_correction_completed", False)) else "N", "Y" if bool(r.get("phase5_escape_rally", False)) else "N", "Y" if bool(r.get("phase5_impulsive_wave", False)) else "N", r.get("phase5_candidate_pool", ""), r.get("phase5_block_reason", ""),
+                r.get("decision_buy_count", ""), r.get("decision_avoid_count", ""), r.get("latest_downgrade_reason", r.get("teacher_execution_reason", ""))
             ])
         return rows
 
@@ -2842,6 +3007,7 @@ class InstitutionalExcelWriter:
         ws.append(["阪田警訊", "SakataRiskPatternEngine：流星/空頭新星十字/墓碑線/長黑K", "觸發後壓力先賣或等待2日確認"])
         ws.append(["排除換股", "AvoidSwapEngine：兩高不過/下降軌道/頸線壓力未突破/乖離過大", "符合者不得列主攻"])
         ws.append(["老師決策", "BUY / LOW_BUY / WATCH / REDUCE / AVOID", "保留是否可下單YES/WAIT/NO，但新增老師五態決策"])
+        ws.append(["Phase5語義一致性", "大波/小波/回撤/反彈/逃命/推動浪/候選池", "主跌弱反彈不得混入主升池；BUY需通過Phase5與進場區Gate"])
         # Phase5 datasets：由TeacherFullReportBuilder集中切分，Writer只負責寫表。
         datasets = TeacherFullReportBuilder(self.logger).build(df)
         report_sheet_map = [
@@ -2889,6 +3055,9 @@ class InstitutionalExcelWriter:
             ("波段修正", "wave_correction_flag" in df.columns, "WARN" if ("wave_correction_flag" in df.columns and int(df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False).sum()) == 0) else ("PASS" if "wave_correction_flag" in df.columns else "FAIL"), int(df.get("wave_correction_flag", pd.Series(False, index=df.index)).fillna(False).sum()) if "wave_correction_flag" in df.columns else 0),
             ("低位階翻多", "low_base_reversal_flag" in df.columns, "PASS" if "low_base_reversal_flag" in df.columns else "FAIL", int(df.get("low_base_reversal_flag", pd.Series(False, index=df.index)).fillna(False).sum()) if "low_base_reversal_flag" in df.columns else 0),
             ("Hard/Soft Avoid", "hard_avoid_flag" in df.columns and "soft_avoid_flag" in df.columns, "PASS" if "hard_avoid_flag" in df.columns and "soft_avoid_flag" in df.columns else "FAIL", f"hard={int(df.get('hard_avoid_flag', pd.Series(False,index=df.index)).fillna(False).sum()) if 'hard_avoid_flag' in df.columns else 0};soft={int(df.get('soft_avoid_flag', pd.Series(False,index=df.index)).fillna(False).sum()) if 'soft_avoid_flag' in df.columns else 0}"),
+            ("Phase5候選池", "phase5_candidate_pool" in df.columns, "PASS" if "phase5_candidate_pool" in df.columns else "FAIL", int(df.get("phase5_candidate_pool", pd.Series("", index=df.index)).astype(str).ne("").sum()) if "phase5_candidate_pool" in df.columns else 0),
+            ("Phase5逃命反彈", "phase5_escape_rally" in df.columns, "PASS" if "phase5_escape_rally" in df.columns else "FAIL", int(df.get("phase5_escape_rally", pd.Series(False, index=df.index)).fillna(False).sum()) if "phase5_escape_rally" in df.columns else 0),
+            ("Phase5推動浪", "phase5_impulsive_wave" in df.columns, "PASS" if "phase5_impulsive_wave" in df.columns else "FAIL", int(df.get("phase5_impulsive_wave", pd.Series(False, index=df.index)).fillna(False).sum()) if "phase5_impulsive_wave" in df.columns else 0),
         ]
         for row in validation_rows:
             ws.append(list(row))
@@ -2912,7 +3081,10 @@ class InstitutionalExcelWriter:
         ws.append(["P5-07", "Strategy Validation", "已修改", "12_策略命中驗證", "保留待追蹤；新增樣本分布與後續計算接口"] )
         ws.append(["P5-08", "GUI/CLI語意", "已修改", "run_gui / argparse", "新增macro_teacher/teacher_full模式並更新說明"] )
         ws.append(["P5-09", "報表缺失防呆", "已修改", "ReportValidator/ExcelWriter", "輸出後檢查00~16，缺失寫TEACHER_REPORT_VALIDATE_FAIL"] )
-        ws.append(["P5-10", "成熟度標記", "已修改", "VERSION/STRATEGY_VERSION", "升級為2.7.2-teacher-phase5-semantic-fix"] )
+        ws.append(["P5-10", "成熟度標記", "已修改", "VERSION/STRATEGY_VERSION", "升級為2.7.3-teacher-phase5-consistency-fix"] )
+        ws.append(["P7-01", "Phase5語義一致性引擎", "已修改", "TeacherPhase5SemanticEngine", "新增大波/小波/回撤/反彈/逃命/推動浪與候選池欄位"] )
+        ws.append(["P7-02", "Phase5候選池Gate", "已修改", "TeacherDecisionEngine", "主跌修正浪/逃命反彈不得進BUY/YES；只進高風險反彈池或禁追風控池"] )
+        ws.append(["P7-03", "動態決策欄位", "已修改", "REPORT_COLUMNS/_report_rows", "新增期間BUY/AVOID次數與最後降級原因欄位，供盤中log差異追蹤"] )
         ws.append(["P6-01", "YES/WAIT/NO語義同步", "已修改", "TeacherDecisionEngine", "以老師五態重新同步是否可下單與teacher_execution_status，避免YES與BUY/LOW_BUY打架"] )
         ws.append(["P6-02", "16表名稱修正", "已修改", "EXPECTED_INSTITUTIONAL_SHEETS/Writer", "16_BUY_LOW_BUY放行原因改為16_放行與觀察候選，避免內含WATCH時語義錯誤"] )
         ws.append(["P6-03", "波段修正零樣本WARN", "已修改", "MarketRegimeEngine/10_老師策略驗收", "wave_correction_count=0改列WARN並寫入log，不再誤判為完全PASS"] )
@@ -3217,7 +3389,7 @@ class Macro16Engine:
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
-        self.logger.info("CHANGELOG v2.7.0: Phase5 full report - LowBaseReversalEngine, hard/soft avoid, BUY/LOW_BUY rebalance, 00~16 teacher report, TEACHER_REPORT_READY")
+        self.logger.info("CHANGELOG v2.7.3: Phase5 consistency - TeacherPhase5SemanticEngine, candidate_pool Gate, execution Gate, report Phase5 fields, TEACHER_REPORT_READY")
         self.logger.strategy_trace("STRATEGY_VERSION", {"strategy_version": STRATEGY_VERSION, "program_version": VERSION})
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
