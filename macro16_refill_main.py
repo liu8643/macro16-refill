@@ -53,8 +53,8 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.8.1-cpo-theme-engine"
-STRATEGY_VERSION = "teacher_strategy_v1.9_cpo_theme_engine_prebreakout_sop_20260524"
+VERSION = "2.8.2-cpo-prebreakout-intersection"
+STRATEGY_VERSION = "teacher_strategy_v2.0_cpo_prebreakout_intersection_20260524"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -3609,7 +3609,7 @@ class CPOReportExcelIntegrator:
     2. CPO爆發前候選：CPO股票 × Phase5/Teacher/TradePlan。
     3. CPO整合驗收：確認資料流是否完整。
     """
-    SHEETS = ["CPO股票池", "CPO爆發前候選", "CPO整合驗收"]
+    SHEETS = ["CPO股票池", "CPO股票池決策", "CPO×爆發前交集", "CPO整合驗收"]
 
     def __init__(self, logger: Optional[Macro16Logger] = None):
         self.logger = logger
@@ -3650,6 +3650,7 @@ class CPOReportExcelIntegrator:
                     self.logger.warning(f"CPO_THEME_ENGINE_APPLY_FAIL error={exc}")
         self._write_master(wb)
         self._write_prebreakout_candidates(wb, merged_df)
+        self._write_cpo_prebreakout_intersection(wb, merged_df)
         self._write_validation(wb, merged_df)
         if self.logger:
             self.logger.info("CPO_REPORT_WRITTEN sheets=" + ",".join(self.SHEETS))
@@ -3694,7 +3695,7 @@ class CPOReportExcelIntegrator:
         return "WATCH", "CPO股票池標的，條件未完整確認"
 
     def _write_prebreakout_candidates(self, wb, merged_df):
-        ws = self._sheet(wb, "CPO爆發前候選")
+        ws = self._sheet(wb, "CPO股票池決策")
         ws.append(CPO_REPORT_COLUMNS)
         if merged_df is None or pd is None or getattr(merged_df, "empty", True):
             ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "未提供DB或老師策略資料，僅輸出CPO股票池", "NO_DB"])
@@ -3744,20 +3745,117 @@ class CPOReportExcelIntegrator:
             ])
         self._style_basic(ws)
 
+    def _build_strict_intersection_df(self, merged_df):
+        """V2.8.2：真正 CPO × 爆發前嚴格交集。
+        定義：CPO_THEME_MASTER 代號 ∩ 爆發前候選條件（Phase5/Wave/Compression/主升預突破）。
+        注意：本表不是全CPO股票池；若0檔，必須輸出0檔原因，避免誤導為可主攻。
+        """
+        if merged_df is None or pd is None or getattr(merged_df, "empty", True):
+            return None
+        df = merged_df.copy()
+        if "is_cpo" not in df.columns:
+            df = self.engine.apply(df)
+        if "stock_id" not in df.columns:
+            return pd.DataFrame()
+        for col in ["phase5_position_score", "rr", "teacher_score", "vol5", "vol20"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "prebreakout_volume_ratio" not in df.columns:
+            vol5 = df["vol5"] if "vol5" in df.columns else pd.Series(index=df.index, dtype=float)
+            vol20 = df["vol20"] if "vol20" in df.columns else pd.Series(index=df.index, dtype=float)
+            df["prebreakout_volume_ratio"] = (vol5 / vol20.replace(0, math.nan)).replace([math.inf, -math.inf], math.nan)
+        wave_phase = df.get("phase5_wave_phase", pd.Series("", index=df.index)).astype(str)
+        breakout_stage = df.get("phase5_breakout_stage", pd.Series("", index=df.index)).astype(str)
+        pool = df.get("phase5_candidate_pool", pd.Series("", index=df.index)).astype(str)
+        strict_mask = (
+            df.get("is_cpo", pd.Series(False, index=df.index)).fillna(False)
+            & (
+                wave_phase.isin(["Wave3_PreBreakout", "Wave3_Breakout", "Wave3_Expansion"])
+                | breakout_stage.isin(["Compression", "PreBreakout", "Breakout", "Expansion"])
+                | pool.str.contains("預突破|主升", na=False)
+            )
+        )
+        inter = df.loc[strict_mask].copy()
+        if inter.empty:
+            return inter
+        if "cpo_prebreakout_decision" not in inter.columns:
+            decisions, reasons = [], []
+            for _, row in inter.iterrows():
+                d, reason = self._candidate_decision(row)
+                decisions.append(d); reasons.append(reason)
+            inter["cpo_prebreakout_decision"] = decisions
+            inter["cpo_prebreakout_reason"] = reasons
+        inter["_rank"] = inter["cpo_prebreakout_decision"].map({"BUY":1,"LOW_BUY":2,"WATCH":3,"REDUCE":4,"AVOID":5}).fillna(9)
+        return inter.sort_values(["_rank","cpo_score","phase5_position_score","rr","prebreakout_volume_ratio"], ascending=[True, False, False, False, False])
+
+    def _write_cpo_prebreakout_intersection(self, wb, merged_df):
+        ws = self._sheet(wb, "CPO×爆發前交集")
+        headers = [
+            "排名", "代號", "名稱", "CPO主題", "CPO子分類", "CPO分數", "CPO直接性",
+            "老師決策", "是否可下單", "波段階段", "突破階段", "Phase5候選池",
+            "波段位置分", "量比", "RR", "CPO爆發前決策", "交集判定", "原因/風險", "資料狀態"
+        ]
+        ws.append(headers)
+        inter = self._build_strict_intersection_df(merged_df)
+        if inter is None:
+            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "NO_DB", "未提供DB或InstitutionalReportEngine未產出，無法計算嚴格交集", "NO_DB"])
+            self._style_basic(ws)
+            return
+        if getattr(inter, "empty", True):
+            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "無", "STRICT_INTERSECTION_ZERO", "CPO股票池與爆發前候選條件交集為0；代表目前沒有CPO主攻爆發前清單，僅能列CPO觀察池", "ZERO_MATCH"])
+            self._style_basic(ws)
+            return
+        for n, (_, r) in enumerate(inter.head(80).iterrows(), start=1):
+            reason = str(r.get("cpo_prebreakout_reason", "") or "")
+            risk = " ".join([
+                str(r.get("hard_avoid_reason", "") or ""),
+                str(r.get("k_warning_type", "") or ""),
+                str(r.get("phase5_block_reason", "") or ""),
+            ]).strip()
+            ws.append([
+                n,
+                str(r.get("stock_id", "")).zfill(4),
+                r.get("report_name", r.get("stock_name", r.get("name", ""))),
+                r.get("cpo_theme", ""),
+                r.get("cpo_subtheme", ""),
+                round(_safe_float(r.get("cpo_score"), 0), 2),
+                r.get("cpo_directness", ""),
+                r.get("teacher_decision", ""),
+                r.get("teacher_execution_status", r.get("是否可下單", "")),
+                r.get("phase5_wave_phase", ""),
+                r.get("phase5_breakout_stage", ""),
+                r.get("phase5_candidate_pool", ""),
+                round(_safe_float(r.get("phase5_position_score"), 0), 2),
+                round(_safe_float(r.get("prebreakout_volume_ratio"), 0), 2),
+                round(_safe_float(r.get("rr"), 0), 2),
+                r.get("cpo_prebreakout_decision", "WATCH"),
+                "STRICT_MATCH",
+                (reason + ("；風險=" + risk[:120] if risk else ""))[:250],
+                "DB_OK",
+            ])
+        self._style_basic(ws)
+
     def _write_validation(self, wb, merged_df):
         ws = self._sheet(wb, "CPO整合驗收")
         master_count = len(CPO_THEME_MASTER)
         merged_count = 0
         candidate_count = 0
+        strict_count = 0
         if merged_df is not None and pd is not None and not getattr(merged_df, "empty", True):
             if "is_cpo" in merged_df.columns:
                 merged_count = int(merged_df["is_cpo"].fillna(False).sum())
                 candidate_count = merged_count
+            try:
+                inter = self._build_strict_intersection_df(merged_df)
+                strict_count = 0 if inter is None or getattr(inter, "empty", True) else int(len(inter))
+            except Exception:
+                strict_count = 0
         rows = [
             ["查核項目", "結果", "說明"],
             ["CPO_THEME_MASTER檔數", master_count, "固定股票池，不依賴DB"],
             ["DB合併命中數", merged_count, "institutional_report['all']與CPO_THEME_MASTER交集"],
-            ["CPO爆發前候選數", candidate_count, "有DB時由CPO股票×Phase5/Teacher/TradePlan產生"],
+            ["CPO股票池決策數", candidate_count, "有DB時由全CPO股票池×Phase5/Teacher/TradePlan產生，不等於嚴格爆發前交集"],
+            ["CPO×爆發前嚴格交集數", strict_count, "CPO_THEME_MASTER ∩ 爆發前候選條件；0檔代表目前無CPO主攻爆發前清單"],
             ["無DB保護", "PASS", "無DB仍輸出CPO股票池，候選頁顯示待DB"],
             ["Excel頁面", ",".join(self.SHEETS), "需與主程式輸出一致"],
             ["Log驗收", "CPO_THEME_MASTER_READY / CPO_REPORT_WRITTEN", "可grep追蹤"],
@@ -3892,20 +3990,26 @@ class PreBreakoutSOPExcelIntegrator:
     def _write_candidates(self, wb, institutional_report: Optional[Dict[str, Any]] = None):
         ws = self._sheet(wb, "爆發前股票候選")
         headers = [
-            "排名", "代號", "名稱", "老師決策", "是否可下單", "波段階段", "突破階段", "波段位置分",
+            "排名", "代號", "名稱", "是否CPO", "CPO主題", "CPO子分類", "CPO分數", "CPO策略定位",
+            "老師決策", "是否可下單", "波段階段", "突破階段", "波段位置分",
             "量比", "RR", "買進下緣", "買進上緣", "停損", "目標1", "目標2",
             "爆發前決策", "爆發前原因", "風險旗標", "資料狀態"
         ]
         ws.append(headers)
         if not institutional_report or "all" not in institutional_report or institutional_report.get("all") is None or pd is None:
-            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "未提供DB或InstitutionalReportEngine未產出，僅輸出SOP規格頁", "待DB", "NO_DB"])
+            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "未提供DB或InstitutionalReportEngine未產出，僅輸出SOP規格頁", "待DB", "NO_DB"])
             return
         df = institutional_report.get("all")
         if df is None or getattr(df, "empty", True):
-            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "DB資料為空，無法產生候選", "待DB", "EMPTY"])
+            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "DB資料為空，無法產生候選", "待DB", "EMPTY"])
             return
         data = df.copy()
-        for c in ["teacher_score", "phase5_position_score", "rr", "entry_low", "entry_high", "stop_loss", "target_1", "target_2", "vol5", "vol20"]:
+        try:
+            data = CPOThemeEngine(self.logger).apply(data)
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(f"PREBREAKOUT_CPO_MERGE_FAIL error={exc}")
+        for c in ["teacher_score", "phase5_position_score", "rr", "entry_low", "entry_high", "stop_loss", "target_1", "target_2", "vol5", "vol20", "cpo_score"]:
             if c in data.columns:
                 data[c] = pd.to_numeric(data[c], errors="coerce")
         if "prebreakout_volume_ratio" not in data.columns:
@@ -3974,10 +4078,16 @@ class PreBreakoutSOPExcelIntegrator:
         candidates["_decision_rank"] = candidates["prebreakout_decision"].map({"BUY": 1, "LOW_BUY": 2, "WATCH": 3, "REDUCE": 4, "AVOID": 5}).fillna(9)
         candidates = candidates.sort_values(["_decision_rank", "phase5_position_score", "rr", "prebreakout_volume_ratio"], ascending=[True, False, False, False]).head(60)
         for n, (_, r) in enumerate(candidates.iterrows(), start=1):
+            is_cpo = bool(r.get("is_cpo", False))
             ws.append([
                 n,
                 str(r.get("stock_id", "")).zfill(4) if str(r.get("stock_id", "")).strip() else "",
                 r.get("report_name", r.get("stock_name", r.get("name", ""))),
+                "Y" if is_cpo else "N",
+                r.get("cpo_theme", "") if is_cpo else "",
+                r.get("cpo_subtheme", "") if is_cpo else "",
+                round(_safe_float(r.get("cpo_score"), 0), 2) if is_cpo else "",
+                r.get("cpo_strategy", "") if is_cpo else "",
                 r.get("teacher_decision", ""),
                 r.get("teacher_execution_status", r.get("是否可下單", "")),
                 r.get("phase5_wave_phase", ""),
@@ -4274,7 +4384,7 @@ class Macro16Engine:
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
-        self.logger.info("CHANGELOG v2.8.1: Add CPO_THEME_MASTER, CPOThemeEngine, CPOReportExcelIntegrator and CPO x PreBreakout output")
+        self.logger.info("CHANGELOG v2.8.2: Add strict CPO×PreBreakout intersection sheet and CPO columns in PreBreakout candidates")
         self.logger.strategy_trace("STRATEGY_VERSION", {"strategy_version": STRATEGY_VERSION, "program_version": VERSION})
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
