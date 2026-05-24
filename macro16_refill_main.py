@@ -53,8 +53,8 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "2.7.4-position-engine-fix"
-STRATEGY_VERSION = "teacher_strategy_v1.7_reduce_page_20260511"
+VERSION = "2.8.1-cpo-theme-engine"
+STRATEGY_VERSION = "teacher_strategy_v1.9_cpo_theme_engine_prebreakout_sop_20260524"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
 
@@ -3219,6 +3219,784 @@ class InstitutionalExcelWriter:
             self.logger.info("TEACHER_REPORT_VALIDATE_OK sheets=00_16_teacher_strategy_reports")
             self.logger.info("INSTITUTIONAL_REPORT_VALIDATE_OK")
 
+
+
+# =============================
+# V2.8.1 CPO Theme Engine / CPO股票池落地
+# =============================
+CPO_THEME_MASTER = [
+    {
+        "stock_id": "2330",
+        "stock_name": "台積電",
+        "cpo_theme": "先進封裝/矽光平台",
+        "cpo_subtheme": "CoWoS/SiPh平台",
+        "cpo_layer": "核心基礎設施",
+        "cpo_score": 94,
+        "cpo_strategy": "長期核心配置",
+        "cpo_directness": "直接/平台",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "CPO/矽光子/先進封裝平台核心"
+    },
+    {
+        "stock_id": "4979",
+        "stock_name": "華星光",
+        "cpo_theme": "光收發/光通訊",
+        "cpo_subtheme": "光模組/收發元件",
+        "cpo_layer": "高彈性主題股",
+        "cpo_score": 93,
+        "cpo_strategy": "波段主攻但需嚴控停損",
+        "cpo_directness": "直接",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "CPO/高速光通訊代表股"
+    },
+    {
+        "stock_id": "3081",
+        "stock_name": "聯亞",
+        "cpo_theme": "磊晶/雷射",
+        "cpo_subtheme": "雷射/磊晶上游",
+        "cpo_layer": "雷射上游",
+        "cpo_score": 88,
+        "cpo_strategy": "中長期觀察",
+        "cpo_directness": "直接",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "光源/雷射上游"
+    },
+    {
+        "stock_id": "3363",
+        "stock_name": "上詮",
+        "cpo_theme": "光通訊元件",
+        "cpo_subtheme": "光纖/光元件",
+        "cpo_layer": "元件彈性",
+        "cpo_score": 84,
+        "cpo_strategy": "短中期波段",
+        "cpo_directness": "直接",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "光通訊元件"
+    },
+    {
+        "stock_id": "3163",
+        "stock_name": "波若威",
+        "cpo_theme": "光纖元件",
+        "cpo_subtheme": "光纖/連接元件",
+        "cpo_layer": "光元件",
+        "cpo_score": 84,
+        "cpo_strategy": "短中期波段",
+        "cpo_directness": "直接",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "光纖元件與模組題材"
+    },
+    {
+        "stock_id": "4908",
+        "stock_name": "前鼎",
+        "cpo_theme": "光通訊模組",
+        "cpo_subtheme": "光模組",
+        "cpo_layer": "模組彈性",
+        "cpo_score": 82,
+        "cpo_strategy": "波段觀察",
+        "cpo_directness": "直接",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "光模組題材"
+    },
+    {
+        "stock_id": "6669",
+        "stock_name": "緯穎",
+        "cpo_theme": "AI Server/資料中心",
+        "cpo_subtheme": "AI伺服器",
+        "cpo_layer": "AI Server核心",
+        "cpo_score": 82,
+        "cpo_strategy": "中長期核心觀察",
+        "cpo_directness": "間接/系統",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "AI資料中心系統端，受惠光互連升級"
+    },
+    {
+        "stock_id": "2345",
+        "stock_name": "智邦",
+        "cpo_theme": "資料中心交換器",
+        "cpo_subtheme": "Switch/網通",
+        "cpo_layer": "Switch核心",
+        "cpo_score": 90,
+        "cpo_strategy": "中長期核心配置",
+        "cpo_directness": "直接/系統",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "交換器/網通，CPO交換器方向"
+    },
+    {
+        "stock_id": "3443",
+        "stock_name": "創意",
+        "cpo_theme": "ASIC/高速SerDes",
+        "cpo_subtheme": "ASIC/SerDes",
+        "cpo_layer": "ASIC槓桿",
+        "cpo_score": 86,
+        "cpo_strategy": "中長期核心觀察",
+        "cpo_directness": "間接/晶片",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "ASIC高速介面/IP設計受惠"
+    },
+    {
+        "stock_id": "3035",
+        "stock_name": "智原",
+        "cpo_theme": "IP/ASIC/高速介面",
+        "cpo_subtheme": "ASIC/IP",
+        "cpo_layer": "ASIC/IP",
+        "cpo_score": 80,
+        "cpo_strategy": "中期波段",
+        "cpo_directness": "間接/晶片",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "ASIC/IP高速傳輸"
+    },
+    {
+        "stock_id": "6531",
+        "stock_name": "愛普*",
+        "cpo_theme": "記憶體/IP/矽光潛在平台",
+        "cpo_subtheme": "IP/記憶體",
+        "cpo_layer": "題材彈性",
+        "cpo_score": 78,
+        "cpo_strategy": "中長期觀察/波段",
+        "cpo_directness": "間接/平台",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "AI記憶體/IP與平台題材"
+    },
+    {
+        "stock_id": "6533",
+        "stock_name": "晶心科",
+        "cpo_theme": "RISC-V/IP/ASIC",
+        "cpo_subtheme": "IP/ASIC",
+        "cpo_layer": "ASIC/IP",
+        "cpo_score": 76,
+        "cpo_strategy": "中期觀察",
+        "cpo_directness": "間接/晶片",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "ASIC/IP延伸題材"
+    },
+    {
+        "stock_id": "2383",
+        "stock_name": "台光電",
+        "cpo_theme": "低損耗材料/CCL",
+        "cpo_subtheme": "材料/CCL",
+        "cpo_layer": "材料核心",
+        "cpo_score": 90,
+        "cpo_strategy": "中長期核心配置",
+        "cpo_directness": "間接/材料",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "高速PCB低損耗材料"
+    },
+    {
+        "stock_id": "6274",
+        "stock_name": "台燿",
+        "cpo_theme": "低損耗材料",
+        "cpo_subtheme": "材料/CCL",
+        "cpo_layer": "材料受惠",
+        "cpo_score": 84,
+        "cpo_strategy": "中期佈局",
+        "cpo_directness": "間接/材料",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "高速材料受惠"
+    },
+    {
+        "stock_id": "6213",
+        "stock_name": "聯茂",
+        "cpo_theme": "CCL材料",
+        "cpo_subtheme": "材料/CCL",
+        "cpo_layer": "材料補漲",
+        "cpo_score": 72,
+        "cpo_strategy": "觀察/低接",
+        "cpo_directness": "間接/材料",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "高速材料補漲題材"
+    },
+    {
+        "stock_id": "3037",
+        "stock_name": "欣興",
+        "cpo_theme": "高階PCB/載板",
+        "cpo_subtheme": "PCB/載板",
+        "cpo_layer": "PCB+載板",
+        "cpo_score": 82,
+        "cpo_strategy": "短中長期分批",
+        "cpo_directness": "間接/PCB",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "AI高速PCB與載板"
+    },
+    {
+        "stock_id": "3189",
+        "stock_name": "景碩",
+        "cpo_theme": "ABF/載板",
+        "cpo_subtheme": "ABF載板",
+        "cpo_layer": "載板復甦",
+        "cpo_score": 78,
+        "cpo_strategy": "中期佈局",
+        "cpo_directness": "間接/PCB",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "ABF/載板受惠"
+    },
+    {
+        "stock_id": "8046",
+        "stock_name": "南電",
+        "cpo_theme": "ABF/載板",
+        "cpo_subtheme": "ABF載板",
+        "cpo_layer": "載板復甦",
+        "cpo_score": 78,
+        "cpo_strategy": "中期佈局",
+        "cpo_directness": "間接/PCB",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "ABF/載板受惠"
+    },
+    {
+        "stock_id": "2313",
+        "stock_name": "華通",
+        "cpo_theme": "高階PCB",
+        "cpo_subtheme": "PCB",
+        "cpo_layer": "PCB受惠",
+        "cpo_score": 72,
+        "cpo_strategy": "中期觀察",
+        "cpo_directness": "間接/PCB",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "高階PCB題材"
+    },
+    {
+        "stock_id": "3665",
+        "stock_name": "貿聯-KY",
+        "cpo_theme": "高速線束/連接",
+        "cpo_subtheme": "連接/線束",
+        "cpo_layer": "過渡期受惠",
+        "cpo_score": 80,
+        "cpo_strategy": "2025-2027主軸",
+        "cpo_directness": "間接/連接",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "去纜線化過渡期與高速連接"
+    },
+    {
+        "stock_id": "3711",
+        "stock_name": "日月光投控",
+        "cpo_theme": "先進封裝/SiP",
+        "cpo_subtheme": "封測/封裝",
+        "cpo_layer": "封測核心",
+        "cpo_score": 78,
+        "cpo_strategy": "中長期觀察",
+        "cpo_directness": "間接/封測",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "先進封裝/封測鏈"
+    },
+    {
+        "stock_id": "2308",
+        "stock_name": "台達電",
+        "cpo_theme": "電源/散熱/資料中心",
+        "cpo_subtheme": "電源/散熱",
+        "cpo_layer": "基建核心",
+        "cpo_score": 76,
+        "cpo_strategy": "中長期配置",
+        "cpo_directness": "間接/基建",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "AI Data Center基建"
+    },
+    {
+        "stock_id": "2356",
+        "stock_name": "英業達",
+        "cpo_theme": "AI Server ODM",
+        "cpo_subtheme": "AI伺服器",
+        "cpo_layer": "ODM受惠",
+        "cpo_score": 70,
+        "cpo_strategy": "觀察",
+        "cpo_directness": "間接/系統",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "系統端受惠"
+    },
+    {
+        "stock_id": "2382",
+        "stock_name": "廣達",
+        "cpo_theme": "AI Server ODM",
+        "cpo_subtheme": "AI伺服器",
+        "cpo_layer": "ODM核心",
+        "cpo_score": 76,
+        "cpo_strategy": "中長期觀察",
+        "cpo_directness": "間接/系統",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "AI Server供應鏈"
+    },
+    {
+        "stock_id": "3231",
+        "stock_name": "緯創",
+        "cpo_theme": "AI Server ODM",
+        "cpo_subtheme": "AI伺服器",
+        "cpo_layer": "ODM受惠",
+        "cpo_score": 72,
+        "cpo_strategy": "觀察/波段",
+        "cpo_directness": "間接/系統",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "AI Server供應鏈"
+    },
+    {
+        "stock_id": "3017",
+        "stock_name": "奇鋐",
+        "cpo_theme": "散熱",
+        "cpo_subtheme": "散熱",
+        "cpo_layer": "散熱核心",
+        "cpo_score": 74,
+        "cpo_strategy": "中期波段",
+        "cpo_directness": "間接/散熱",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "光電混合/AI機櫃散熱升級"
+    },
+    {
+        "stock_id": "3324",
+        "stock_name": "雙鴻",
+        "cpo_theme": "散熱",
+        "cpo_subtheme": "散熱",
+        "cpo_layer": "散熱受惠",
+        "cpo_score": 72,
+        "cpo_strategy": "觀察/波段",
+        "cpo_directness": "間接/散熱",
+        "cpo_source": "CPO_THEME_MASTER",
+        "cpo_note": "AI機櫃散熱升級"
+    }
+]
+
+CPO_REPORT_COLUMNS = [
+    "排名", "代號", "名稱", "CPO主題", "CPO子分類", "CPO分層", "CPO分數",
+    "直接性", "策略定位", "老師決策", "是否可下單", "波段階段", "突破階段",
+    "波段位置分", "RR", "CPO爆發前決策", "CPO爆發前原因", "資料狀態"
+]
+
+class CPOThemeEngine:
+    """
+    V2.8.1：CPO股票池引擎。
+    目的：
+    1. 將CPO_THEME_MASTER落地成可合併資料框，不再只有頁面名稱。
+    2. 若有institutional_report['all']，將is_cpo/cpo_theme/cpo_score等欄位合併回主資料流。
+    3. 無DB時仍能輸出完整CPO股票池，避免CPO頁空白。
+    """
+    def __init__(self, logger: Optional[Macro16Logger] = None):
+        self.logger = logger
+
+    def master_df(self):
+        if pd is None:
+            return CPO_THEME_MASTER
+        df = pd.DataFrame(CPO_THEME_MASTER)
+        if not df.empty:
+            df["stock_id"] = df["stock_id"].astype(str).str.zfill(4)
+            df["cpo_score"] = pd.to_numeric(df["cpo_score"], errors="coerce").fillna(0)
+        return df
+
+    def apply(self, df):
+        if df is None or pd is None or getattr(df, "empty", True):
+            return df
+        master = self.master_df()
+        if isinstance(master, list) or master.empty:
+            return df
+        out = df.copy()
+        if "stock_id" not in out.columns:
+            out["is_cpo"] = False
+            return out
+        out["stock_id"] = out["stock_id"].astype(str).str.zfill(4)
+        drop_cols = [c for c in ["is_cpo","cpo_theme","cpo_subtheme","cpo_layer","cpo_score","cpo_strategy","cpo_directness","cpo_source","cpo_note"] if c in out.columns]
+        if drop_cols:
+            out = out.drop(columns=drop_cols)
+        out = out.merge(master, on="stock_id", how="left")
+        out["is_cpo"] = out["cpo_theme"].notna()
+        out["cpo_score"] = pd.to_numeric(out["cpo_score"], errors="coerce").fillna(0)
+        if self.logger:
+            self.logger.info(
+                "CPO_THEME_MASTER_READY "
+                f"master_count={len(master)} merged_count={int(out['is_cpo'].sum())}"
+            )
+        return out
+
+class CPOReportExcelIntegrator:
+    """
+    V2.8.1：CPO報表輸出整合器。
+    輸出：
+    1. CPO股票池：固定Universe，不依賴DB。
+    2. CPO爆發前候選：CPO股票 × Phase5/Teacher/TradePlan。
+    3. CPO整合驗收：確認資料流是否完整。
+    """
+    SHEETS = ["CPO股票池", "CPO爆發前候選", "CPO整合驗收"]
+
+    def __init__(self, logger: Optional[Macro16Logger] = None):
+        self.logger = logger
+        self.engine = CPOThemeEngine(logger)
+
+    def _sheet(self, wb, name: str):
+        if name in wb.sheetnames:
+            ws = wb[name]
+            ws.delete_rows(1, ws.max_row)
+        else:
+            ws = wb.create_sheet(name)
+        return ws
+
+    def _style_basic(self, ws):
+        try:
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1F4E78")
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            for row in ws.iter_rows():
+                for cell in row:
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+            for col in range(1, ws.max_column + 1):
+                letter = get_column_letter(col)
+                ws.column_dimensions[letter].width = min(max(12, len(str(ws.cell(1, col).value or "")) + 4), 28)
+            ws.freeze_panes = "A2"
+        except Exception:
+            pass
+
+    def write_into_workbook(self, wb, institutional_report: Optional[Dict[str, Any]] = None):
+        merged_df = None
+        if institutional_report is not None and institutional_report.get("all") is not None and pd is not None:
+            try:
+                merged_df = self.engine.apply(institutional_report.get("all"))
+                institutional_report["all"] = merged_df
+            except Exception as exc:
+                if self.logger:
+                    self.logger.warning(f"CPO_THEME_ENGINE_APPLY_FAIL error={exc}")
+        self._write_master(wb)
+        self._write_prebreakout_candidates(wb, merged_df)
+        self._write_validation(wb, merged_df)
+        if self.logger:
+            self.logger.info("CPO_REPORT_WRITTEN sheets=" + ",".join(self.SHEETS))
+        return wb
+
+    def _write_master(self, wb):
+        ws = self._sheet(wb, "CPO股票池")
+        headers = ["代號","公司","CPO主題","CPO子分類","CPO分層","CPO分數","直接性","策略定位","資料來源","備註"]
+        ws.append(headers)
+        for item in CPO_THEME_MASTER:
+            ws.append([
+                item.get("stock_id",""), item.get("stock_name",""), item.get("cpo_theme",""),
+                item.get("cpo_subtheme",""), item.get("cpo_layer",""), item.get("cpo_score",""),
+                item.get("cpo_directness",""), item.get("cpo_strategy",""),
+                item.get("cpo_source",""), item.get("cpo_note","")
+            ])
+        self._style_basic(ws)
+
+    def _candidate_decision(self, row):
+        risk = " ".join([
+            str(row.get("hard_avoid_reason", "") or ""),
+            str(row.get("k_warning_type", "") or ""),
+            str(row.get("phase5_block_reason", "") or ""),
+        ])
+        wp = str(row.get("phase5_wave_phase", "") or "")
+        bs = str(row.get("phase5_breakout_stage", "") or "")
+        pos = _safe_float(row.get("phase5_position_score"), 0)
+        rr = _safe_float(row.get("rr"), 0)
+        cpo_score = _safe_float(row.get("cpo_score"), 0)
+        tdec = str(row.get("teacher_decision", "WATCH") or "WATCH")
+        exe = str(row.get("teacher_execution_status", row.get("是否可下單", "NO")) or "NO")
+        if any(k in risk for k in ["硬性", "逃命", "主跌", "長黑", "墓碑"]):
+            return "AVOID", "CPO標的但觸發硬性/波段風險：" + risk[:120]
+        if tdec == "REDUCE":
+            return "REDUCE", "老師策略為REDUCE，CPO題材不得覆蓋減碼訊號"
+        if cpo_score >= 85 and wp in ["Wave3_Breakout", "Wave3_Expansion"] and pos >= 70 and rr >= 1.5 and exe in ["YES", "WAIT"]:
+            return ("BUY" if exe == "YES" else "WATCH"), "CPO高分+Wave3突破+RR達標；仍需依執行狀態確認"
+        if cpo_score >= 80 and (wp == "Wave3_PreBreakout" or bs == "PreBreakout") and pos >= 65 and rr >= 1.2:
+            return ("LOW_BUY" if tdec in ["LOW_BUY", "BUY"] else "WATCH"), "CPO高分+Wave3預突破；等待量價確認"
+        if cpo_score >= 75 and bs in ["Compression", "PreBreakout", "Breakout"]:
+            return "WATCH", "CPO題材進入壓縮/預突破觀察"
+        return "WATCH", "CPO股票池標的，條件未完整確認"
+
+    def _write_prebreakout_candidates(self, wb, merged_df):
+        ws = self._sheet(wb, "CPO爆發前候選")
+        ws.append(CPO_REPORT_COLUMNS)
+        if merged_df is None or pd is None or getattr(merged_df, "empty", True):
+            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "未提供DB或老師策略資料，僅輸出CPO股票池", "NO_DB"])
+            self._style_basic(ws)
+            return
+        df = merged_df.copy()
+        if "is_cpo" not in df.columns:
+            df = self.engine.apply(df)
+        cpo = df[df.get("is_cpo", pd.Series(False, index=df.index)).fillna(False)].copy()
+        if cpo.empty:
+            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "DB有資料但未命中CPO_THEME_MASTER", "NO_MATCH"])
+            self._style_basic(ws)
+            return
+        for col in ["cpo_score", "phase5_position_score", "rr", "teacher_score"]:
+            if col in cpo.columns:
+                cpo[col] = pd.to_numeric(cpo[col], errors="coerce").fillna(0)
+            else:
+                cpo[col] = 0
+        decisions, reasons = [], []
+        for _, row in cpo.iterrows():
+            d, reason = self._candidate_decision(row)
+            decisions.append(d); reasons.append(reason)
+        cpo["cpo_prebreakout_decision"] = decisions
+        cpo["cpo_prebreakout_reason"] = reasons
+        cpo["_rank"] = cpo["cpo_prebreakout_decision"].map({"BUY":1,"LOW_BUY":2,"WATCH":3,"REDUCE":4,"AVOID":5}).fillna(9)
+        cpo = cpo.sort_values(["_rank","cpo_score","phase5_position_score","rr"], ascending=[True, False, False, False]).head(80)
+        for n, (_, r) in enumerate(cpo.iterrows(), start=1):
+            ws.append([
+                n,
+                str(r.get("stock_id","")).zfill(4),
+                r.get("report_name", r.get("stock_name", r.get("name", ""))),
+                r.get("cpo_theme",""),
+                r.get("cpo_subtheme",""),
+                r.get("cpo_layer",""),
+                round(_safe_float(r.get("cpo_score"),0),2),
+                r.get("cpo_directness",""),
+                r.get("cpo_strategy",""),
+                r.get("teacher_decision",""),
+                r.get("teacher_execution_status", r.get("是否可下單","")),
+                r.get("phase5_wave_phase",""),
+                r.get("phase5_breakout_stage",""),
+                round(_safe_float(r.get("phase5_position_score"),0),2),
+                round(_safe_float(r.get("rr"),0),2),
+                r.get("cpo_prebreakout_decision",""),
+                r.get("cpo_prebreakout_reason",""),
+                "DB_OK",
+            ])
+        self._style_basic(ws)
+
+    def _write_validation(self, wb, merged_df):
+        ws = self._sheet(wb, "CPO整合驗收")
+        master_count = len(CPO_THEME_MASTER)
+        merged_count = 0
+        candidate_count = 0
+        if merged_df is not None and pd is not None and not getattr(merged_df, "empty", True):
+            if "is_cpo" in merged_df.columns:
+                merged_count = int(merged_df["is_cpo"].fillna(False).sum())
+                candidate_count = merged_count
+        rows = [
+            ["查核項目", "結果", "說明"],
+            ["CPO_THEME_MASTER檔數", master_count, "固定股票池，不依賴DB"],
+            ["DB合併命中數", merged_count, "institutional_report['all']與CPO_THEME_MASTER交集"],
+            ["CPO爆發前候選數", candidate_count, "有DB時由CPO股票×Phase5/Teacher/TradePlan產生"],
+            ["無DB保護", "PASS", "無DB仍輸出CPO股票池，候選頁顯示待DB"],
+            ["Excel頁面", ",".join(self.SHEETS), "需與主程式輸出一致"],
+            ["Log驗收", "CPO_THEME_MASTER_READY / CPO_REPORT_WRITTEN", "可grep追蹤"],
+        ]
+        for r in rows:
+            ws.append(r)
+        self._style_basic(ws)
+
+# =============================
+# V2.8 CPO / 爆發前股票 SOP 整合頁
+# =============================
+class PreBreakoutSOPExcelIntegrator:
+    """
+    將「加入爆發前股票SOP」落地到 Macro16 Excel 輸出。
+    設計原則：
+    1. 不取代既有 Macro16 / 老師策略 / CPO 頁面，只新增 SOP 說明與候選清單。
+    2. 若有 DB / institutional_report['all']，自動產生「爆發前股票候選」。
+    3. 若無 DB，仍輸出 SOP、規則矩陣、盤後DB_盤前分析分工、宏觀16整合方式、盤前輸出欄位，避免報表缺頁。
+    """
+    SOP_SHEET_NAMES = [
+        "爆發前股票SOP",
+        "爆發前規則矩陣",
+        "盤後DB_盤前分析分工",
+        "宏觀16整合方式",
+        "盤前輸出欄位",
+        "爆發前股票候選",
+    ]
+
+    def __init__(self, logger: Optional[Macro16Logger] = None):
+        self.logger = logger
+
+    def _sheet(self, wb, name: str):
+        if name in wb.sheetnames:
+            ws = wb[name]
+            ws.delete_rows(1, ws.max_row)
+        else:
+            ws = wb.create_sheet(name)
+        return ws
+
+    def write_into_workbook(self, wb, institutional_report: Optional[Dict[str, Any]] = None):
+        self._write_sop(wb)
+        self._write_rule_matrix(wb)
+        self._write_db_preopen_split(wb)
+        self._write_macro16_integration(wb)
+        self._write_preopen_columns(wb)
+        self._write_candidates(wb, institutional_report)
+        if self.logger:
+            self.logger.info("PREBREAKOUT_SOP_SHEETS_WRITTEN sheets=" + ",".join(self.SOP_SHEET_NAMES))
+        return wb
+
+    def _write_sop(self, wb):
+        ws = self._sheet(wb, "爆發前股票SOP")
+        rows = [
+            ["步驟", "SOP項目", "程式執行邏輯", "輸出結果", "驗收標準"],
+            ["1", "盤後DB完成", "收盤後先完成 price_history / market_snapshot / ranking_result / 外部財報籌碼欄位", "可供盤前分析的乾淨資料集", "DB資料日與報表基準日一致"],
+            ["2", "候選池建立", "以老師策略、低位階翻多、Phase5預突破、量價壓縮、題材標籤建立初始池", "爆發前候選清單", "不得直接等同TOP15；必須有預突破原因"],
+            ["3", "結構確認", "判斷 Wave3_PreBreakout、Compression、主升預突破觀察池、低位階翻多", "structure_tag / breakout_stage", "至少保留一個可追溯欄位"],
+            ["4", "量價確認", "量比、20日高點、均線支撐、K線風險、RR同步確認", "volume_ratio / rr / risk_flag", "量價不足時只能WATCH，不可BUY"],
+            ["5", "宏觀16 Gate", "引用宏觀總分、V2技術風險、大盤判定、夜盤偏空、重大事件", "macro_gate", "市場風險偏空時降級或禁止追高"],
+            ["6", "決策輸出", "輸出 BUY / LOW_BUY / WATCH / REDUCE / AVOID 與是否可下單", "prebreakout_decision", "決策原因必須可追溯"],
+            ["7", "Excel與UI一致", "Excel新增爆發前股票SOP相關頁，UI可再掛載相同資料框", "SOP頁+候選頁", "報表、程式、UI語義一致"],
+        ]
+        for r in rows:
+            ws.append(r)
+
+    def _write_rule_matrix(self, wb):
+        ws = self._sheet(wb, "爆發前規則矩陣")
+        rows = [
+            ["規則類別", "欄位/條件", "BUY", "LOW_BUY", "WATCH", "REDUCE/AVOID", "程式欄位"],
+            ["結構", "phase5_wave_phase", "Wave3_Breakout / Wave3_Expansion", "Wave3_PreBreakout 且位置分>=65", "Wave3_PreBreakout 或 Compression", "A/B/C_Correction 且未完成", "phase5_wave_phase"],
+            ["突破階段", "phase5_breakout_stage", "Breakout/Expansion", "PreBreakout", "Compression/PreBreakout", "Correction/Exhaustion", "phase5_breakout_stage"],
+            ["位置分", "phase5_position_score", ">=70", ">=65", ">=55", "<50", "phase5_position_score"],
+            ["量能", "vol5/vol20", ">=1.5", ">=1.2", ">=1.0", "<0.8", "prebreakout_volume_ratio"],
+            ["RR", "rr", ">=1.5", ">=1.2", ">=1.0", "<1.0", "rr"],
+            ["風險", "hard_avoid / k_warning / phase5_escape", "皆未觸發", "無硬性風險", "僅軟性壓力", "硬性風險或逃命反彈", "prebreakout_risk_flag"],
+            ["宏觀", "macro_gate", "允許交易/震盪偏多", "震盪偏多", "中性震盪", "風險偏空/停止新倉", "macro_gate"],
+        ]
+        for r in rows:
+            ws.append(r)
+
+    def _write_db_preopen_split(self, wb):
+        ws = self._sheet(wb, "盤後DB_盤前分析分工")
+        rows = [
+            ["階段", "資料/動作", "主責程式區塊", "不得混淆事項", "輸出"],
+            ["盤後", "更新日K、均線、成交量、法人、財報、ranking_result", "DBRepository / InstitutionalReportEngine", "盤後只建資料，不直接盤前追價", "完整DB"],
+            ["盤後", "計算Phase5、老師策略、低位階翻多、避開/換股", "FeatureBuilder + TeacherDecisionEngine", "結構分類不可被即時價格硬改", "老師策略欄位"],
+            ["盤前", "讀取昨收DB與外部宏觀16資料", "Macro16Engine.run", "盤前不重算大量歷史資料", "市場Gate"],
+            ["盤前", "篩爆發前候選", "PreBreakoutSOPExcelIntegrator", "候選不等於BUY；需量價/RR/Gate確認", "爆發前股票候選"],
+            ["盤中/下單前", "即時價、五檔、流動性、滑價二次確認", "交易/Execution Layer", "外部資料不得直接控制下單", "execution_status"],
+        ]
+        for r in rows:
+            ws.append(r)
+
+    def _write_macro16_integration(self, wb):
+        ws = self._sheet(wb, "宏觀16整合方式")
+        rows = [
+            ["Macro16項目", "使用方式", "對爆發前股票的影響", "程式落地"],
+            ["宏觀總分", "控制盤前風險偏好", "總分偏低時候選股降級", "summary['宏觀總分'] / scores"],
+            ["V2技術風險", "判斷大盤是否禁追高", "risk_score>=3 降級 WATCH/REDUCE", "TechnicalRisk.risk_score"],
+            ["重大事件", "重大事件=1時啟動保守Gate", "禁止高β追價", "market.major_event"],
+            ["夜盤偏空", "night_score<0納入風險", "盤前候選降一級", "TechnicalRisk.night_bearish"],
+            ["外資/官股", "資金面輔助", "資金轉弱時降低BUY數量", "MarketInput.foreign_net_100m / gov_net_100m"],
+            ["AI產業", "主題強度", "CPO/AI主題股排序加權", "MarketInput.ai_strength"],
+        ]
+        for r in rows:
+            ws.append(r)
+
+    def _write_preopen_columns(self, wb):
+        ws = self._sheet(wb, "盤前輸出欄位")
+        rows = [
+            ["欄位", "中文名稱", "來源", "用途", "必要"],
+            ["stock_id", "代號", "DB/ranking_result", "主鍵", "Y"],
+            ["report_name", "名稱", "stocks_master/報表", "顯示", "Y"],
+            ["teacher_decision", "老師決策", "TeacherDecisionEngine", "五態決策", "Y"],
+            ["teacher_execution_status", "是否可下單", "TeacherDecisionEngine", "YES/WAIT/NO", "Y"],
+            ["phase5_wave_phase", "波段階段", "TeacherPhase5SemanticEngine", "辨識Wave3_PreBreakout", "Y"],
+            ["phase5_breakout_stage", "突破階段", "TeacherPhase5SemanticEngine", "Compression/PreBreakout/Breakout", "Y"],
+            ["phase5_position_score", "波段位置分", "TeacherPhase5SemanticEngine", "排序與Gate", "Y"],
+            ["prebreakout_volume_ratio", "預突破量比", "price_history衍生 vol5/vol20", "量價確認", "Y"],
+            ["rr", "風報比", "TradePlanEngine", "交易風險控管", "Y"],
+            ["entry_low", "買進下緣", "TradePlanEngine", "低接區", "Y"],
+            ["entry_high", "買進上緣", "TradePlanEngine", "低接區", "Y"],
+            ["stop_loss", "停損", "TradePlanEngine", "風控", "Y"],
+            ["target_1", "目標1", "TradePlanEngine", "第一目標", "Y"],
+            ["target_2", "目標2", "TradePlanEngine", "第二目標", "Y"],
+            ["prebreakout_decision", "爆發前決策", "本SOP整合層", "BUY/LOW_BUY/WATCH/REDUCE/AVOID", "Y"],
+            ["prebreakout_reason", "爆發前原因", "本SOP整合層", "可追溯說明", "Y"],
+        ]
+        for r in rows:
+            ws.append(r)
+
+    def _write_candidates(self, wb, institutional_report: Optional[Dict[str, Any]] = None):
+        ws = self._sheet(wb, "爆發前股票候選")
+        headers = [
+            "排名", "代號", "名稱", "老師決策", "是否可下單", "波段階段", "突破階段", "波段位置分",
+            "量比", "RR", "買進下緣", "買進上緣", "停損", "目標1", "目標2",
+            "爆發前決策", "爆發前原因", "風險旗標", "資料狀態"
+        ]
+        ws.append(headers)
+        if not institutional_report or "all" not in institutional_report or institutional_report.get("all") is None or pd is None:
+            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "未提供DB或InstitutionalReportEngine未產出，僅輸出SOP規格頁", "待DB", "NO_DB"])
+            return
+        df = institutional_report.get("all")
+        if df is None or getattr(df, "empty", True):
+            ws.append([1, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "待DB", "DB資料為空，無法產生候選", "待DB", "EMPTY"])
+            return
+        data = df.copy()
+        for c in ["teacher_score", "phase5_position_score", "rr", "entry_low", "entry_high", "stop_loss", "target_1", "target_2", "vol5", "vol20"]:
+            if c in data.columns:
+                data[c] = pd.to_numeric(data[c], errors="coerce")
+        if "prebreakout_volume_ratio" not in data.columns:
+            vol5 = data["vol5"] if "vol5" in data.columns else pd.Series(index=data.index, dtype=float)
+            vol20 = data["vol20"] if "vol20" in data.columns else pd.Series(index=data.index, dtype=float)
+            data["prebreakout_volume_ratio"] = (vol5 / vol20.replace(0, math.nan)).replace([math.inf, -math.inf], math.nan)
+        wave_phase = data.get("phase5_wave_phase", pd.Series("", index=data.index)).astype(str)
+        breakout_stage = data.get("phase5_breakout_stage", pd.Series("", index=data.index)).astype(str)
+        position_score = pd.to_numeric(data.get("phase5_position_score", pd.Series(0, index=data.index)), errors="coerce").fillna(0)
+        rr = pd.to_numeric(data.get("rr", pd.Series(0, index=data.index)), errors="coerce").fillna(0)
+        vr = pd.to_numeric(data.get("prebreakout_volume_ratio", pd.Series(0, index=data.index)), errors="coerce").fillna(0)
+        teacher_decision = data.get("teacher_decision", pd.Series("WATCH", index=data.index)).astype(str)
+        execution_status = data.get("teacher_execution_status", pd.Series("NO", index=data.index)).astype(str)
+        risk_text = (
+            data.get("hard_avoid_reason", pd.Series("", index=data.index)).astype(str) + " " +
+            data.get("k_warning_type", pd.Series("", index=data.index)).astype(str) + " " +
+            data.get("phase5_block_reason", pd.Series("", index=data.index)).astype(str)
+        )
+        pre_mask = (
+            wave_phase.isin(["Wave3_PreBreakout", "Wave3_Breakout", "Wave3_Expansion"]) |
+            breakout_stage.isin(["Compression", "PreBreakout", "Breakout", "Expansion"]) |
+            data.get("phase5_candidate_pool", pd.Series("", index=data.index)).astype(str).str.contains("預突破|主升", na=False)
+        )
+        candidates = data.loc[pre_mask].copy()
+        if candidates.empty:
+            candidates = data.copy()
+        def decide(row):
+            risk = str(row.get("_risk_text", "") or "")
+            wp = str(row.get("phase5_wave_phase", "") or "")
+            bs = str(row.get("phase5_breakout_stage", "") or "")
+            pos = _safe_float(row.get("phase5_position_score"), 0)
+            rrv = _safe_float(row.get("rr"), 0)
+            vol = _safe_float(row.get("prebreakout_volume_ratio"), 0)
+            tdec = str(row.get("teacher_decision", "WATCH") or "WATCH")
+            exe = str(row.get("teacher_execution_status", "NO") or "NO")
+            if any(k in risk for k in ["硬性", "逃命", "主跌", "長黑", "墓碑"]):
+                return "AVOID"
+            if tdec == "REDUCE":
+                return "REDUCE"
+            if (wp in ["Wave3_Breakout", "Wave3_Expansion"] or bs in ["Breakout", "Expansion"]) and pos >= 70 and rrv >= 1.5 and vol >= 1.2 and exe in ["YES", "WAIT"]:
+                return "BUY" if exe == "YES" else "WATCH"
+            if wp == "Wave3_PreBreakout" or bs == "PreBreakout":
+                if pos >= 65 and rrv >= 1.2:
+                    return "LOW_BUY" if tdec in ["LOW_BUY", "BUY"] else "WATCH"
+            if bs == "Compression" and pos >= 55:
+                return "WATCH"
+            return "WATCH"
+        candidates["_risk_text"] = risk_text.loc[candidates.index]
+        candidates["prebreakout_decision"] = candidates.apply(decide, axis=1)
+        reasons = []
+        for _, r in candidates.iterrows():
+            parts = []
+            parts.append(f"波段={r.get('phase5_wave_phase','')}")
+            parts.append(f"突破={r.get('phase5_breakout_stage','')}")
+            parts.append(f"位置分={round(_safe_float(r.get('phase5_position_score'),0),2)}")
+            parts.append(f"量比={round(_safe_float(r.get('prebreakout_volume_ratio'),0),2)}")
+            parts.append(f"RR={round(_safe_float(r.get('rr'),0),2)}")
+            if str(r.get("_risk_text","")).strip():
+                parts.append("風險=" + str(r.get("_risk_text","")).strip()[:120])
+            reasons.append(";".join(parts))
+        candidates["prebreakout_reason"] = reasons
+        rank_cols = ["prebreakout_decision", "phase5_position_score", "rr", "prebreakout_volume_ratio", "teacher_score"]
+        for c in rank_cols[1:]:
+            if c not in candidates.columns:
+                candidates[c] = 0
+        candidates["_decision_rank"] = candidates["prebreakout_decision"].map({"BUY": 1, "LOW_BUY": 2, "WATCH": 3, "REDUCE": 4, "AVOID": 5}).fillna(9)
+        candidates = candidates.sort_values(["_decision_rank", "phase5_position_score", "rr", "prebreakout_volume_ratio"], ascending=[True, False, False, False]).head(60)
+        for n, (_, r) in enumerate(candidates.iterrows(), start=1):
+            ws.append([
+                n,
+                str(r.get("stock_id", "")).zfill(4) if str(r.get("stock_id", "")).strip() else "",
+                r.get("report_name", r.get("stock_name", r.get("name", ""))),
+                r.get("teacher_decision", ""),
+                r.get("teacher_execution_status", r.get("是否可下單", "")),
+                r.get("phase5_wave_phase", ""),
+                r.get("phase5_breakout_stage", ""),
+                round(_safe_float(r.get("phase5_position_score"), 0), 2),
+                round(_safe_float(r.get("prebreakout_volume_ratio"), 0), 2),
+                round(_safe_float(r.get("rr"), 0), 2),
+                _safe_float(r.get("entry_low"), None),
+                _safe_float(r.get("entry_high"), None),
+                _safe_float(r.get("stop_loss"), None),
+                _safe_float(r.get("target_1"), None),
+                _safe_float(r.get("target_2"), None),
+                r.get("prebreakout_decision", ""),
+                r.get("prebreakout_reason", ""),
+                str(r.get("_risk_text", "")).strip(),
+                "DB_OK",
+            ])
+
+
 class ExcelWriter:
     def __init__(self, logger: Macro16Logger):
         self.logger = logger
@@ -3279,6 +4057,8 @@ class ExcelWriter:
             self._write_audit(wb, market, scores, tech, summary, logs)
             self._write_data_source_status(wb, market, raw or {})
             self._write_evidence_index(wb, raw or {})
+        CPOReportExcelIntegrator(self.logger).write_into_workbook(wb, institutional_report=locals().get("institutional_report"))
+        PreBreakoutSOPExcelIntegrator(self.logger).write_into_workbook(wb, institutional_report=locals().get("institutional_report"))
         self._format_all(wb)
         wb.save(out_path)
         if institutional_report is not None and report_mode in (REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL):
@@ -3494,7 +4274,7 @@ class Macro16Engine:
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
-        self.logger.info("CHANGELOG v2.7.4: Position Engine fix - wave_phase, breakout_stage, impulsive_stage, position_score, 6116 PreBreakout trace, report fields")
+        self.logger.info("CHANGELOG v2.8.1: Add CPO_THEME_MASTER, CPOThemeEngine, CPOReportExcelIntegrator and CPO x PreBreakout output")
         self.logger.strategy_trace("STRATEGY_VERSION", {"strategy_version": STRATEGY_VERSION, "program_version": VERSION})
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
