@@ -8460,6 +8460,87 @@ class Macro16Engine:
         self.writer = ExcelWriter(self.logger)
         self.word_evidence_writer = WordEvidenceReportWriter(self.logger)
 
+    def _find_existing_cultivation_db(self, base_dir: Path) -> Optional[Path]:
+        """R5N29I：macro_refill 執行後自動尋找既有培養DB，用於恢復 data.zip 交付物。
+        不重跑培養、不改變主程式原本報表；只把既有 watch_pool_cultivation.db 與報表打包。
+        """
+        candidates = [
+            base_dir / "data" / "watch_pool_cultivation.db",
+            base_dir / "watch_pool_cultivation.db",
+        ]
+        for p in candidates:
+            if p.exists():
+                return p
+        return None
+
+    def _find_existing_cultivation_report(self, base_dir: Path, base_date: str) -> Optional[Path]:
+        ymd = str(base_date or "").replace("-", "")
+        candidates = []
+        if ymd:
+            candidates.extend([
+                base_dir / "reports" / f"watch_pool_cultivation_{ymd}.xlsx",
+                base_dir / f"watch_pool_cultivation_{ymd}.xlsx",
+            ])
+        candidates.extend(sorted((base_dir / "reports").glob("watch_pool_cultivation_*.xlsx"), reverse=True) if (base_dir / "reports").exists() else [])
+        candidates.extend(sorted(base_dir.glob("watch_pool_cultivation_*.xlsx"), reverse=True))
+        for p in candidates:
+            if p.exists():
+                return p
+        return None
+
+    def _export_existing_cultivation_report_if_possible(self, base_dir: Path, cult_db: Path, base_date: str) -> Optional[Path]:
+        """R5N29I：若使用者目前只有 watch_pool_cultivation.db，則用既有DB重建培養報表。
+        這是包裝既有資料，不會讀主DB、不會新增 tracking/event/performance 紀錄。
+        """
+        try:
+            report = self._find_existing_cultivation_report(base_dir, base_date)
+            if report:
+                return report
+            out = base_dir / "reports" / f"watch_pool_cultivation_{str(base_date or '').replace('-', '')}.xlsx"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            helper = WatchPoolCultivationEngine(self.logger.log_file.parent)
+            with sqlite3.connect(cult_db) as conn:
+                helper.export_cultivation_report(conn, str(out), base_date)
+            self.logger.info(f"R5N29I_EXISTING_CULTIVATION_REPORT_REBUILT path={out}")
+            return out
+        except Exception as exc:
+            self.logger.warning(f"R5N29I_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
+            return None
+
+    def _package_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str) -> str:
+        """R5N29I：恢復 01/02 使用者期待的 data.zip 交付。
+        觸發條件：macro_refill 正常完成後，如果同資料夾已有 watch_pool_cultivation.db，
+        自動輸出 data.zip，內容維持附件設計：
+          data/watch_pool_cultivation.db
+          reports/watch_pool_cultivation_YYYYMMDD.xlsx
+          logs/macro16_debug_*.txt
+        若沒有培養DB，僅記錄 WARN，不影響原宏觀16報表。
+        """
+        try:
+            base_dir = Path(db_path).resolve().parent if db_path else Path(out_path).resolve().parent
+            cult_db = self._find_existing_cultivation_db(base_dir)
+            if not cult_db:
+                self.logger.warning(f"R5N29I_DATA_PACKAGE_SKIP no watch_pool_cultivation.db under {base_dir}")
+                return ""
+            report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date)
+            zip_path = base_dir / "data.zip"
+            artifacts = [(cult_db, "data/watch_pool_cultivation.db")]
+            if report and Path(report).exists():
+                artifacts.append((Path(report), f"reports/{Path(report).name}"))
+            if self.logger.log_file and Path(self.logger.log_file).exists():
+                artifacts.append((Path(self.logger.log_file), f"logs/{Path(self.logger.log_file).name}"))
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                seen = set()
+                for src, arc in artifacts:
+                    if src.exists() and arc not in seen:
+                        zf.write(src, arc)
+                        seen.add(arc)
+            self.logger.info(f"R5N29I_MACRO_DATA_PACKAGE_WRITTEN path={zip_path} files={list(seen)}")
+            return str(zip_path)
+        except Exception as exc:
+            self.logger.warning(f"R5N29I_MACRO_DATA_PACKAGE_FAIL error={exc}")
+            return ""
+
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
         self.logger.info("CHANGELOG v3.0.0: Add AI Project Rotation Monitor sheets and full 201-stock AI tracking page")
@@ -8550,8 +8631,15 @@ class Macro16Engine:
         evidence_word = ""
         if report_mode == REPORT_MODE_ALL:
             evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
+        # R5N29I：macro_refill / macro_teacher / teacher_full 完成後，若同資料夾已有培養DB，
+        # 自動恢復 data.zip 交付；不影響原宏觀16報表與老師策略報表產出。
+        data_package = ""
+        if report_mode in (REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_TEACHER_FULL, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL):
+            data_package = self._package_macro_side_data_outputs(output, db_path, market.base_date or base_date or dt.date.today().isoformat())
+            if data_package:
+                summary["data.zip"] = data_package
         self.logger.info("執行完成")
-        return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file)}
+        return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file), "data_package": data_package}
 
 
 class WatchPoolCultivationEngine:
