@@ -8869,10 +8869,39 @@ class WatchPoolCultivationEngine:
         except Exception:
             return None
 
-    def _derive_status(self, score: Optional[float], raw_status: Optional[str] = None) -> str:
+    def _normalize_watch_status(self, raw_status: Optional[str]) -> str:
+        """R5N29AC：統一外部報表狀態文字，避免 Launch Ready 報表的 A/S/中文等級
+        被原樣寫入 watch_status，造成 06_升級LaunchReady 查詢不到資料。
+        raw grade 仍保存在 launch_grade；watch_status 必須是模型狀態碼。
+        """
         s = str(raw_status or "").strip()
-        if s:
-            return s
+        if not s:
+            return ""
+        u = s.upper().replace(" ", "_").replace("-", "_")
+        promoted_keywords = ["LAUNCH_READY", "PROMOTED", "BREAKOUT", "SUCCESS", "READY", "噴射", "起爆", "突破", "升級", "成功"]
+        accelerating_keywords = ["ACCELERATING", "加速", "觀察強", "追蹤強"]
+        exit_keywords = ["EXIT", "AVOID", "淘汰", "排除", "退場"]
+        if any(k in u or k in s for k in promoted_keywords):
+            return "LAUNCH_READY"
+        if any(k in u or k in s for k in accelerating_keywords):
+            return "ACCELERATING"
+        if any(k in u or k in s for k in exit_keywords):
+            return "EXIT"
+        # Launch Ready 報表常以 A/S/1/2 代表分級，不可直接當 watch_status。
+        if u in {"S", "A", "A+", "A級", "S級", "1", "TOP", "TOP20"}:
+            return "LAUNCH_READY"
+        if u in {"B", "B級", "2"}:
+            return "ACCELERATING"
+        if u in {"C", "C級", "3", "WATCH", "觀察"}:
+            return "WATCH"
+        return ""
+
+    def _derive_status(self, score: Optional[float], raw_status: Optional[str] = None, force_launch_ready: bool = False) -> str:
+        normalized = self._normalize_watch_status(raw_status)
+        if normalized:
+            return normalized
+        if force_launch_ready:
+            return "LAUNCH_READY"
         if score is None:
             return "WATCH"
         if score >= 80:
@@ -9081,7 +9110,9 @@ class WatchPoolCultivationEngine:
                                 "theme": str(ws.cell(r, theme_col).value or "").strip() if theme_col else "",
                                 "sub_theme": str(ws.cell(r, sub_theme_col).value or "").strip() if sub_theme_col else "",
                                 "launch_grade": str(ws.cell(r, launch_grade_col).value or "").strip() if launch_grade_col else raw_status,
-                                "watch_status": self._derive_status(score, raw_status),
+                                # R5N29AC：Launch Ready 報表來源的列，若原始等級無法標準化，仍應歸入 LAUNCH_READY，
+                                # 否則 06_升級LaunchReady 會空表；原始 A/S/中文等級保存在 launch_grade。
+                                "watch_status": self._derive_status(score, raw_status, force_launch_ready=True),
                                 "launch_score": score,
                                 "status_reason": str(ws.cell(r, reason_col).value or "").strip() if reason_col else "from_launch_ready_report",
                                 "source_report": str(report),
