@@ -8472,45 +8472,52 @@ class Macro16Engine:
                 return p
         return None
 
-    def _find_existing_cultivation_report(self, base_dir: Path, base_date: str) -> Optional[Path]:
-        ymd = str(base_date or "").replace("-", "")
-        candidates = []
-        if ymd:
-            candidates.extend([
-                base_dir / "reports" / f"watch_pool_cultivation_{ymd}.xlsx",
-                base_dir / f"watch_pool_cultivation_{ymd}.xlsx",
-            ])
-        candidates.extend(sorted((base_dir / "reports").glob("watch_pool_cultivation_*.xlsx"), reverse=True) if (base_dir / "reports").exists() else [])
-        candidates.extend(sorted(base_dir.glob("watch_pool_cultivation_*.xlsx"), reverse=True))
-        for p in candidates:
-            if p.exists():
-                return p
-        return None
+    def _resolve_existing_cultivation_report_date(self, conn: sqlite3.Connection, base_date: str) -> str:
+        """R5N29O：報表輸出日期必須與實際 tracking 資料一致。
+
+        R5N29N 的問題是 macro_refill 使用 market.base_date（交易所回補日）
+        去命名 cultivation 報表，導致 UI 基準日為 2026-06-27 時，
+        報表卻輸出 watch_pool_cultivation_20260626.xlsx；內容日期與檔名不一致。
+        本函式以使用者基準日優先，若 DB 無該日資料，才回退到 <=基準日最近日期，
+        最後才使用 DB 最新日期。
+        """
+        d = str(base_date or "").strip()
+        if d:
+            try:
+                if conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=?", (d,)).fetchone()[0] > 0:
+                    return d
+                row = conn.execute("SELECT MAX(track_date) FROM watch_pool_tracking WHERE track_date<=?", (d,)).fetchone()
+                if row and row[0]:
+                    return row[0]
+            except Exception:
+                pass
+        row = conn.execute("SELECT MAX(track_date) FROM watch_pool_tracking").fetchone()
+        if row and row[0]:
+            return row[0]
+        return d or dt.date.today().isoformat()
 
     def _export_existing_cultivation_report_if_possible(self, base_dir: Path, cult_db: Path, base_date: str, main_db_path: Optional[str] = None) -> Optional[Path]:
-        """R5N29K：若使用者目前只有 watch_pool_cultivation.db，則用既有DB重建培養報表。
-        這是包裝既有資料，不會讀主DB、不會新增 tracking/event/performance 紀錄。
+        """R5N29O：用既有培養DB重建培養報表，且不沿用過期報表。
+
+        修正 R5N29N 問題：
+        1. 不再先找舊報表直接 return，避免 reports 裡已有 20260626 報表時，
+           20260627 執行仍拿舊檔當結果。
+        2. 先升級 DB schema 並回填 Snapshot，再依實際 tracking 日期命名輸出。
+        3. 報表檔名、01 今日總表、08 模型驗證 effective_track_date 必須一致。
         """
         try:
-            report = self._find_existing_cultivation_report(base_dir, base_date)
-            if report:
-                return report
-            out = base_dir / "reports" / f"watch_pool_cultivation_{str(base_date or '').replace('-', '')}.xlsx"
-            out.parent.mkdir(parents=True, exist_ok=True)
             helper = WatchPoolCultivationEngine(self.logger.log_file.parent)
             with sqlite3.connect(cult_db) as conn:
-                # R5N29M FIX：舊版 watch_pool_cultivation.db 可能只有 stock_id/score，
-                # 缺少 R5N29L 新增的 Historical Snapshot 欄位。
-                # 匯出報表前必須先執行 schema migration，否則會發生
-                # no such column: market_type，導致 reports 資料夾空白。
                 helper.ensure_cultivation_schema(conn)
-                # R5N29N FIX：R5N29M 只補 schema，舊資料內容仍空；重建報表前需用主DB回填股名/市場/產業/題材等 Snapshot。
                 helper.backfill_existing_snapshot_fields(conn, main_db_path, base_date)
-                helper.export_cultivation_report(conn, str(out), base_date)
-            self.logger.info(f"R5N29N_EXISTING_CULTIVATION_REPORT_REBUILT path={out}")
+                report_date = self._resolve_existing_cultivation_report_date(conn, base_date)
+                out = base_dir / "reports" / f"watch_pool_cultivation_{str(report_date or '').replace('-', '')}.xlsx"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                helper.export_cultivation_report(conn, str(out), report_date)
+            self.logger.info(f"R5N29O_EXISTING_CULTIVATION_REPORT_REBUILT path={out} requested_base_date={base_date} report_date={report_date}")
             return out
         except Exception as exc:
-            self.logger.warning(f"R5N29M_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
+            self.logger.warning(f"R5N29O_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
             return None
 
     def _prepare_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str) -> Dict[str, str]:
@@ -8553,7 +8560,7 @@ class Macro16Engine:
                 report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date, db_path)
                 if report:
                     result["cultivation_report"] = str(report)
-            self.logger.info(f"R5N29N_DATA_ZIP_DISABLED folders={result}")
+            self.logger.info(f"R5N29O_DATA_ZIP_DISABLED folders={result}")
             return result
         except Exception as exc:
             self.logger.warning(f"R5N29N_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
@@ -8653,7 +8660,10 @@ class Macro16Engine:
         # 原因：data.zip 只是附件/交付包形式，不是每日培養迴路的工作資料。
         data_outputs: Dict[str, str] = {}
         if report_mode in (REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_TEACHER_FULL, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL):
-            data_outputs = self._prepare_macro_side_data_outputs(output, db_path, market.base_date or base_date or dt.date.today().isoformat())
+            # R5N29O FIX：培養報表屬於使用者執行日/觀察池日期，不可用 TWSE fallback 後的 market.base_date 命名。
+            # 否則 2026-06-27 執行但交易所回補到 2026-06-26 時，會錯產 watch_pool_cultivation_20260626.xlsx。
+            cultivation_output_date = base_date or market.base_date or dt.date.today().isoformat()
+            data_outputs = self._prepare_macro_side_data_outputs(output, db_path, cultivation_output_date)
             summary["data_folder"] = data_outputs.get("data_folder", "")
             summary["reports_folder"] = data_outputs.get("reports_folder", "")
             summary["logs_folder"] = data_outputs.get("logs_folder", "")
