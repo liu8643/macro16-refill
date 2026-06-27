@@ -25,6 +25,7 @@ import sys
 import time
 import sqlite3
 import html as html_lib
+import zipfile
 from dataclasses import dataclass, asdict
 from io import StringIO
 from pathlib import Path
@@ -8947,6 +8948,34 @@ class WatchPoolCultivationEngine:
         self.log(f"R5N29_CULTIVATION_REPORT_WRITTEN output={out}")
         return str(out)
 
+
+    def package_cultivation_outputs(self, main_db_path: str, cult_db: Path, report_path: str, log_file: Optional[Path] = None) -> str:
+        """R5N29H：將培養模式必要交付物固定打包成 data.zip。
+        目的：避免只產生 Excel/DB，卻沒有交付 data/watch_pool_cultivation.db 與 reports/watch_pool_cultivation_YYYYMMDD.xlsx。
+        輸出位置：主DB同資料夾 data.zip；內容固定使用相對路徑 data/、reports/、logs/。
+        """
+        base_dir = Path(main_db_path).resolve().parent if main_db_path else Path.cwd()
+        zip_path = base_dir / "data.zip"
+        artifacts = []
+        if cult_db and Path(cult_db).exists():
+            artifacts.append((Path(cult_db), "data/watch_pool_cultivation.db"))
+        if report_path and Path(report_path).exists():
+            artifacts.append((Path(report_path), f"reports/{Path(report_path).name}"))
+        if log_file and Path(log_file).exists():
+            artifacts.append((Path(log_file), f"logs/{Path(log_file).name}"))
+        if not artifacts:
+            self.warn("R5N29_DATA_PACKAGE_SKIP no_artifacts")
+            return ""
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for src, arc in artifacts:
+                    zf.write(src, arc)
+            self.log(f"R5N29_DATA_PACKAGE_WRITTEN path={zip_path} files={[arc for _, arc in artifacts]}")
+            return str(zip_path)
+        except Exception as exc:
+            self.warn(f"R5N29_DATA_PACKAGE_FAIL path={zip_path} error={exc}")
+            return ""
+
     def run(self, template: Optional[str], out_path: str, base_date: str, main_db_path: str, cultivation_db_path: Optional[str] = None, launch_ready_path: Optional[str] = None) -> Dict[str, Any]:
         base_date = self._parse_date(base_date)
         if not main_db_path:
@@ -8982,8 +9011,10 @@ class WatchPoolCultivationEngine:
             log_file.write_text("\n".join(self.messages), encoding="utf-8")
         except Exception as exc:
             self.warn(f"R5N29_LOG_WRITE_FAIL {exc}")
-        return {"output": output, "cultivation_db": str(cult_db), "summary": summary, "log_file": str(log_file)}
-
+        data_package = self.package_cultivation_outputs(main_db_path, cult_db, output, log_file)
+        if data_package:
+            summary["data.zip"] = data_package
+        return {"output": output, "cultivation_db": str(cult_db), "data_package": data_package, "summary": summary, "log_file": str(log_file)}
 
 
 def run_gui():
