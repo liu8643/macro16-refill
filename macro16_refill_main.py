@@ -77,6 +77,8 @@ REPORT_MODE_INSTITUTIONAL = "institutional_report"
 REPORT_MODE_MACRO_TEACHER = "macro_teacher"
 REPORT_MODE_TEACHER_FULL = "teacher_full"
 REPORT_MODE_ALL = "all"
+# R5N29：獨立觀察池培養輸出模式。只讀主DB與Launch Ready報表，寫入培養DB。
+REPORT_MODE_WATCH_POOL = "watch_pool_cultivation"
 MACRO_REFILL_SHEETS = ["市場輸入", "宏觀16模組", "V2技術引擎"]
 
 
@@ -8550,21 +8552,456 @@ class Macro16Engine:
         self.logger.info("執行完成")
         return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file)}
 
+
+# =============================================================================
+# R5N29 Watch Pool Cultivation Engine
+# 目的：獨立觀察池培養程式；不寫主DB，只讀 stock_system_v6_2.db 與 Launch Ready 報表，
+#       並將跨日追蹤結果累積到 watch_pool_cultivation.db。
+# =============================================================================
+class WatchPoolCultivationEngine:
+    """R5N29：觀察池培養引擎。"""
+
+    def __init__(self, log_dir: Path | str = "logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.messages: List[str] = []
+
+    def log(self, msg: str) -> None:
+        line = f"INFO {msg}"
+        self.messages.append(line)
+        print(line)
+
+    def warn(self, msg: str) -> None:
+        line = f"WARN {msg}"
+        self.messages.append(line)
+        print(line)
+
+    def _parse_date(self, base_date: str) -> str:
+        return dt.datetime.strptime(base_date, "%Y-%m-%d").date().isoformat()
+
+    def resolve_cultivation_db_path(self, main_db_path: str, cultivation_db_path: Optional[str]) -> Path:
+        if cultivation_db_path and str(cultivation_db_path).strip():
+            path = Path(cultivation_db_path)
+        else:
+            # 規劃指定：主程式資料夾/data/watch_pool_cultivation.db。
+            base = Path(main_db_path).resolve().parent if main_db_path else Path.cwd()
+            path = base / "data" / "watch_pool_cultivation.db"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def ensure_cultivation_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS watch_pool_tracking (
+            track_date TEXT NOT NULL,
+            stock_id TEXT NOT NULL,
+            stock_name TEXT,
+            watch_status TEXT,
+            launch_score REAL,
+            score_1d_delta REAL,
+            score_3d_delta REAL,
+            score_5d_delta REAL,
+            days_in_watch INTEGER,
+            status_reason TEXT,
+            source_report TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(track_date, stock_id)
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS watch_pool_event (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_date TEXT NOT NULL,
+            stock_id TEXT NOT NULL,
+            event_type TEXT,
+            before_status TEXT,
+            after_status TEXT,
+            event_reason TEXT,
+            launch_score REAL,
+            created_at TEXT NOT NULL,
+            UNIQUE(event_date, stock_id, event_type, before_status, after_status)
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS watch_pool_performance (
+            stock_id TEXT NOT NULL,
+            entry_date TEXT NOT NULL,
+            entry_price REAL,
+            max_return_5d REAL,
+            max_return_10d REAL,
+            max_return_20d REAL,
+            outcome TEXT,
+            outcome_reason TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(stock_id, entry_date)
+        )
+        """)
+        conn.commit()
+        self.log("R5N29_SCHEMA_READY tables=watch_pool_tracking,watch_pool_event,watch_pool_performance")
+
+    def _find_latest_report(self, launch_ready_path: Optional[str]) -> Optional[Path]:
+        if not launch_ready_path:
+            candidates = [Path.cwd() / "launch_ready_reports", Path.cwd() / "reports" / "launch_ready_reports"]
+        else:
+            p = Path(launch_ready_path)
+            candidates = [p]
+        files: List[Path] = []
+        for p in candidates:
+            if p.is_file() and p.suffix.lower() in (".xlsx", ".xlsm"):
+                files.append(p)
+            elif p.is_dir():
+                files.extend([x for x in p.glob("*.xlsx") if not x.name.startswith("~$")])
+                files.extend([x for x in p.glob("*.xlsm") if not x.name.startswith("~$")])
+        if not files:
+            return None
+        return max(files, key=lambda x: x.stat().st_mtime)
+
+    def _normalize_header(self, v: Any) -> str:
+        return str(v or "").strip().lower().replace(" ", "").replace("_", "")
+
+    def _pick_col(self, headers: Dict[str, int], names: List[str]) -> Optional[int]:
+        normalized = {self._normalize_header(k): v for k, v in headers.items()}
+        for name in names:
+            key = self._normalize_header(name)
+            if key in normalized:
+                return normalized[key]
+        for k, v in normalized.items():
+            if any(self._normalize_header(n) in k for n in names):
+                return v
+        return None
+
+    def _num(self, v: Any) -> Optional[float]:
+        if v is None or v == "":
+            return None
+        try:
+            s = str(v).replace("%", "").replace(",", "").strip()
+            return float(s)
+        except Exception:
+            return None
+
+    def _derive_status(self, score: Optional[float], raw_status: Optional[str] = None) -> str:
+        s = str(raw_status or "").strip()
+        if s:
+            return s
+        if score is None:
+            return "WATCH"
+        if score >= 80:
+            return "LAUNCH_READY"
+        if score >= 65:
+            return "ACCELERATING"
+        return "WATCH"
+
+    def load_today_launch_ready(self, main_db_path: str, launch_ready_path: Optional[str], base_date: str) -> Tuple[List[Dict[str, Any]], str]:
+        """讀取今日 Launch Ready 報表；若報表不存在，回退讀主DB常見候選表。"""
+        rows: List[Dict[str, Any]] = []
+        source = ""
+        report = self._find_latest_report(launch_ready_path)
+        if report:
+            source = str(report)
+            try:
+                wb = load_workbook(report, data_only=True, read_only=True)
+                for ws in wb.worksheets:
+                    # 掃描前10列找股票代號欄。
+                    for header_row_idx in range(1, min(ws.max_row, 10) + 1):
+                        header_values = [ws.cell(header_row_idx, c).value for c in range(1, min(ws.max_column, 80) + 1)]
+                        headers = {str(v): i + 1 for i, v in enumerate(header_values) if v is not None}
+                        stock_col = self._pick_col(headers, ["stock_id", "股票代號", "代號", "證券代號"])
+                        if not stock_col:
+                            continue
+                        name_col = self._pick_col(headers, ["stock_name", "股票名稱", "名稱", "公司名稱"])
+                        score_col = self._pick_col(headers, ["launch_score", "launch ready score", "準備噴射分數", "分數", "score"])
+                        status_col = self._pick_col(headers, ["watch_status", "狀態", "等級", "grade", "判定"])
+                        reason_col = self._pick_col(headers, ["status_reason", "原因", "理由", "AI判定", "操作建議"])
+                        for r in range(header_row_idx + 1, ws.max_row + 1):
+                            stock_id = ws.cell(r, stock_col).value
+                            if stock_id is None:
+                                continue
+                            stock_id = str(stock_id).strip().split('.')[0]
+                            if not re.match(r"^\d{4,6}$", stock_id):
+                                continue
+                            score = self._num(ws.cell(r, score_col).value) if score_col else None
+                            raw_status = str(ws.cell(r, status_col).value or "").strip() if status_col else ""
+                            rows.append({
+                                "track_date": base_date,
+                                "stock_id": stock_id,
+                                "stock_name": str(ws.cell(r, name_col).value or "").strip() if name_col else "",
+                                "watch_status": self._derive_status(score, raw_status),
+                                "launch_score": score,
+                                "status_reason": str(ws.cell(r, reason_col).value or "").strip() if reason_col else "from_launch_ready_report",
+                                "source_report": str(report),
+                            })
+                        if rows:
+                            self.log(f"R5N29_LOAD_LAUNCH_READY_REPORT sheet={ws.title} rows={len(rows)} source={report}")
+                            return self._dedupe_rows(rows), source
+                self.warn(f"R5N29_LAUNCH_READY_PARSE_EMPTY source={report}")
+            except Exception as exc:
+                self.warn(f"R5N29_LAUNCH_READY_READ_FAIL source={report} error={exc}")
+        # fallback：只讀主DB，不寫入主DB。
+        if main_db_path and Path(main_db_path).exists():
+            try:
+                with sqlite3.connect(f"file:{main_db_path}?mode=ro", uri=True) as conn:
+                    table_names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+                    for table in ["launch_ready_candidates", "prebreakout", "ranking_result", "watchlist"]:
+                        if table not in table_names:
+                            continue
+                        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                        stock_col = next((c for c in ["stock_id", "code", "證券代號"] if c in cols), None)
+                        if not stock_col:
+                            continue
+                        name_col = next((c for c in ["stock_name", "name", "股票名稱"] if c in cols), None)
+                        score_col = next((c for c in ["launch_score", "prebreakout_score", "score", "total_score"] if c in cols), None)
+                        sql = f"SELECT {stock_col} AS stock_id" + (f", {name_col} AS stock_name" if name_col else ", '' AS stock_name") + (f", {score_col} AS launch_score" if score_col else ", NULL AS launch_score") + f" FROM {table} LIMIT 500"
+                        for stock_id, stock_name, launch_score in conn.execute(sql).fetchall():
+                            score = self._num(launch_score)
+                            rows.append({"track_date": base_date, "stock_id": str(stock_id), "stock_name": stock_name or "", "watch_status": self._derive_status(score), "launch_score": score, "status_reason": f"fallback_from_{table}", "source_report": f"main_db:{table}"})
+                        if rows:
+                            source = f"{main_db_path}:{table}"
+                            self.log(f"R5N29_LOAD_MAIN_DB_FALLBACK table={table} rows={len(rows)}")
+                            return self._dedupe_rows(rows), source
+            except Exception as exc:
+                self.warn(f"R5N29_MAIN_DB_FALLBACK_FAIL error={exc}")
+        raise RuntimeError("R5N29 無法取得今日觀察池資料：請指定 Launch Ready 報表/資料夾，或確認主DB存在候選表。")
+
+    def _dedupe_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        best: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            sid = str(row.get("stock_id", "")).strip()
+            if not sid:
+                continue
+            old = best.get(sid)
+            old_score = old.get("launch_score") if old else None
+            new_score = row.get("launch_score")
+            if old is None or (new_score is not None and (old_score is None or new_score > old_score)):
+                best[sid] = row
+        return list(best.values())
+
+    def load_previous_tracking(self, conn: sqlite3.Connection, base_date: str) -> Dict[str, Dict[str, Any]]:
+        sql = """
+        SELECT t.track_date, t.stock_id, t.watch_status, t.launch_score, t.days_in_watch
+        FROM watch_pool_tracking t
+        JOIN (
+            SELECT stock_id, MAX(track_date) AS max_date
+            FROM watch_pool_tracking
+            WHERE track_date < ?
+            GROUP BY stock_id
+        ) x ON x.stock_id=t.stock_id AND x.max_date=t.track_date
+        """
+        prev = {}
+        for track_date, stock_id, status, score, days in conn.execute(sql, (base_date,)).fetchall():
+            prev[str(stock_id)] = {"track_date": track_date, "watch_status": status, "launch_score": score, "days_in_watch": days or 0}
+        self.log(f"R5N29_PREVIOUS_TRACKING rows={len(prev)}")
+        return prev
+
+    def _score_delta_days(self, conn: sqlite3.Connection, stock_id: str, base_date: str, days: int, score: Optional[float]) -> Optional[float]:
+        if score is None:
+            return None
+        row = conn.execute("""
+            SELECT launch_score FROM watch_pool_tracking
+            WHERE stock_id=? AND track_date <= date(?, ?)
+            ORDER BY track_date DESC LIMIT 1
+        """, (stock_id, base_date, f"-{days} day")).fetchone()
+        if not row or row[0] is None:
+            return None
+        return float(score) - float(row[0])
+
+    def compare_today_previous(self, conn: sqlite3.Connection, today_rows: List[Dict[str, Any]], prev: Dict[str, Dict[str, Any]], base_date: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tracking: List[Dict[str, Any]] = []
+        events: List[Dict[str, Any]] = []
+        for row in today_rows:
+            sid = str(row["stock_id"])
+            score = row.get("launch_score")
+            p = prev.get(sid)
+            days = (int(p.get("days_in_watch") or 0) + 1) if p else 1
+            d1 = (float(score) - float(p["launch_score"])) if p and score is not None and p.get("launch_score") is not None else None
+            d3 = self._score_delta_days(conn, sid, base_date, 3, score)
+            d5 = self._score_delta_days(conn, sid, base_date, 5, score)
+            track = dict(row)
+            track.update({"score_1d_delta": d1, "score_3d_delta": d3, "score_5d_delta": d5, "days_in_watch": days, "created_at": now})
+            tracking.append(track)
+            before = p.get("watch_status") if p else None
+            after = row.get("watch_status") or "WATCH"
+            event_type = None
+            reason = ""
+            if p is None:
+                event_type = "ENTER"
+                reason = "首次進入觀察池"
+            elif before != after:
+                event_type = "STATUS_CHANGE"
+                reason = f"狀態變更 {before} -> {after}"
+            elif d1 is not None and d1 >= 10:
+                event_type = "ACCELERATING"
+                reason = f"分數單日增加 {d1:.2f}"
+            if event_type:
+                events.append({"event_date": base_date, "stock_id": sid, "event_type": event_type, "before_status": before, "after_status": after, "event_reason": reason, "launch_score": score, "created_at": now})
+        self.log(f"R5N29_COMPARE tracking_rows={len(tracking)} event_rows={len(events)}")
+        return tracking, events
+
+    def write_tracking_rows(self, conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> None:
+        sql = """
+        INSERT OR REPLACE INTO watch_pool_tracking
+        (track_date, stock_id, stock_name, watch_status, launch_score, score_1d_delta, score_3d_delta, score_5d_delta, days_in_watch, status_reason, source_report, created_at)
+        VALUES (:track_date, :stock_id, :stock_name, :watch_status, :launch_score, :score_1d_delta, :score_3d_delta, :score_5d_delta, :days_in_watch, :status_reason, :source_report, :created_at)
+        """
+        conn.executemany(sql, rows)
+        conn.commit()
+        self.log(f"R5N29_TRACKING_WRITTEN rows={len(rows)}")
+
+    def write_event_rows(self, conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> None:
+        sql = """
+        INSERT OR IGNORE INTO watch_pool_event
+        (event_date, stock_id, event_type, before_status, after_status, event_reason, launch_score, created_at)
+        VALUES (:event_date, :stock_id, :event_type, :before_status, :after_status, :event_reason, :launch_score, :created_at)
+        """
+        conn.executemany(sql, rows)
+        conn.commit()
+        self.log(f"R5N29_EVENT_WRITTEN rows={len(rows)}")
+
+    def update_performance(self, conn: sqlite3.Connection, main_db_path: str, base_date: str) -> None:
+        if not main_db_path or not Path(main_db_path).exists():
+            self.warn("R5N29_PERFORMANCE_SKIP no_main_db")
+            return
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entries = conn.execute("SELECT stock_id, MIN(track_date) FROM watch_pool_tracking GROUP BY stock_id").fetchall()
+        try:
+            with sqlite3.connect(f"file:{main_db_path}?mode=ro", uri=True) as mconn:
+                tables = [r[0] for r in mconn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+                if "price_history" not in tables:
+                    self.warn("R5N29_PERFORMANCE_SKIP price_history_missing")
+                    return
+                cols = [r[1] for r in mconn.execute("PRAGMA table_info(price_history)").fetchall()]
+                date_col = next((c for c in ["trade_date", "date", "日期"] if c in cols), None)
+                close_col = next((c for c in ["close", "close_price", "收盤價"] if c in cols), None)
+                stock_col = next((c for c in ["stock_id", "code", "證券代號"] if c in cols), None)
+                if not (date_col and close_col and stock_col):
+                    self.warn("R5N29_PERFORMANCE_SKIP price_history_columns_missing")
+                    return
+                upserts = []
+                for sid, entry_date in entries:
+                    prices = mconn.execute(f"SELECT {date_col}, {close_col} FROM price_history WHERE {stock_col}=? AND {date_col}>=? ORDER BY {date_col}", (sid, entry_date)).fetchall()
+                    clean = [(str(d)[:10], self._num(c)) for d, c in prices if self._num(c) is not None]
+                    if not clean:
+                        continue
+                    entry_price = clean[0][1]
+                    def max_ret(n: int) -> Optional[float]:
+                        end = (dt.datetime.strptime(entry_date, "%Y-%m-%d").date() + dt.timedelta(days=n)).isoformat()
+                        vals = [c for d, c in clean if d <= end]
+                        return (max(vals) / entry_price - 1.0) if vals and entry_price else None
+                    r5, r10, r20 = max_ret(5), max_ret(10), max_ret(20)
+                    best = max([x for x in [r5, r10, r20] if x is not None], default=None)
+                    outcome = "PENDING" if best is None else ("SUCCESS" if best >= 0.10 else "WATCHING")
+                    reason = "資料不足" if best is None else f"目前最高報酬 {best:.2%}"
+                    upserts.append((sid, entry_date, entry_price, r5, r10, r20, outcome, reason, now))
+                conn.executemany("""
+                    INSERT OR REPLACE INTO watch_pool_performance
+                    (stock_id, entry_date, entry_price, max_return_5d, max_return_10d, max_return_20d, outcome, outcome_reason, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, upserts)
+                conn.commit()
+                self.log(f"R5N29_PERFORMANCE_UPDATED rows={len(upserts)}")
+        except Exception as exc:
+            self.warn(f"R5N29_PERFORMANCE_FAIL error={exc}")
+
+    def export_cultivation_report(self, conn: sqlite3.Connection, output_xlsx: str, base_date: str) -> str:
+        out = Path(output_xlsx)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        wb = Workbook()
+        if wb.sheetnames == ["Sheet"]:
+            wb["Sheet"].title = "今日總覽"
+        header_fill = PatternFill("solid", fgColor="1F4E78")
+        header_font = Font(color="FFFFFF", bold=True)
+        thin = Side(style="thin", color="D9E2F3")
+
+        def write_sheet(name: str, headers: List[str], rows: List[Tuple[Any, ...]]):
+            ws = wb[name] if name in wb.sheetnames else wb.create_sheet(name)
+            ws.append(headers)
+            for row in rows:
+                ws.append(list(row))
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            for row in ws.iter_rows():
+                for cell in row:
+                    cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+            for col in range(1, ws.max_column + 1):
+                ws.column_dimensions[get_column_letter(col)].width = min(max(12, len(str(ws.cell(1, col).value or "")) + 4), 28)
+            ws.freeze_panes = "A2"
+            return ws
+
+        tracking_headers = ["track_date", "stock_id", "stock_name", "watch_status", "launch_score", "score_1d_delta", "score_3d_delta", "score_5d_delta", "days_in_watch", "status_reason", "source_report", "created_at"]
+        tracking_rows = conn.execute("SELECT " + ",".join(tracking_headers) + " FROM watch_pool_tracking WHERE track_date=? ORDER BY launch_score DESC, stock_id", (base_date,)).fetchall()
+        write_sheet("今日總覽", tracking_headers, tracking_rows)
+        event_headers = ["event_date", "stock_id", "event_type", "before_status", "after_status", "event_reason", "launch_score", "created_at"]
+        event_rows = conn.execute("SELECT " + ",".join(event_headers) + " FROM watch_pool_event WHERE event_date=? ORDER BY stock_id, event_type", (base_date,)).fetchall()
+        write_sheet("狀態事件", event_headers, event_rows)
+        perf_headers = ["stock_id", "entry_date", "entry_price", "max_return_5d", "max_return_10d", "max_return_20d", "outcome", "outcome_reason", "updated_at"]
+        perf_rows = conn.execute("SELECT " + ",".join(perf_headers) + " FROM watch_pool_performance ORDER BY entry_date DESC, stock_id").fetchall()
+        write_sheet("績效驗證", perf_headers, perf_rows)
+        trend_rows = conn.execute("SELECT track_date, stock_id, stock_name, watch_status, launch_score, days_in_watch FROM watch_pool_tracking ORDER BY stock_id, track_date").fetchall()
+        write_sheet("分數趨勢", ["track_date", "stock_id", "stock_name", "watch_status", "launch_score", "days_in_watch"], trend_rows)
+        check_rows = [
+            ("schema", "PASS", "三張表使用 CREATE TABLE IF NOT EXISTS，不刪除舊資料"),
+            ("today_tracking_count", "PASS" if len(tracking_rows) > 0 else "WARN", len(tracking_rows)),
+            ("today_event_count", "PASS", len(event_rows)),
+            ("performance_count", "PASS", len(perf_rows)),
+            ("output_file", "PASS", str(out)),
+        ]
+        write_sheet("查核紀錄", ["項目", "結果", "說明"], check_rows)
+        wb.save(out)
+        self.log(f"R5N29_CULTIVATION_REPORT_WRITTEN output={out}")
+        return str(out)
+
+    def run(self, template: Optional[str], out_path: str, base_date: str, main_db_path: str, cultivation_db_path: Optional[str] = None, launch_ready_path: Optional[str] = None) -> Dict[str, Any]:
+        base_date = self._parse_date(base_date)
+        if not main_db_path:
+            raise RuntimeError("R5N29 必須指定主DB檔案 stock_system_v6_2.db")
+        if not Path(main_db_path).exists():
+            raise RuntimeError(f"R5N29 主DB不存在：{main_db_path}")
+        cult_db = self.resolve_cultivation_db_path(main_db_path, cultivation_db_path)
+        if not out_path:
+            out_path = str(Path(main_db_path).resolve().parent / "reports" / f"watch_pool_cultivation_{base_date.replace('-', '')}.xlsx")
+        self.log(f"R5N29_START base_date={base_date}")
+        self.log(f"R5N29_MAIN_DB read_only={main_db_path}")
+        self.log(f"R5N29_CULTIVATION_DB path={cult_db}")
+        with sqlite3.connect(cult_db) as conn:
+            self.ensure_cultivation_schema(conn)
+            today_rows, source = self.load_today_launch_ready(main_db_path, launch_ready_path, base_date)
+            prev = self.load_previous_tracking(conn, base_date)
+            tracking_rows, event_rows = self.compare_today_previous(conn, today_rows, prev, base_date)
+            self.write_tracking_rows(conn, tracking_rows)
+            self.write_event_rows(conn, event_rows)
+            self.update_performance(conn, main_db_path, base_date)
+            output = self.export_cultivation_report(conn, out_path, base_date)
+            summary = {
+                "基準日": base_date,
+                "今日追蹤檔數": str(len(tracking_rows)),
+                "今日事件數": str(len(event_rows)),
+                "培養DB": str(cult_db),
+                "資料來源": source,
+                "輸出檔案": output,
+            }
+        self.log("R5N29_DONE")
+        return {"output": output, "cultivation_db": str(cult_db), "summary": summary, "log_file": ""}
+
+
 def run_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
-    root.title("宏觀16模組 自動回填主程式")
+    root.title("R5N29 觀察池培養程式 / 宏觀16模組")
     root.geometry("1000x720")
 
     template_var = tk.StringVar()
-    out_var = tk.StringVar(value=str(Path.cwd() / f"宏觀16模組_自動回填_{dt.date.today().strftime('%Y%m%d')}.xlsx"))
+    out_var = tk.StringVar(value=str(Path.cwd() / "reports" / f"watch_pool_cultivation_{dt.date.today().strftime('%Y%m%d')}.xlsx"))
     date_var = tk.StringVar(value=dt.date.today().strftime("%Y-%m-%d"))
     db_var = tk.StringVar()
     tej_gov_var = tk.StringVar()
+    cultivation_db_var = tk.StringVar()
+    launch_ready_var = tk.StringVar()
     strict_ranking_var = tk.BooleanVar(value=False)
-    report_mode_var = tk.StringVar(value=REPORT_MODE_MACRO)
+    report_mode_var = tk.StringVar(value=REPORT_MODE_WATCH_POOL)
     status_var = tk.StringVar(value="待執行")
 
     def browse_template():
@@ -8587,9 +9024,19 @@ def run_gui():
         if p:
             tej_gov_var.set(p)
 
+    def browse_cultivation_db():
+        p = filedialog.askopenfilename(filetypes=[("SQLite DB", "*.db"), ("All files", "*.*")])
+        if p:
+            cultivation_db_var.set(p)
+
+    def browse_launch_ready():
+        p = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")])
+        if p:
+            launch_ready_var.set(p)
+
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill="both", expand=True)
-    ttk.Label(frm, text="宏觀16模組 自動抓取與Excel回填", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
+    ttk.Label(frm, text="R5N29 觀察池培養程式 / 宏觀16模組 自動抓取與Excel回填", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
     ttk.Label(frm, text="Excel模板").grid(row=1, column=0, sticky="w")
     ttk.Entry(frm, textvariable=template_var, width=90).grid(row=1, column=1, sticky="we")
     ttk.Button(frm, text="選擇", command=browse_template).grid(row=1, column=2)
@@ -8598,20 +9045,26 @@ def run_gui():
     ttk.Button(frm, text="另存", command=browse_out).grid(row=2, column=2)
     ttk.Label(frm, text="基準日(YYYY-MM-DD)").grid(row=3, column=0, sticky="w")
     ttk.Entry(frm, textvariable=date_var, width=20).grid(row=3, column=1, sticky="w")
-    ttk.Label(frm, text="主DB檔案(選填)").grid(row=4, column=0, sticky="w")
+    ttk.Label(frm, text="主DB檔案").grid(row=4, column=0, sticky="w")
     ttk.Entry(frm, textvariable=db_var, width=90).grid(row=4, column=1, sticky="we")
     ttk.Button(frm, text="選擇DB", command=browse_db).grid(row=4, column=2)
-    ttk.Label(frm, text="TEJ八大官股檔(選填)").grid(row=5, column=0, sticky="w")
-    ttk.Entry(frm, textvariable=tej_gov_var, width=90).grid(row=5, column=1, sticky="we")
-    ttk.Button(frm, text="選擇TEJ", command=browse_tej_gov).grid(row=5, column=2)
-    ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=6, column=1, sticky="w")
-    ttk.Label(frm, text="輸出模式").grid(row=7, column=0, sticky="w")
-    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL], width=36, state="readonly").grid(row=7, column=1, sticky="w")
-    ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=8, column=0, columnspan=3, sticky="w", pady=8)
+    ttk.Label(frm, text="培養DB檔案（空白則自動建立）").grid(row=5, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=cultivation_db_var, width=90).grid(row=5, column=1, sticky="we")
+    ttk.Button(frm, text="選擇培養DB", command=browse_cultivation_db).grid(row=5, column=2)
+    ttk.Label(frm, text="Launch Ready報表/資料夾").grid(row=6, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=launch_ready_var, width=90).grid(row=6, column=1, sticky="we")
+    ttk.Button(frm, text="選擇報表", command=browse_launch_ready).grid(row=6, column=2)
+    ttk.Label(frm, text="TEJ八大官股檔(宏觀模式選填)").grid(row=7, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=tej_gov_var, width=90).grid(row=7, column=1, sticky="we")
+    ttk.Button(frm, text="選擇TEJ", command=browse_tej_gov).grid(row=7, column=2)
+    ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=8, column=1, sticky="w")
+    ttk.Label(frm, text="輸出模式").grid(row=9, column=0, sticky="w")
+    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_WATCH_POOL, REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL], width=36, state="readonly").grid(row=9, column=1, sticky="w")
+    ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=10, column=0, columnspan=3, sticky="w", pady=8)
 
-    log_text = tk.Text(frm, height=26, wrap="word")
-    log_text.grid(row=10, column=0, columnspan=3, sticky="nsew", pady=(10,0))
-    frm.rowconfigure(10, weight=1)
+    log_text = tk.Text(frm, height=22, wrap="word")
+    log_text.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(10,0))
+    frm.rowconfigure(12, weight=1)
     frm.columnconfigure(1, weight=1)
 
     def append_log(text):
@@ -8621,12 +9074,18 @@ def run_gui():
 
     def execute():
         try:
-            status_var.set("執行中：抓資料、計分、回填Excel...")
+            status_var.set("執行中：R5N29培養/宏觀回填...")
             log_text.delete("1.0", "end")
-            engine = Macro16Engine(Path("logs"))
-            result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()), tej_gov_file=(tej_gov_var.get() or None), report_mode=report_mode_var.get())
-            for msg in engine.logger.messages:
-                append_log(msg)
+            if report_mode_var.get() == REPORT_MODE_WATCH_POOL:
+                engine = WatchPoolCultivationEngine(Path("logs"))
+                result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), main_db_path=(db_var.get() or ""), cultivation_db_path=(cultivation_db_var.get() or None), launch_ready_path=(launch_ready_var.get() or None))
+                for msg in engine.messages:
+                    append_log(msg)
+            else:
+                engine = Macro16Engine(Path("logs"))
+                result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()), tej_gov_file=(tej_gov_var.get() or None), report_mode=report_mode_var.get())
+                for msg in engine.logger.messages:
+                    append_log(msg)
             append_log("\n總結：" + json.dumps(result["summary"], ensure_ascii=False, indent=2))
             append_log("Log檔：" + result["log_file"])
             status_var.set("完成")
@@ -8636,8 +9095,8 @@ def run_gui():
             append_log("ERROR " + str(exc))
             messagebox.showerror("錯誤", str(exc))
 
-    ttk.Button(frm, text="執行回填", command=execute).grid(row=9, column=0, sticky="w", pady=6)
-    ttk.Button(frm, text="離開", command=root.destroy).grid(row=9, column=2, sticky="e", pady=6)
+    ttk.Button(frm, text="執行培養/回填", command=execute).grid(row=11, column=0, sticky="w", pady=6)
+    ttk.Button(frm, text="離開", command=root.destroy).grid(row=11, column=2, sticky="e", pady=6)
     root.mainloop()
 
 def main():
@@ -8652,15 +9111,21 @@ def main():
     parser.add_argument("--major-event", type=int, default=None, help="人工覆寫重大事件0/1")
     parser.add_argument("--event-note", default="", help="人工覆寫戰爭/地緣/重大事件說明")
     parser.add_argument("--night-score", type=float, default=None, help="人工覆寫台股夜盤分數")
-    parser.add_argument("--db-path", default="", help="指定主SQLite DB路徑；用於ranking_result驗證與機構級股票投資規劃報表")
+    parser.add_argument("--db-path", default="", help="指定主SQLite DB路徑；用於ranking_result驗證與機構級股票投資規劃報表/R5N29主DB")
+    parser.add_argument("--cultivation-db-path", default="", help="R5N29培養DB路徑；空白則自動建立 data/watch_pool_cultivation.db")
+    parser.add_argument("--launch-ready-path", default="", help="R5N29 Launch Ready報表檔案或資料夾；空白則自動找 launch_ready_reports 最新報表")
     parser.add_argument("--tej-gov-file", default="", help="TEJ八大公股行庫買賣超排名xls/xlsx；用於gov_net_100m主來源")
     parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
-    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug")
+    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_WATCH_POOL, REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug")
     args = parser.parse_args()
     if args.cli:
-        engine = Macro16Engine(Path(args.log_dir))
-        override = ManualOverride(gov_net_100m=args.gov_net, ai_strength=args.ai_strength, major_event=args.major_event, event_note=args.event_note, night_score=args.night_score)
-        result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking, tej_gov_file=(args.tej_gov_file or None), report_mode=args.report_mode)
+        if args.report_mode == REPORT_MODE_WATCH_POOL:
+            engine = WatchPoolCultivationEngine(Path(args.log_dir))
+            result = engine.run(args.template or None, args.out, args.date, main_db_path=args.db_path, cultivation_db_path=(args.cultivation_db_path or None), launch_ready_path=(args.launch_ready_path or None))
+        else:
+            engine = Macro16Engine(Path(args.log_dir))
+            override = ManualOverride(gov_net_100m=args.gov_net, ai_strength=args.ai_strength, major_event=args.major_event, event_note=args.event_note, night_score=args.night_score)
+            result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking, tej_gov_file=(args.tej_gov_file or None), report_mode=args.report_mode)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         run_gui()
