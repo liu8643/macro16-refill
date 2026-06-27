@@ -8526,23 +8526,20 @@ class Macro16Engine:
             self.logger.warning(f"R5N29Q_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
             return None
 
-    def _prepare_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str) -> Dict[str, str]:
-        """R5N29AA：Macro16 與 Watch Pool 培養流程正式分離。
+    def _prepare_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str, cultivation_db_path: Optional[str] = None, launch_ready_path: Optional[str] = None) -> Dict[str, str]:
+        """R5N29AB：Macro16完成後的 Watch Pool 旁路輸出。
 
-        設計依據：
-        - macro_refill 是原宏觀16回填功能。
-        - watch_pool_cultivation 才是 R5N29 觀察池培養功能，負責讀 Launch Ready、
-          更新 watch_pool_cultivation.db、輸出培養報表與 data/watch_pool_cultivation.db。
+        正確設計：macro_refill 與 watch_pool_cultivation 是不同主流程；
+        但 Macro16 日常回填完成後，若 UI/CLI 有填「培養DB」或「Launch Ready」欄位，
+        必須執行附加培養輸出：
+        1. 同步/建立 data/watch_pool_cultivation.db。
+        2. 若有 Launch Ready，讀取並刷新培養DB；若沒有，依 WatchPoolCultivationEngine 原規則回退讀主DB。
+        3. 輸出 reports/watch_pool_cultivation_YYYYMMDD.xlsx。
 
-        因此 macro_refill 模式不得再：
-        1. 讀取或假裝使用 Launch Ready 報表。
-        2. 複製 root 的 watch_pool_cultivation.db 到 data/ 當成本次產出。
-        3. 以既有 cultivation DB 重建 watch_pool_cultivation_YYYYMMDD.xlsx。
-
-        本函式只保留 macro_refill 所需的工作資料夾建立，並用 Log 明確標示
-        R5N29 已跳過，避免使用者把既有 DB 重建誤判成正式培養流程。
+        這不是把 macro_refill 改成 watch_pool_cultivation，而是在 macro_refill 後段補上
+        使用者已填 R5N29 欄位時的旁路培養交付物，避免資料夾空白或誤判沒有產出。
         """
-        result = {"data_folder": "", "reports_folder": "", "logs_folder": "", "cultivation_db": "", "cultivation_report": ""}
+        result = {"data_folder": "", "reports_folder": "", "logs_folder": "", "cultivation_db": "", "cultivation_report": "", "manifest": ""}
         try:
             base_dir = Path(db_path).resolve().parent if db_path else Path(out_path).resolve().parent
             data_dir = base_dir / "data"
@@ -8551,18 +8548,46 @@ class Macro16Engine:
             for d in (data_dir, reports_dir, logs_dir):
                 d.mkdir(parents=True, exist_ok=True)
             result.update({"data_folder": str(data_dir), "reports_folder": str(reports_dir), "logs_folder": str(logs_dir)})
+
+            has_r5n29_input = bool(str(cultivation_db_path or "").strip()) or bool(str(launch_ready_path or "").strip())
+            if not has_r5n29_input:
+                self.logger.info(f"R5N29AB_MACRO_SIDE_NO_R5N29_INPUT folders={result}")
+                return result
+            if not db_path or not Path(db_path).exists():
+                self.logger.warning(f"R5N29AB_MACRO_SIDE_SKIP_NO_MAIN_DB db_path={db_path} folders={result}")
+                return result
+
+            report_date = str(base_date or dt.date.today().isoformat())
+            report_out = reports_dir / f"watch_pool_cultivation_{report_date.replace('-', '')}.xlsx"
             self.logger.info(
-                "R5N29AA_MACRO_REFILL_WATCH_POOL_SKIPPED "
-                "reason=macro_refill與watch_pool_cultivation為不同功能；"
-                "若要讀LaunchReady並更新培養DB，請改用report_mode=watch_pool_cultivation "
-                f"folders={result}"
+                "R5N29AB_MACRO_SIDE_WATCH_POOL_START "
+                f"main_db={db_path} cultivation_db_path={cultivation_db_path or ''} "
+                f"launch_ready_path={launch_ready_path or ''} report={report_out}"
             )
+            helper = WatchPoolCultivationEngine(logs_dir)
+            wp_result = helper.run(
+                template=None,
+                out_path=str(report_out),
+                base_date=report_date,
+                main_db_path=db_path,
+                cultivation_db_path=(cultivation_db_path or None),
+                launch_ready_path=(launch_ready_path or None),
+            )
+            for msg in helper.messages:
+                self.logger.info("R5N29AB_SIDE_ENGINE " + msg)
+            data_outputs = wp_result.get("data_outputs", {}) if isinstance(wp_result, dict) else {}
+            result.update({
+                "cultivation_db": data_outputs.get("cultivation_db_data_copy") or wp_result.get("cultivation_db", ""),
+                "cultivation_report": data_outputs.get("cultivation_report_reports_copy") or wp_result.get("output", ""),
+                "manifest": data_outputs.get("manifest", ""),
+            })
+            self.logger.info(f"R5N29AB_MACRO_SIDE_WATCH_POOL_DONE outputs={result}")
             return result
         except Exception as exc:
-            self.logger.warning(f"R5N29AA_PREPARE_MACRO_FOLDERS_FAIL error={exc}")
+            self.logger.warning(f"R5N29AB_MACRO_SIDE_WATCH_POOL_FAIL error={exc} folders={result}")
             return result
 
-    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
+    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO, cultivation_db_path: Optional[str] = None, launch_ready_path: Optional[str] = None) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
         self.logger.info("CHANGELOG v3.0.0: Add AI Project Rotation Monitor sheets and full 201-stock AI tracking page")
         self.logger.strategy_trace("STRATEGY_VERSION", {"strategy_version": STRATEGY_VERSION, "program_version": VERSION})
@@ -8659,7 +8684,7 @@ class Macro16Engine:
             # R5N29Q FIX：培養報表屬於使用者執行日/觀察池日期，不可用 TWSE fallback 後的 market.base_date 命名。
             # 否則 2026-06-27 執行但交易所回補到 2026-06-26 時，會錯產 watch_pool_cultivation_20260626.xlsx。
             cultivation_output_date = base_date or market.base_date or dt.date.today().isoformat()
-            data_outputs = self._prepare_macro_side_data_outputs(output, db_path, cultivation_output_date)
+            data_outputs = self._prepare_macro_side_data_outputs(output, db_path, cultivation_output_date, cultivation_db_path=cultivation_db_path, launch_ready_path=launch_ready_path)
             summary["data_folder"] = data_outputs.get("data_folder", "")
             summary["reports_folder"] = data_outputs.get("reports_folder", "")
             summary["logs_folder"] = data_outputs.get("logs_folder", "")
@@ -9682,7 +9707,7 @@ def run_gui():
                     append_log(msg)
             else:
                 engine = Macro16Engine(Path("logs"))
-                result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()), tej_gov_file=(tej_gov_var.get() or None), report_mode=report_mode_var.get())
+                result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()), tej_gov_file=(tej_gov_var.get() or None), report_mode=report_mode_var.get(), cultivation_db_path=(cultivation_db_var.get() or None), launch_ready_path=(launch_ready_var.get() or None))
                 for msg in engine.logger.messages:
                     append_log(msg)
             append_log("\n總結：" + json.dumps(result["summary"], ensure_ascii=False, indent=2))
@@ -9712,7 +9737,7 @@ def main():
     parser.add_argument("--night-score", type=float, default=None, help="人工覆寫台股夜盤分數")
     parser.add_argument("--db-path", default="", help="指定主SQLite DB路徑；用於ranking_result驗證與機構級股票投資規劃報表/R5N29主DB")
     parser.add_argument("--cultivation-db-path", default="", help="R5N29培養DB路徑；空白則自動建立 data/watch_pool_cultivation.db")
-    parser.add_argument("--launch-ready-path", default="", help="R5N29 Launch Ready報表檔案或資料夾；僅report-mode=watch_pool_cultivation時使用；空白則自動找 launch_ready_reports 最新報表")
+    parser.add_argument("--launch-ready-path", default="", help="R5N29 Launch Ready報表檔案或資料夾；watch_pool_cultivation模式直接使用；macro_refill模式若有填則在宏觀報表完成後執行旁路培養輸出")
     parser.add_argument("--tej-gov-file", default="", help="TEJ八大公股行庫買賣超排名xls/xlsx；用於gov_net_100m主來源")
     parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
     parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug")
@@ -9724,7 +9749,7 @@ def main():
         else:
             engine = Macro16Engine(Path(args.log_dir))
             override = ManualOverride(gov_net_100m=args.gov_net, ai_strength=args.ai_strength, major_event=args.major_event, event_note=args.event_note, night_score=args.night_score)
-            result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking, tej_gov_file=(args.tej_gov_file or None), report_mode=args.report_mode)
+            result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking, tej_gov_file=(args.tej_gov_file or None), report_mode=args.report_mode, cultivation_db_path=(args.cultivation_db_path or None), launch_ready_path=(args.launch_ready_path or None))
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         run_gui()
