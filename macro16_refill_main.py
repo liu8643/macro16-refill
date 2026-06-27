@@ -3590,10 +3590,16 @@ class CPOThemeEngine:
             out["is_cpo"] = False
             return out
         out["stock_id"] = out["stock_id"].astype(str).str.zfill(4)
-        drop_cols = [c for c in ["is_cpo","cpo_theme","cpo_subtheme","cpo_layer","cpo_score","cpo_strategy","cpo_directness","cpo_source","cpo_note"] if c in out.columns]
+        # R5N29Q FIX：避免 CPO master 內的 stock_name 與主資料流既有 stock_name / stock_name_x / stock_name_y
+        # 重複合併，造成 pandas merge suffixes duplicate columns 錯誤。
+        # CPO apply 只需要補 CPO 屬性欄位，不應覆蓋主資料流的正式股名。
+        cpo_cols = ["stock_id", "cpo_theme", "cpo_subtheme", "cpo_layer", "cpo_score", "cpo_strategy", "cpo_directness", "cpo_source", "cpo_note"]
+        merge_cols = [c for c in cpo_cols if c in master.columns]
+        drop_cols = [c for c in merge_cols if c != "stock_id" and c in out.columns]
         if drop_cols:
             out = out.drop(columns=drop_cols)
-        out = out.merge(master, on="stock_id", how="left")
+        # 若舊資料流已存在 stock_name_x/stock_name_y，不再讓 CPO merge 產生任何 stock_name suffix。
+        out = out.merge(master[merge_cols].drop_duplicates("stock_id"), on="stock_id", how="left")
         out["is_cpo"] = out["cpo_theme"].notna()
         out["cpo_score"] = pd.to_numeric(out["cpo_score"], errors="coerce").fillna(0)
         if self.logger:
@@ -8473,7 +8479,7 @@ class Macro16Engine:
         return None
 
     def _resolve_existing_cultivation_report_date(self, conn: sqlite3.Connection, base_date: str) -> str:
-        """R5N29O：報表輸出日期必須與實際 tracking 資料一致。
+        """R5N29Q：報表輸出日期必須與實際 tracking 資料一致。
 
         R5N29N 的問題是 macro_refill 使用 market.base_date（交易所回補日）
         去命名 cultivation 報表，導致 UI 基準日為 2026-06-27 時，
@@ -8497,7 +8503,7 @@ class Macro16Engine:
         return d or dt.date.today().isoformat()
 
     def _export_existing_cultivation_report_if_possible(self, base_dir: Path, cult_db: Path, base_date: str, main_db_path: Optional[str] = None) -> Optional[Path]:
-        """R5N29O：用既有培養DB重建培養報表，且不沿用過期報表。
+        """R5N29Q：用既有培養DB重建培養報表，且不沿用過期報表。
 
         修正 R5N29N 問題：
         1. 不再先找舊報表直接 return，避免 reports 裡已有 20260626 報表時，
@@ -8514,10 +8520,10 @@ class Macro16Engine:
                 out = base_dir / "reports" / f"watch_pool_cultivation_{str(report_date or '').replace('-', '')}.xlsx"
                 out.parent.mkdir(parents=True, exist_ok=True)
                 helper.export_cultivation_report(conn, str(out), report_date)
-            self.logger.info(f"R5N29O_EXISTING_CULTIVATION_REPORT_REBUILT path={out} requested_base_date={base_date} report_date={report_date}")
+            self.logger.info(f"R5N29Q_EXISTING_CULTIVATION_REPORT_REBUILT path={out} requested_base_date={base_date} report_date={report_date}")
             return out
         except Exception as exc:
-            self.logger.warning(f"R5N29O_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
+            self.logger.warning(f"R5N29Q_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
             return None
 
     def _prepare_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str) -> Dict[str, str]:
@@ -8560,10 +8566,10 @@ class Macro16Engine:
                 report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date, db_path)
                 if report:
                     result["cultivation_report"] = str(report)
-            self.logger.info(f"R5N29O_DATA_ZIP_DISABLED folders={result}")
+            self.logger.info(f"R5N29Q_DATA_ZIP_DISABLED folders={result}")
             return result
         except Exception as exc:
-            self.logger.warning(f"R5N29N_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
+            self.logger.warning(f"R5N29Q_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
             return result
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
@@ -8660,7 +8666,7 @@ class Macro16Engine:
         # 原因：data.zip 只是附件/交付包形式，不是每日培養迴路的工作資料。
         data_outputs: Dict[str, str] = {}
         if report_mode in (REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_TEACHER_FULL, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL):
-            # R5N29O FIX：培養報表屬於使用者執行日/觀察池日期，不可用 TWSE fallback 後的 market.base_date 命名。
+            # R5N29Q FIX：培養報表屬於使用者執行日/觀察池日期，不可用 TWSE fallback 後的 market.base_date 命名。
             # 否則 2026-06-27 執行但交易所回補到 2026-06-26 時，會錯產 watch_pool_cultivation_20260626.xlsx。
             cultivation_output_date = base_date or market.base_date or dt.date.today().isoformat()
             data_outputs = self._prepare_macro_side_data_outputs(output, db_path, cultivation_output_date)
