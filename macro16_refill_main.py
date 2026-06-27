@@ -77,7 +77,7 @@ REPORT_MODE_INSTITUTIONAL = "institutional_report"
 REPORT_MODE_MACRO_TEACHER = "macro_teacher"
 REPORT_MODE_TEACHER_FULL = "teacher_full"
 REPORT_MODE_ALL = "all"
-# R5N29：獨立觀察池培養輸出模式。只讀主DB與Launch Ready報表，寫入培養DB。
+# R5N29：獨立觀察池培養模式；非預設，不影響原宏觀16 / 老師策略報表。
 REPORT_MODE_WATCH_POOL = "watch_pool_cultivation"
 MACRO_REFILL_SHEETS = ["市場輸入", "宏觀16模組", "V2技術引擎"]
 
@@ -8553,11 +8553,6 @@ class Macro16Engine:
         return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file)}
 
 
-# =============================================================================
-# R5N29 Watch Pool Cultivation Engine
-# 目的：獨立觀察池培養程式；不寫主DB，只讀 stock_system_v6_2.db 與 Launch Ready 報表，
-#       並將跨日追蹤結果累積到 watch_pool_cultivation.db。
-# =============================================================================
 class WatchPoolCultivationEngine:
     """R5N29：觀察池培養引擎。"""
 
@@ -8982,7 +8977,13 @@ class WatchPoolCultivationEngine:
                 "輸出檔案": output,
             }
         self.log("R5N29_DONE")
-        return {"output": output, "cultivation_db": str(cult_db), "summary": summary, "log_file": ""}
+        log_file = self.log_dir / f"r5n29_watch_pool_{base_date.replace('-', '')}_{dt.datetime.now().strftime('%H%M%S')}.log"
+        try:
+            log_file.write_text("\n".join(self.messages), encoding="utf-8")
+        except Exception as exc:
+            self.warn(f"R5N29_LOG_WRITE_FAIL {exc}")
+        return {"output": output, "cultivation_db": str(cult_db), "summary": summary, "log_file": str(log_file)}
+
 
 
 def run_gui():
@@ -8990,18 +8991,19 @@ def run_gui():
     from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
-    root.title("R5N29 觀察池培養程式 / 宏觀16模組")
-    root.geometry("1000x720")
+    root.title("宏觀16模組 自動回填主程式 / R5N29觀察池培養")
+    root.geometry("1000x760")
 
     template_var = tk.StringVar()
-    out_var = tk.StringVar(value=str(Path.cwd() / "reports" / f"watch_pool_cultivation_{dt.date.today().strftime('%Y%m%d')}.xlsx"))
+    out_var = tk.StringVar(value=str(Path.cwd() / f"宏觀16模組_自動回填_{dt.date.today().strftime('%Y%m%d')}.xlsx"))
     date_var = tk.StringVar(value=dt.date.today().strftime("%Y-%m-%d"))
     db_var = tk.StringVar()
     tej_gov_var = tk.StringVar()
     cultivation_db_var = tk.StringVar()
     launch_ready_var = tk.StringVar()
     strict_ranking_var = tk.BooleanVar(value=False)
-    report_mode_var = tk.StringVar(value=REPORT_MODE_WATCH_POOL)
+    # P0恢復：預設一定是原始宏觀回填，不得預設為R5N29培養。
+    report_mode_var = tk.StringVar(value=REPORT_MODE_MACRO)
     status_var = tk.StringVar(value="待執行")
 
     def browse_template():
@@ -9030,13 +9032,15 @@ def run_gui():
             cultivation_db_var.set(p)
 
     def browse_launch_ready():
-        p = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")])
+        p = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")])
+        if not p:
+            p = filedialog.askdirectory()
         if p:
             launch_ready_var.set(p)
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill="both", expand=True)
-    ttk.Label(frm, text="R5N29 觀察池培養程式 / 宏觀16模組 自動抓取與Excel回填", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
+    ttk.Label(frm, text="宏觀16模組 自動抓取與Excel回填 / R5N29觀察池培養", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
     ttk.Label(frm, text="Excel模板").grid(row=1, column=0, sticky="w")
     ttk.Entry(frm, textvariable=template_var, width=90).grid(row=1, column=1, sticky="we")
     ttk.Button(frm, text="選擇", command=browse_template).grid(row=1, column=2)
@@ -9045,24 +9049,24 @@ def run_gui():
     ttk.Button(frm, text="另存", command=browse_out).grid(row=2, column=2)
     ttk.Label(frm, text="基準日(YYYY-MM-DD)").grid(row=3, column=0, sticky="w")
     ttk.Entry(frm, textvariable=date_var, width=20).grid(row=3, column=1, sticky="w")
-    ttk.Label(frm, text="主DB檔案").grid(row=4, column=0, sticky="w")
+    ttk.Label(frm, text="主DB檔案(選填；R5N29必填)").grid(row=4, column=0, sticky="w")
     ttk.Entry(frm, textvariable=db_var, width=90).grid(row=4, column=1, sticky="we")
     ttk.Button(frm, text="選擇DB", command=browse_db).grid(row=4, column=2)
-    ttk.Label(frm, text="培養DB檔案（空白則自動建立）").grid(row=5, column=0, sticky="w")
-    ttk.Entry(frm, textvariable=cultivation_db_var, width=90).grid(row=5, column=1, sticky="we")
-    ttk.Button(frm, text="選擇培養DB", command=browse_cultivation_db).grid(row=5, column=2)
-    ttk.Label(frm, text="Launch Ready報表/資料夾").grid(row=6, column=0, sticky="w")
-    ttk.Entry(frm, textvariable=launch_ready_var, width=90).grid(row=6, column=1, sticky="we")
-    ttk.Button(frm, text="選擇報表", command=browse_launch_ready).grid(row=6, column=2)
-    ttk.Label(frm, text="TEJ八大官股檔(宏觀模式選填)").grid(row=7, column=0, sticky="w")
-    ttk.Entry(frm, textvariable=tej_gov_var, width=90).grid(row=7, column=1, sticky="we")
-    ttk.Button(frm, text="選擇TEJ", command=browse_tej_gov).grid(row=7, column=2)
+    ttk.Label(frm, text="TEJ八大官股檔(宏觀模式選填)").grid(row=5, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=tej_gov_var, width=90).grid(row=5, column=1, sticky="we")
+    ttk.Button(frm, text="選擇TEJ", command=browse_tej_gov).grid(row=5, column=2)
+    ttk.Label(frm, text="培養DB檔案（R5N29；空白則自動建立）").grid(row=6, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=cultivation_db_var, width=90).grid(row=6, column=1, sticky="we")
+    ttk.Button(frm, text="選擇培養DB", command=browse_cultivation_db).grid(row=6, column=2)
+    ttk.Label(frm, text="Launch Ready報表/資料夾（R5N29選填）").grid(row=7, column=0, sticky="w")
+    ttk.Entry(frm, textvariable=launch_ready_var, width=90).grid(row=7, column=1, sticky="we")
+    ttk.Button(frm, text="選擇報表", command=browse_launch_ready).grid(row=7, column=2)
     ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=8, column=1, sticky="w")
     ttk.Label(frm, text="輸出模式").grid(row=9, column=0, sticky="w")
-    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_WATCH_POOL, REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL], width=36, state="readonly").grid(row=9, column=1, sticky="w")
+    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], width=36, state="readonly").grid(row=9, column=1, sticky="w")
     ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=10, column=0, columnspan=3, sticky="w", pady=8)
 
-    log_text = tk.Text(frm, height=22, wrap="word")
+    log_text = tk.Text(frm, height=24, wrap="word")
     log_text.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(10,0))
     frm.rowconfigure(12, weight=1)
     frm.columnconfigure(1, weight=1)
@@ -9074,11 +9078,13 @@ def run_gui():
 
     def execute():
         try:
-            status_var.set("執行中：R5N29培養/宏觀回填...")
+            status_var.set("執行中...")
             log_text.delete("1.0", "end")
             if report_mode_var.get() == REPORT_MODE_WATCH_POOL:
+                if not db_var.get():
+                    raise RuntimeError("R5N29觀察池培養必須指定主DB檔案")
                 engine = WatchPoolCultivationEngine(Path("logs"))
-                result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), main_db_path=(db_var.get() or ""), cultivation_db_path=(cultivation_db_var.get() or None), launch_ready_path=(launch_ready_var.get() or None))
+                result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), main_db_path=db_var.get(), cultivation_db_path=(cultivation_db_var.get() or None), launch_ready_path=(launch_ready_var.get() or None))
                 for msg in engine.messages:
                     append_log(msg)
             else:
@@ -9087,7 +9093,7 @@ def run_gui():
                 for msg in engine.logger.messages:
                     append_log(msg)
             append_log("\n總結：" + json.dumps(result["summary"], ensure_ascii=False, indent=2))
-            append_log("Log檔：" + result["log_file"])
+            append_log("Log檔：" + result.get("log_file", ""))
             status_var.set("完成")
             messagebox.showinfo("完成", f"已輸出：{result['output']}")
         except Exception as exc:
@@ -9095,7 +9101,7 @@ def run_gui():
             append_log("ERROR " + str(exc))
             messagebox.showerror("錯誤", str(exc))
 
-    ttk.Button(frm, text="執行培養/回填", command=execute).grid(row=11, column=0, sticky="w", pady=6)
+    ttk.Button(frm, text="執行回填/培養", command=execute).grid(row=11, column=0, sticky="w", pady=6)
     ttk.Button(frm, text="離開", command=root.destroy).grid(row=11, column=2, sticky="e", pady=6)
     root.mainloop()
 
@@ -9116,7 +9122,7 @@ def main():
     parser.add_argument("--launch-ready-path", default="", help="R5N29 Launch Ready報表檔案或資料夾；空白則自動找 launch_ready_reports 最新報表")
     parser.add_argument("--tej-gov-file", default="", help="TEJ八大公股行庫買賣超排名xls/xlsx；用於gov_net_100m主來源")
     parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
-    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_WATCH_POOL, REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug")
+    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug")
     args = parser.parse_args()
     if args.cli:
         if args.report_mode == REPORT_MODE_WATCH_POOL:
