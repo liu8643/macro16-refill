@@ -8487,7 +8487,7 @@ class Macro16Engine:
                 return p
         return None
 
-    def _export_existing_cultivation_report_if_possible(self, base_dir: Path, cult_db: Path, base_date: str) -> Optional[Path]:
+    def _export_existing_cultivation_report_if_possible(self, base_dir: Path, cult_db: Path, base_date: str, main_db_path: Optional[str] = None) -> Optional[Path]:
         """R5N29K：若使用者目前只有 watch_pool_cultivation.db，則用既有DB重建培養報表。
         這是包裝既有資料，不會讀主DB、不會新增 tracking/event/performance 紀錄。
         """
@@ -8504,8 +8504,10 @@ class Macro16Engine:
                 # 匯出報表前必須先執行 schema migration，否則會發生
                 # no such column: market_type，導致 reports 資料夾空白。
                 helper.ensure_cultivation_schema(conn)
+                # R5N29N FIX：R5N29M 只補 schema，舊資料內容仍空；重建報表前需用主DB回填股名/市場/產業/題材等 Snapshot。
+                helper.backfill_existing_snapshot_fields(conn, main_db_path, base_date)
                 helper.export_cultivation_report(conn, str(out), base_date)
-            self.logger.info(f"R5N29M_EXISTING_CULTIVATION_REPORT_REBUILT path={out}")
+            self.logger.info(f"R5N29N_EXISTING_CULTIVATION_REPORT_REBUILT path={out}")
             return out
         except Exception as exc:
             self.logger.warning(f"R5N29M_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
@@ -8548,13 +8550,13 @@ class Macro16Engine:
             cult_db = self._find_existing_cultivation_db(base_dir)
             if cult_db:
                 result["cultivation_db"] = str(cult_db)
-                report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date)
+                report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date, db_path)
                 if report:
                     result["cultivation_report"] = str(report)
-            self.logger.info(f"R5N29M_DATA_ZIP_DISABLED folders={result}")
+            self.logger.info(f"R5N29N_DATA_ZIP_DISABLED folders={result}")
             return result
         except Exception as exc:
-            self.logger.warning(f"R5N29M_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
+            self.logger.warning(f"R5N29N_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
             return result
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
@@ -8732,6 +8734,8 @@ class WatchPoolCultivationEngine:
             theme TEXT,
             sub_theme TEXT,
             launch_grade TEXT,
+            first_enter_date TEXT,
+            last_update_date TEXT,
             event_type TEXT,
             before_status TEXT,
             after_status TEXT,
@@ -8781,6 +8785,7 @@ class WatchPoolCultivationEngine:
         _ensure_columns("watch_pool_event", {
             "stock_name": "TEXT", "market_type": "TEXT", "industry": "TEXT",
             "theme": "TEXT", "sub_theme": "TEXT", "launch_grade": "TEXT",
+            "first_enter_date": "TEXT", "last_update_date": "TEXT",
             "before_status": "TEXT", "after_status": "TEXT", "event_reason": "TEXT", "launch_score": "REAL",
         })
         _ensure_columns("watch_pool_performance", {
@@ -8898,6 +8903,98 @@ class WatchPoolCultivationEngine:
         except Exception as exc:
             self.warn(f"R5N29L_METADATA_ENRICH_FAIL error={exc}")
         return rows
+
+    def backfill_existing_snapshot_fields(self, conn: sqlite3.Connection, main_db_path: Optional[str], base_date: Optional[str] = None) -> None:
+        """R5N29N：舊版培養DB升級後，必須同步把既有 stock_id 補成完整 Historical Snapshot。
+
+        R5N29M 只做 ALTER TABLE，會讓新增欄位存在但內容仍為空；結果報表看起來有欄位，
+        但 stock_name/market_type/industry/theme/sub_theme/launch_grade/first_enter_date/last_update_date
+        仍全空。此函式在重建報表前用主DB補齊舊資料，且只填空白欄位，不覆蓋既有歷史快照。
+        """
+        try:
+            self.ensure_cultivation_schema(conn)
+            ids = []
+            for table in ["watch_pool_tracking", "watch_pool_event", "watch_pool_performance"]:
+                try:
+                    ids.extend([str(r[0]).strip() for r in conn.execute(f"SELECT DISTINCT stock_id FROM {table} WHERE COALESCE(stock_id,'')<>''").fetchall()])
+                except Exception:
+                    pass
+            ids = sorted(set(x for x in ids if x))
+            if not ids:
+                self.log("R5N29N_BACKFILL_SKIP no_stock_id")
+                return
+
+            seed_rows = [{"stock_id": sid} for sid in ids]
+            enriched = self._enrich_rows_from_master(str(main_db_path or ""), seed_rows)
+            meta = {str(r.get("stock_id", "")).strip(): r for r in enriched if str(r.get("stock_id", "")).strip()}
+
+            def _not_blank(v: Any) -> bool:
+                return bool(str(v or "").strip())
+
+            # 若沒有主DB或主DB沒有 stocks_master，至少補 first/last date，並保留已存在欄位。
+            updated_tracking = updated_event = updated_perf = 0
+            for sid, m in meta.items():
+                vals = {
+                    "stock_name": m.get("stock_name", "") or "",
+                    "market_type": m.get("market_type", "") or "",
+                    "industry": m.get("industry", "") or "",
+                    "theme": m.get("theme", "") or "",
+                    "sub_theme": m.get("sub_theme", "") or "",
+                    "launch_grade": m.get("launch_grade", "") or "",
+                }
+                # tracking：row-level last_update_date 用 track_date；first_enter_date 用該股最早追蹤日。
+                cur = conn.execute("""
+                    UPDATE watch_pool_tracking
+                    SET stock_name=CASE WHEN COALESCE(stock_name,'')='' THEN ? ELSE stock_name END,
+                        market_type=CASE WHEN COALESCE(market_type,'')='' THEN ? ELSE market_type END,
+                        industry=CASE WHEN COALESCE(industry,'')='' THEN ? ELSE industry END,
+                        theme=CASE WHEN COALESCE(theme,'')='' THEN ? ELSE theme END,
+                        sub_theme=CASE WHEN COALESCE(sub_theme,'')='' THEN ? ELSE sub_theme END,
+                        launch_grade=CASE WHEN COALESCE(launch_grade,'')='' THEN ? ELSE launch_grade END,
+                        first_enter_date=CASE WHEN COALESCE(first_enter_date,'')='' THEN (SELECT MIN(track_date) FROM watch_pool_tracking WHERE stock_id=?) ELSE first_enter_date END,
+                        last_update_date=CASE WHEN COALESCE(last_update_date,'')='' THEN track_date ELSE last_update_date END
+                    WHERE stock_id=?
+                """, (vals["stock_name"], vals["market_type"], vals["industry"], vals["theme"], vals["sub_theme"], vals["launch_grade"], sid, sid))
+                updated_tracking += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                # event：R5N29N 起也保存 first/latest，符合三表 Historical Snapshot 設計。
+                try:
+                    cur = conn.execute("""
+                        UPDATE watch_pool_event
+                        SET stock_name=CASE WHEN COALESCE(stock_name,'')='' THEN ? ELSE stock_name END,
+                            market_type=CASE WHEN COALESCE(market_type,'')='' THEN ? ELSE market_type END,
+                            industry=CASE WHEN COALESCE(industry,'')='' THEN ? ELSE industry END,
+                            theme=CASE WHEN COALESCE(theme,'')='' THEN ? ELSE theme END,
+                            sub_theme=CASE WHEN COALESCE(sub_theme,'')='' THEN ? ELSE sub_theme END,
+                            launch_grade=CASE WHEN COALESCE(launch_grade,'')='' THEN ? ELSE launch_grade END,
+                            first_enter_date=CASE WHEN COALESCE(first_enter_date,'')='' THEN (SELECT MIN(track_date) FROM watch_pool_tracking WHERE stock_id=?) ELSE first_enter_date END,
+                            last_update_date=CASE WHEN COALESCE(last_update_date,'')='' THEN event_date ELSE last_update_date END
+                        WHERE stock_id=?
+                    """, (vals["stock_name"], vals["market_type"], vals["industry"], vals["theme"], vals["sub_theme"], vals["launch_grade"], sid, sid))
+                    updated_event += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                except Exception as event_exc:
+                    self.warn(f"R5N29N_EVENT_BACKFILL_WARN stock_id={sid} error={event_exc}")
+
+                cur = conn.execute("""
+                    UPDATE watch_pool_performance
+                    SET stock_name=CASE WHEN COALESCE(stock_name,'')='' THEN ? ELSE stock_name END,
+                        market_type=CASE WHEN COALESCE(market_type,'')='' THEN ? ELSE market_type END,
+                        industry=CASE WHEN COALESCE(industry,'')='' THEN ? ELSE industry END,
+                        theme=CASE WHEN COALESCE(theme,'')='' THEN ? ELSE theme END,
+                        sub_theme=CASE WHEN COALESCE(sub_theme,'')='' THEN ? ELSE sub_theme END,
+                        launch_grade=CASE WHEN COALESCE(launch_grade,'')='' THEN ? ELSE launch_grade END,
+                        first_enter_date=CASE WHEN COALESCE(first_enter_date,'')='' THEN entry_date ELSE first_enter_date END,
+                        last_update_date=CASE WHEN COALESCE(last_update_date,'')='' THEN COALESCE(updated_at, entry_date) ELSE last_update_date END
+                    WHERE stock_id=?
+                """, (vals["stock_name"], vals["market_type"], vals["industry"], vals["theme"], vals["sub_theme"], vals["launch_grade"], sid))
+                updated_perf += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+            conn.commit()
+            missing_name = conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE COALESCE(stock_name,'')='' ").fetchone()[0]
+            missing_meta = conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE COALESCE(market_type,'')='' OR COALESCE(industry,'')='' OR COALESCE(theme,'')='' OR COALESCE(sub_theme,'')='' ").fetchone()[0]
+            self.log(f"R5N29N_SNAPSHOT_BACKFILL_DONE ids={len(ids)} tracking_updates={updated_tracking} event_updates={updated_event} performance_updates={updated_perf} missing_stock_name={missing_name} missing_meta={missing_meta}")
+        except Exception as exc:
+            self.warn(f"R5N29N_SNAPSHOT_BACKFILL_FAIL error={exc}")
 
     def load_today_launch_ready(self, main_db_path: str, launch_ready_path: Optional[str], base_date: str) -> Tuple[List[Dict[str, Any]], str]:
         """讀取今日 Launch Ready 報表；若報表不存在，回退讀主DB常見候選表。"""
@@ -9069,7 +9166,7 @@ class WatchPoolCultivationEngine:
                 event_type = "ACCELERATING"
                 reason = f"分數單日增加 {d1:.2f}"
             if event_type:
-                events.append({"event_date": base_date, "stock_id": sid, "stock_name": row.get("stock_name", ""), "market_type": row.get("market_type", ""), "industry": row.get("industry", ""), "theme": row.get("theme", ""), "sub_theme": row.get("sub_theme", ""), "launch_grade": row.get("launch_grade", ""), "event_type": event_type, "before_status": before, "after_status": after, "event_reason": reason, "launch_score": score, "created_at": now})
+                events.append({"event_date": base_date, "stock_id": sid, "stock_name": row.get("stock_name", ""), "market_type": row.get("market_type", ""), "industry": row.get("industry", ""), "theme": row.get("theme", ""), "sub_theme": row.get("sub_theme", ""), "launch_grade": row.get("launch_grade", ""), "first_enter_date": row.get("first_enter_date", base_date), "last_update_date": row.get("last_update_date", base_date), "event_type": event_type, "before_status": before, "after_status": after, "event_reason": reason, "launch_score": score, "created_at": now})
         self.log(f"R5N29_COMPARE tracking_rows={len(tracking)} event_rows={len(events)}")
         return tracking, events
 
@@ -9086,8 +9183,8 @@ class WatchPoolCultivationEngine:
     def write_event_rows(self, conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> None:
         sql = """
         INSERT OR IGNORE INTO watch_pool_event
-        (event_date, stock_id, stock_name, market_type, industry, theme, sub_theme, launch_grade, event_type, before_status, after_status, event_reason, launch_score, created_at)
-        VALUES (:event_date, :stock_id, :stock_name, :market_type, :industry, :theme, :sub_theme, :launch_grade, :event_type, :before_status, :after_status, :event_reason, :launch_score, :created_at)
+        (event_date, stock_id, stock_name, market_type, industry, theme, sub_theme, launch_grade, first_enter_date, last_update_date, event_type, before_status, after_status, event_reason, launch_score, created_at)
+        VALUES (:event_date, :stock_id, :stock_name, :market_type, :industry, :theme, :sub_theme, :launch_grade, :first_enter_date, :last_update_date, :event_type, :before_status, :after_status, :event_reason, :launch_score, :created_at)
         """
         conn.executemany(sql, rows)
         conn.commit()
@@ -9224,7 +9321,7 @@ class WatchPoolCultivationEngine:
             tracking_rows
         )
 
-        event_headers = ["event_date", "stock_id", "stock_name", "market_type", "industry", "theme", "sub_theme", "launch_grade", "event_type", "before_status", "after_status", "event_reason", "launch_score", "created_at"]
+        event_headers = ["event_date", "stock_id", "stock_name", "market_type", "industry", "theme", "sub_theme", "launch_grade", "first_enter_date", "last_update_date", "event_type", "before_status", "after_status", "event_reason", "launch_score", "created_at"]
         event_rows = _fetch("SELECT " + ",".join(event_headers) + " FROM watch_pool_event WHERE event_date=? ORDER BY stock_id, event_type", (effective_date,))
         write_sheet("02_狀態變更事件", event_headers, event_rows)
 
@@ -9249,10 +9346,10 @@ class WatchPoolCultivationEngine:
         acceleration_rows = [(i + 1, *row) for i, row in enumerate(acceleration_source)]
         write_sheet("04_加速度排行", acceleration_headers, acceleration_rows)
 
-        exit_headers = ["event_date", "stock_id", "event_type", "before_status", "after_status", "event_reason", "launch_score", "created_at"]
+        exit_headers = ["event_date", "stock_id", "stock_name", "market_type", "industry", "theme", "sub_theme", "launch_grade", "first_enter_date", "last_update_date", "event_type", "before_status", "after_status", "event_reason", "launch_score", "created_at"]
         exit_rows = _fetch(
             """
-            SELECT event_date, stock_id, event_type, before_status, after_status, event_reason, launch_score, created_at
+            SELECT event_date, stock_id, stock_name, market_type, industry, theme, sub_theme, launch_grade, first_enter_date, last_update_date, event_type, before_status, after_status, event_reason, launch_score, created_at
             FROM watch_pool_event
             WHERE event_date=? AND (event_type='EXIT' OR after_status='EXIT')
             ORDER BY stock_id
@@ -9290,6 +9387,7 @@ class WatchPoolCultivationEngine:
             ("today_tracking_count", len(tracking_rows), "01 今日總表筆數；需 >0"),
             ("missing_stock_name_count", conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND COALESCE(stock_name,'')=''", (effective_date,)).fetchone()[0], "R5N29L 驗收：股名不可整批空白"),
             ("missing_snapshot_meta_count", conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND (COALESCE(market_type,'')='' OR COALESCE(industry,'')='' OR COALESCE(theme,'')='' OR COALESCE(sub_theme,'')='')", (effective_date,)).fetchone()[0], "R5N29L 驗收：市場/產業/題材/子題材 Snapshot 完整性"),
+            ("missing_event_snapshot_count", conn.execute("SELECT COUNT(*) FROM watch_pool_event WHERE event_date=? AND (COALESCE(stock_name,'')='' OR COALESCE(first_enter_date,'')='' OR COALESCE(last_update_date,'')='')", (effective_date,)).fetchone()[0], "R5N29N 驗收：event 表也需保存股名與進池/更新日"),
             ("today_event_count", len(event_rows), "02 狀態事件筆數；首次培養通常為 ENTER"),
             ("trend_count", len(trend_rows), "03 分數趨勢總筆數"),
             ("acceleration_rank_count", len(acceleration_rows), "04 加速度排行筆數"),
@@ -9374,6 +9472,7 @@ class WatchPoolCultivationEngine:
             self.write_tracking_rows(conn, tracking_rows)
             self.write_event_rows(conn, event_rows)
             self.update_performance(conn, main_db_path, base_date)
+            self.backfill_existing_snapshot_fields(conn, main_db_path, base_date)
             output = self.export_cultivation_report(conn, out_path, base_date)
             summary = {
                 "基準日": base_date,
