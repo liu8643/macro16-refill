@@ -8499,11 +8499,16 @@ class Macro16Engine:
             out.parent.mkdir(parents=True, exist_ok=True)
             helper = WatchPoolCultivationEngine(self.logger.log_file.parent)
             with sqlite3.connect(cult_db) as conn:
+                # R5N29M FIX：舊版 watch_pool_cultivation.db 可能只有 stock_id/score，
+                # 缺少 R5N29L 新增的 Historical Snapshot 欄位。
+                # 匯出報表前必須先執行 schema migration，否則會發生
+                # no such column: market_type，導致 reports 資料夾空白。
+                helper.ensure_cultivation_schema(conn)
                 helper.export_cultivation_report(conn, str(out), base_date)
-            self.logger.info(f"R5N29K_EXISTING_CULTIVATION_REPORT_REBUILT path={out}")
+            self.logger.info(f"R5N29M_EXISTING_CULTIVATION_REPORT_REBUILT path={out}")
             return out
         except Exception as exc:
-            self.logger.warning(f"R5N29K_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
+            self.logger.warning(f"R5N29M_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
             return None
 
     def _prepare_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str) -> Dict[str, str]:
@@ -8537,19 +8542,19 @@ class Macro16Engine:
                 try:
                     import shutil
                     shutil.copy2(root_cult_db, data_cult_db)
-                    self.logger.info(f"R5N29K_CULTIVATION_DB_COPIED_TO_DATA src={root_cult_db} dst={data_cult_db}")
+                    self.logger.info(f"R5N29M_CULTIVATION_DB_COPIED_TO_DATA src={root_cult_db} dst={data_cult_db}")
                 except Exception as copy_exc:
-                    self.logger.warning(f"R5N29K_CULTIVATION_DB_COPY_FAIL src={root_cult_db} dst={data_cult_db} error={copy_exc}")
+                    self.logger.warning(f"R5N29M_CULTIVATION_DB_COPY_FAIL src={root_cult_db} dst={data_cult_db} error={copy_exc}")
             cult_db = self._find_existing_cultivation_db(base_dir)
             if cult_db:
                 result["cultivation_db"] = str(cult_db)
                 report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date)
                 if report:
                     result["cultivation_report"] = str(report)
-            self.logger.info(f"R5N29K_DATA_ZIP_DISABLED folders={result}")
+            self.logger.info(f"R5N29M_DATA_ZIP_DISABLED folders={result}")
             return result
         except Exception as exc:
-            self.logger.warning(f"R5N29K_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
+            self.logger.warning(f"R5N29M_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
             return result
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
@@ -8686,7 +8691,7 @@ class WatchPoolCultivationEngine:
         return path
 
     def ensure_cultivation_schema(self, conn: sqlite3.Connection) -> None:
-        """R5N29L：建立/升級培養DB結構。
+        """R5N29M：建立/升級培養DB結構（含舊DB自動遷移）。
 
         目的：觀察池培養 DB 必須保存 Historical Snapshot，不可只保存 stock_id 後再依賴主DB JOIN。
         因此 tracking / event / performance 三張表都保留股票名稱、市場、產業、題材、Launch 等級、
@@ -8764,24 +8769,29 @@ class WatchPoolCultivationEngine:
             for col, ddl in required.items():
                 if col not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
-                    self.log(f"R5N29L_SCHEMA_MIGRATE table={table} add_column={col}")
+                    self.log(f"R5N29M_SCHEMA_MIGRATE table={table} add_column={col}")
 
         _ensure_columns("watch_pool_tracking", {
             "stock_name": "TEXT", "market_type": "TEXT", "industry": "TEXT",
             "theme": "TEXT", "sub_theme": "TEXT", "launch_grade": "TEXT",
             "first_enter_date": "TEXT", "last_update_date": "TEXT",
+            "score_1d_delta": "REAL", "score_3d_delta": "REAL", "score_5d_delta": "REAL",
+            "days_in_watch": "INTEGER", "status_reason": "TEXT", "source_report": "TEXT",
         })
         _ensure_columns("watch_pool_event", {
             "stock_name": "TEXT", "market_type": "TEXT", "industry": "TEXT",
             "theme": "TEXT", "sub_theme": "TEXT", "launch_grade": "TEXT",
+            "before_status": "TEXT", "after_status": "TEXT", "event_reason": "TEXT", "launch_score": "REAL",
         })
         _ensure_columns("watch_pool_performance", {
             "stock_name": "TEXT", "market_type": "TEXT", "industry": "TEXT",
             "theme": "TEXT", "sub_theme": "TEXT", "launch_grade": "TEXT",
             "first_enter_date": "TEXT", "last_update_date": "TEXT",
+            "max_return_5d": "REAL", "max_return_10d": "REAL", "max_return_20d": "REAL",
+            "outcome": "TEXT", "outcome_reason": "TEXT",
         })
         conn.commit()
-        self.log("R5N29L_SCHEMA_READY tables=watch_pool_tracking,watch_pool_event,watch_pool_performance snapshot_columns=stock_name,market_type,industry,theme,sub_theme,launch_grade,first_enter_date,last_update_date")
+        self.log("R5N29M_SCHEMA_READY tables=watch_pool_tracking,watch_pool_event,watch_pool_performance snapshot_columns=stock_name,market_type,industry,theme,sub_theme,launch_grade,first_enter_date,last_update_date")
 
     def _find_latest_report(self, launch_ready_path: Optional[str]) -> Optional[Path]:
         if not launch_ready_path:
@@ -9315,7 +9325,7 @@ class WatchPoolCultivationEngine:
                     if isinstance(cell.value, float):
                         cell.number_format = "0.00"
         wb.save(out)
-        self.log(f"R5N29K_CULTIVATION_REPORT_WRITTEN output={out} effective_date={effective_date} sheets=01_08")
+        self.log(f"R5N29M_CULTIVATION_REPORT_WRITTEN output={out} effective_date={effective_date} sheets=01_08")
         return str(out)
 
 
