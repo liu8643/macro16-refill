@@ -8527,19 +8527,20 @@ class Macro16Engine:
             return None
 
     def _prepare_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str) -> Dict[str, str]:
-        """R5N29K：不再自動壓縮 data.zip。
+        """R5N29AA：Macro16 與 Watch Pool 培養流程正式分離。
 
-        修正原因：
-        - R5N29K 把使用者提供的 data.zip 附件誤解為程式每日必要交付物。
-        - 正確設計是保留可直接讀寫的 data/、reports/、logs/ 工作資料夾，
-          讓主程式與觀察池培養程式隔日可直接延續，不需要先解壓縮。
-        - 若需要交付壓縮包，應另設「輸出完整成果包」功能，不應在 macro_refill
-          或 watch_pool_cultivation 每次執行時強制產生 data.zip。
+        設計依據：
+        - macro_refill 是原宏觀16回填功能。
+        - watch_pool_cultivation 才是 R5N29 觀察池培養功能，負責讀 Launch Ready、
+          更新 watch_pool_cultivation.db、輸出培養報表與 data/watch_pool_cultivation.db。
 
-        本函式只做三件事：
-        1. 確保 data/reports/logs 目錄存在。
-        2. 若 root 目錄已有 watch_pool_cultivation.db，複製到 data/ 供後續固定讀取。
-        3. 若已有培養 DB 但沒有培養報表，重建 reports/watch_pool_cultivation_YYYYMMDD.xlsx。
+        因此 macro_refill 模式不得再：
+        1. 讀取或假裝使用 Launch Ready 報表。
+        2. 複製 root 的 watch_pool_cultivation.db 到 data/ 當成本次產出。
+        3. 以既有 cultivation DB 重建 watch_pool_cultivation_YYYYMMDD.xlsx。
+
+        本函式只保留 macro_refill 所需的工作資料夾建立，並用 Log 明確標示
+        R5N29 已跳過，避免使用者把既有 DB 重建誤判成正式培養流程。
         """
         result = {"data_folder": "", "reports_folder": "", "logs_folder": "", "cultivation_db": "", "cultivation_report": ""}
         try:
@@ -8550,26 +8551,15 @@ class Macro16Engine:
             for d in (data_dir, reports_dir, logs_dir):
                 d.mkdir(parents=True, exist_ok=True)
             result.update({"data_folder": str(data_dir), "reports_folder": str(reports_dir), "logs_folder": str(logs_dir)})
-
-            root_cult_db = base_dir / "watch_pool_cultivation.db"
-            data_cult_db = data_dir / "watch_pool_cultivation.db"
-            if root_cult_db.exists() and not data_cult_db.exists():
-                try:
-                    import shutil
-                    shutil.copy2(root_cult_db, data_cult_db)
-                    self.logger.info(f"R5N29M_CULTIVATION_DB_COPIED_TO_DATA src={root_cult_db} dst={data_cult_db}")
-                except Exception as copy_exc:
-                    self.logger.warning(f"R5N29M_CULTIVATION_DB_COPY_FAIL src={root_cult_db} dst={data_cult_db} error={copy_exc}")
-            cult_db = self._find_existing_cultivation_db(base_dir)
-            if cult_db:
-                result["cultivation_db"] = str(cult_db)
-                report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date, db_path)
-                if report:
-                    result["cultivation_report"] = str(report)
-            self.logger.info(f"R5N29Q_DATA_ZIP_DISABLED folders={result}")
+            self.logger.info(
+                "R5N29AA_MACRO_REFILL_WATCH_POOL_SKIPPED "
+                "reason=macro_refill與watch_pool_cultivation為不同功能；"
+                "若要讀LaunchReady並更新培養DB，請改用report_mode=watch_pool_cultivation "
+                f"folders={result}"
+            )
             return result
         except Exception as exc:
-            self.logger.warning(f"R5N29Q_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
+            self.logger.warning(f"R5N29AA_PREPARE_MACRO_FOLDERS_FAIL error={exc}")
             return result
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
@@ -9722,7 +9712,7 @@ def main():
     parser.add_argument("--night-score", type=float, default=None, help="人工覆寫台股夜盤分數")
     parser.add_argument("--db-path", default="", help="指定主SQLite DB路徑；用於ranking_result驗證與機構級股票投資規劃報表/R5N29主DB")
     parser.add_argument("--cultivation-db-path", default="", help="R5N29培養DB路徑；空白則自動建立 data/watch_pool_cultivation.db")
-    parser.add_argument("--launch-ready-path", default="", help="R5N29 Launch Ready報表檔案或資料夾；空白則自動找 launch_ready_reports 最新報表")
+    parser.add_argument("--launch-ready-path", default="", help="R5N29 Launch Ready報表檔案或資料夾；僅report-mode=watch_pool_cultivation時使用；空白則自動找 launch_ready_reports 最新報表")
     parser.add_argument("--tej-gov-file", default="", help="TEJ八大公股行庫買賣超排名xls/xlsx；用於gov_net_100m主來源")
     parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
     parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug")
