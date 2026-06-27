@@ -8526,7 +8526,7 @@ class Macro16Engine:
             self.logger.warning(f"R5N29Q_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
             return None
 
-    def _prepare_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str, cultivation_db_path: Optional[str] = None, launch_ready_path: Optional[str] = None) -> Dict[str, str]:
+    def _prepare_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str) -> Dict[str, str]:
         """R5N29K：不再自動壓縮 data.zip。
 
         修正原因：
@@ -8553,33 +8553,6 @@ class Macro16Engine:
 
             root_cult_db = base_dir / "watch_pool_cultivation.db"
             data_cult_db = data_dir / "watch_pool_cultivation.db"
-
-            # R5N29W FIX：macro_refill 模式下，若 UI 紅框「Launch Ready報表/資料夾」有填，
-            # 必須先讀取該輸入，更新 watch_pool_cultivation.db，再輸出 reports/watch_pool_cultivation_YYYYMMDD.xlsx。
-            # 舊版 R5N29Q 只重建既有 cultivation DB 報表，沒有使用 UI launch_ready_path，導致紅框輸入被忽略。
-            explicit_cult_db = Path(cultivation_db_path).expanduser() if cultivation_db_path and str(cultivation_db_path).strip() else data_cult_db
-            if db_path and launch_ready_path and str(launch_ready_path).strip():
-                try:
-                    report_out = reports_dir / f"watch_pool_cultivation_{str(base_date or '').replace('-', '')}.xlsx"
-                    helper = WatchPoolCultivationEngine(self.logger.log_file.parent)
-                    run_result = helper.run(
-                        template=None,
-                        out_path=str(report_out),
-                        base_date=base_date,
-                        main_db_path=db_path,
-                        cultivation_db_path=str(explicit_cult_db),
-                        launch_ready_path=launch_ready_path,
-                    )
-                    for msg in helper.messages:
-                        self.logger.info(msg)
-                    result["cultivation_db"] = str(explicit_cult_db)
-                    result["cultivation_report"] = str(run_result.get("output") or report_out)
-                    self.logger.info(f"R5N29W_LAUNCH_READY_INPUT_REFRESH_OK launch_ready_path={launch_ready_path} cultivation_db={explicit_cult_db} report={result['cultivation_report']}")
-                    self.logger.info(f"R5N29W_DATA_ZIP_DISABLED folders={result}")
-                    return result
-                except Exception as refresh_exc:
-                    self.logger.warning(f"R5N29W_LAUNCH_READY_INPUT_REFRESH_FAIL launch_ready_path={launch_ready_path} error={refresh_exc}")
-
             if root_cult_db.exists() and not data_cult_db.exists():
                 try:
                     import shutil
@@ -8587,22 +8560,21 @@ class Macro16Engine:
                     self.logger.info(f"R5N29M_CULTIVATION_DB_COPIED_TO_DATA src={root_cult_db} dst={data_cult_db}")
                 except Exception as copy_exc:
                     self.logger.warning(f"R5N29M_CULTIVATION_DB_COPY_FAIL src={root_cult_db} dst={data_cult_db} error={copy_exc}")
-            cult_db = Path(cultivation_db_path).expanduser() if cultivation_db_path and str(cultivation_db_path).strip() else self._find_existing_cultivation_db(base_dir)
-            if cult_db and cult_db.exists():
+            cult_db = self._find_existing_cultivation_db(base_dir)
+            if cult_db:
                 result["cultivation_db"] = str(cult_db)
                 report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date, db_path)
                 if report:
                     result["cultivation_report"] = str(report)
-            self.logger.info(f"R5N29W_DATA_ZIP_DISABLED folders={result}")
+            self.logger.info(f"R5N29Q_DATA_ZIP_DISABLED folders={result}")
             return result
         except Exception as exc:
             self.logger.warning(f"R5N29Q_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
             return result
 
-    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO, cultivation_db_path: Optional[str] = None, launch_ready_path: Optional[str] = None) -> Dict[str, Any]:
+    def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
         self.logger.info("CHANGELOG v3.0.0: Add AI Project Rotation Monitor sheets and full 201-stock AI tracking page")
-        self.logger.info("CHANGELOG R5N29W: macro_refill now uses UI Launch Ready報表/資料夾 to refresh watch_pool_cultivation.db before report export")
         self.logger.strategy_trace("STRATEGY_VERSION", {"strategy_version": STRATEGY_VERSION, "program_version": VERSION})
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
@@ -8697,7 +8669,7 @@ class Macro16Engine:
             # R5N29Q FIX：培養報表屬於使用者執行日/觀察池日期，不可用 TWSE fallback 後的 market.base_date 命名。
             # 否則 2026-06-27 執行但交易所回補到 2026-06-26 時，會錯產 watch_pool_cultivation_20260626.xlsx。
             cultivation_output_date = base_date or market.base_date or dt.date.today().isoformat()
-            data_outputs = self._prepare_macro_side_data_outputs(output, db_path, cultivation_output_date, cultivation_db_path=cultivation_db_path, launch_ready_path=launch_ready_path)
+            data_outputs = self._prepare_macro_side_data_outputs(output, db_path, cultivation_output_date)
             summary["data_folder"] = data_outputs.get("data_folder", "")
             summary["reports_folder"] = data_outputs.get("reports_folder", "")
             summary["logs_folder"] = data_outputs.get("logs_folder", "")
@@ -8857,16 +8829,6 @@ class WatchPoolCultivationEngine:
                 files.extend([x for x in p.glob("*.xlsm") if not x.name.startswith("~$")])
         if not files:
             return None
-        # R5N29W2 FIX：若使用者選的是資料夾，裡面可能同時有輸入用 Launch Ready 報表
-        # 與輸出用 watch_pool_cultivation 報表。必須優先選 Launch Ready 類檔案，避免把自己輸出的
-        # watch_pool_cultivation_YYYYMMDD.xlsx 當成下一輪輸入。
-        launch_files = [
-            x for x in files
-            if ("launch_ready" in x.name.lower() or "launchready" in x.name.lower() or "準備噴射" in x.name)
-            and "watch_pool_cultivation" not in x.name.lower()
-        ]
-        if launch_files:
-            return max(launch_files, key=lambda x: x.stat().st_mtime)
         return max(files, key=lambda x: x.stat().st_mtime)
 
     def _normalize_header(self, v: Any) -> str:
@@ -9510,28 +9472,78 @@ class WatchPoolCultivationEngine:
 
 
     def prepare_cultivation_outputs(self, main_db_path: str, cult_db: Path, report_path: str, log_file: Optional[Path] = None) -> Dict[str, str]:
-        """R5N29K：培養模式不再固定打包成 data.zip。
+        """R5N29Y：培養模式輸出資料夾落地修正。
 
-        正確輸出是可直接持續更新的工作資料：
-        - data/watch_pool_cultivation.db
-        - reports/watch_pool_cultivation_YYYYMMDD.xlsx
-        - logs/r5n29_watch_pool_*.log
+        背景：
+        - R5N29K/Q 只建立 data/reports/logs 目錄，沒有把本次實際更新的培養DB
+          落地到 data/watch_pool_cultivation.db。
+        - 若使用者在 UI 指定既有 watch_pool_cultivation.db，該檔會被當作讀寫中的培養DB，
+          但 data/ 仍可能是空資料夾，造成驗收誤判「沒有輸出資料」。
+
+        本函式固定做四件事：
+        1. 確保 data/reports/logs 存在。
+        2. 將本次實際更新的 cult_db 複製/同步到 data/watch_pool_cultivation.db。
+        3. 若報表輸出不在 reports/，同步一份到 reports/。
+        4. 產生 data/watch_pool_manifest.json，明確記錄輸入/輸出來源。
         """
+        import shutil
+        import json as _json
         base_dir = Path(main_db_path).resolve().parent if main_db_path else Path.cwd()
         data_dir = base_dir / "data"
         reports_dir = base_dir / "reports"
         logs_dir = base_dir / "logs"
         for d in (data_dir, reports_dir, logs_dir):
             d.mkdir(parents=True, exist_ok=True)
+
+        data_cult_db = data_dir / "watch_pool_cultivation.db"
+        copied_db = ""
+        try:
+            if cult_db and Path(cult_db).exists():
+                src = Path(cult_db).resolve()
+                dst = data_cult_db.resolve()
+                if src != dst:
+                    shutil.copy2(src, dst)
+                    copied_db = str(data_cult_db)
+                    self.log(f"R5N29Y_CULTIVATION_DB_SYNC_TO_DATA src={src} dst={dst}")
+                else:
+                    copied_db = str(data_cult_db)
+                    self.log(f"R5N29Y_CULTIVATION_DB_ALREADY_IN_DATA path={dst}")
+        except Exception as exc:
+            self.warn(f"R5N29Y_CULTIVATION_DB_SYNC_FAIL src={cult_db} dst={data_cult_db} error={exc}")
+
+        report_copy = ""
+        try:
+            if report_path and Path(report_path).exists():
+                src_report = Path(report_path).resolve()
+                dst_report = (reports_dir / src_report.name).resolve()
+                if src_report != dst_report:
+                    shutil.copy2(src_report, dst_report)
+                    report_copy = str(dst_report)
+                    self.log(f"R5N29Y_CULTIVATION_REPORT_SYNC_TO_REPORTS src={src_report} dst={dst_report}")
+                else:
+                    report_copy = str(dst_report)
+        except Exception as exc:
+            self.warn(f"R5N29Y_CULTIVATION_REPORT_SYNC_FAIL src={report_path} error={exc}")
+
         output_info = {
             "data_folder": str(data_dir),
             "reports_folder": str(reports_dir),
             "logs_folder": str(logs_dir),
-            "cultivation_db": str(cult_db) if cult_db else "",
-            "cultivation_report": str(report_path) if report_path else "",
+            "cultivation_db_runtime": str(cult_db) if cult_db else "",
+            "cultivation_db_data_copy": copied_db,
+            "cultivation_report_runtime": str(report_path) if report_path else "",
+            "cultivation_report_reports_copy": report_copy,
             "log_file": str(log_file) if log_file else "",
+            "data_zip": "DISABLED",
         }
-        self.log(f"R5N29K_DATA_ZIP_DISABLED outputs={output_info}")
+        try:
+            manifest = data_dir / "watch_pool_manifest.json"
+            manifest.write_text(_json.dumps(output_info, ensure_ascii=False, indent=2), encoding="utf-8")
+            output_info["manifest"] = str(manifest)
+            self.log(f"R5N29Y_DATA_MANIFEST_WRITTEN path={manifest}")
+        except Exception as exc:
+            self.warn(f"R5N29Y_DATA_MANIFEST_WRITE_FAIL error={exc}")
+        self.log(f"R5N29Y_DATA_OUTPUTS_READY outputs={output_info}")
         return output_info
 
     def run(self, template: Optional[str], out_path: str, base_date: str, main_db_path: str, cultivation_db_path: Optional[str] = None, launch_ready_path: Optional[str] = None) -> Dict[str, Any]:
@@ -9680,7 +9692,7 @@ def run_gui():
                     append_log(msg)
             else:
                 engine = Macro16Engine(Path("logs"))
-                result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()), tej_gov_file=(tej_gov_var.get() or None), report_mode=report_mode_var.get(), cultivation_db_path=(cultivation_db_var.get() or None), launch_ready_path=(launch_ready_var.get() or None))
+                result = engine.run(template_var.get() or None, out_var.get(), date_var.get(), db_path=(db_var.get() or None), strict_ranking=bool(strict_ranking_var.get()), tej_gov_file=(tej_gov_var.get() or None), report_mode=report_mode_var.get())
                 for msg in engine.logger.messages:
                     append_log(msg)
             append_log("\n總結：" + json.dumps(result["summary"], ensure_ascii=False, indent=2))
@@ -9722,7 +9734,7 @@ def main():
         else:
             engine = Macro16Engine(Path(args.log_dir))
             override = ManualOverride(gov_net_100m=args.gov_net, ai_strength=args.ai_strength, major_event=args.major_event, event_note=args.event_note, night_score=args.night_score)
-            result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking, tej_gov_file=(args.tej_gov_file or None), report_mode=args.report_mode, cultivation_db_path=(args.cultivation_db_path or None), launch_ready_path=(args.launch_ready_path or None))
+            result = engine.run(args.template or None, args.out, args.date, override, db_path=(args.db_path or None), strict_ranking=args.strict_ranking, tej_gov_file=(args.tej_gov_file or None), report_mode=args.report_mode)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         run_gui()
