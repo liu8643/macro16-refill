@@ -8994,11 +8994,21 @@ class WatchPoolCultivationEngine:
                         sub_theme=CASE WHEN COALESCE(sub_theme,'')='' THEN ? ELSE sub_theme END,
                         launch_grade=CASE WHEN COALESCE(launch_grade,'')='' THEN ? ELSE launch_grade END,
                         first_enter_date=CASE WHEN COALESCE(first_enter_date,'')='' THEN entry_date ELSE first_enter_date END,
-                        last_update_date=CASE WHEN COALESCE(last_update_date,'')='' THEN COALESCE(updated_at, entry_date) ELSE last_update_date END
+                        last_update_date=CASE 
+                            WHEN COALESCE(last_update_date,'')='' THEN entry_date
+                            WHEN LENGTH(COALESCE(last_update_date,''))>10 THEN SUBSTR(last_update_date,1,10)
+                            ELSE last_update_date END
                     WHERE stock_id=?
                 """, (vals["stock_name"], vals["market_type"], vals["industry"], vals["theme"], vals["sub_theme"], vals["launch_grade"], sid))
                 updated_perf += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
+            # R5N29P：日期欄位一律正規化為 YYYY-MM-DD，避免 performance.last_update_date 混入 updated_at 時分秒。
+            conn.execute("UPDATE watch_pool_tracking SET first_enter_date=SUBSTR(first_enter_date,1,10) WHERE LENGTH(COALESCE(first_enter_date,''))>10")
+            conn.execute("UPDATE watch_pool_tracking SET last_update_date=SUBSTR(last_update_date,1,10) WHERE LENGTH(COALESCE(last_update_date,''))>10")
+            conn.execute("UPDATE watch_pool_event SET first_enter_date=SUBSTR(first_enter_date,1,10) WHERE LENGTH(COALESCE(first_enter_date,''))>10")
+            conn.execute("UPDATE watch_pool_event SET last_update_date=SUBSTR(last_update_date,1,10) WHERE LENGTH(COALESCE(last_update_date,''))>10")
+            conn.execute("UPDATE watch_pool_performance SET first_enter_date=SUBSTR(first_enter_date,1,10) WHERE LENGTH(COALESCE(first_enter_date,''))>10")
+            conn.execute("UPDATE watch_pool_performance SET last_update_date=SUBSTR(last_update_date,1,10) WHERE LENGTH(COALESCE(last_update_date,''))>10")
             conn.commit()
             missing_name = conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE COALESCE(stock_name,'')='' ").fetchone()[0]
             missing_meta = conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE COALESCE(market_type,'')='' OR COALESCE(industry,'')='' OR COALESCE(theme,'')='' OR COALESCE(sub_theme,'')='' ").fetchone()[0]
@@ -9398,6 +9408,12 @@ class WatchPoolCultivationEngine:
             ("missing_stock_name_count", conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND COALESCE(stock_name,'')=''", (effective_date,)).fetchone()[0], "R5N29L 驗收：股名不可整批空白"),
             ("missing_snapshot_meta_count", conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND (COALESCE(market_type,'')='' OR COALESCE(industry,'')='' OR COALESCE(theme,'')='' OR COALESCE(sub_theme,'')='')", (effective_date,)).fetchone()[0], "R5N29L 驗收：市場/產業/題材/子題材 Snapshot 完整性"),
             ("missing_event_snapshot_count", conn.execute("SELECT COUNT(*) FROM watch_pool_event WHERE event_date=? AND (COALESCE(stock_name,'')='' OR COALESCE(first_enter_date,'')='' OR COALESCE(last_update_date,'')='')", (effective_date,)).fetchone()[0], "R5N29N 驗收：event 表也需保存股名與進池/更新日"),
+            ("invalid_date_format_count", conn.execute("""
+                SELECT
+                  (SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND (LENGTH(COALESCE(first_enter_date,''))>10 OR LENGTH(COALESCE(last_update_date,''))>10)) +
+                  (SELECT COUNT(*) FROM watch_pool_event WHERE event_date=? AND (LENGTH(COALESCE(first_enter_date,''))>10 OR LENGTH(COALESCE(last_update_date,''))>10)) +
+                  (SELECT COUNT(*) FROM watch_pool_performance WHERE LENGTH(COALESCE(first_enter_date,''))>10 OR LENGTH(COALESCE(last_update_date,''))>10)
+            """, (effective_date, effective_date)).fetchone()[0], "R5N29P 驗收：first_enter_date/last_update_date 必須是 YYYY-MM-DD，不可混入時分秒"),
             ("today_event_count", len(event_rows), "02 狀態事件筆數；首次培養通常為 ENTER"),
             ("trend_count", len(trend_rows), "03 分數趨勢總筆數"),
             ("acceleration_rank_count", len(acceleration_rows), "04 加速度排行筆數"),
@@ -9415,8 +9431,20 @@ class WatchPoolCultivationEngine:
             validation_rows.append((f"outcome_count:{outcome}", count, "performance outcome 分布"))
         write_sheet("08_模型驗證", ["metric", "value", "description"], validation_rows)
 
+        missing_stock_name_count = conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND COALESCE(stock_name,'')=''", (effective_date,)).fetchone()[0]
+        missing_snapshot_meta_count = conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND (COALESCE(market_type,'')='' OR COALESCE(industry,'')='' OR COALESCE(theme,'')='' OR COALESCE(sub_theme,'')='')", (effective_date,)).fetchone()[0]
+        invalid_date_format_count = conn.execute("""
+            SELECT
+              (SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND (LENGTH(COALESCE(first_enter_date,''))>10 OR LENGTH(COALESCE(last_update_date,''))>10)) +
+              (SELECT COUNT(*) FROM watch_pool_event WHERE event_date=? AND (LENGTH(COALESCE(first_enter_date,''))>10 OR LENGTH(COALESCE(last_update_date,''))>10)) +
+              (SELECT COUNT(*) FROM watch_pool_performance WHERE LENGTH(COALESCE(first_enter_date,''))>10 OR LENGTH(COALESCE(last_update_date,''))>10)
+        """, (effective_date, effective_date)).fetchone()[0]
+
         required = [
             ("01_WatchPool_今日總表", len(tracking_rows), "PASS" if len(tracking_rows) > 0 else "FAIL", "今日追蹤總表不可空白"),
+            ("R5N29P_股名完整性", missing_stock_name_count, "PASS" if missing_stock_name_count == 0 else "FAIL", "stock_name 不可空白；避免報表只有代碼"),
+            ("R5N29P_Snapshot欄位完整性", missing_snapshot_meta_count, "PASS" if missing_snapshot_meta_count == 0 else "FAIL", "market_type/industry/theme/sub_theme 必須保存歷史快照"),
+            ("R5N29P_日期格式一致性", invalid_date_format_count, "PASS" if invalid_date_format_count == 0 else "FAIL", "first_enter_date/last_update_date 必須為 YYYY-MM-DD"),
             ("02_狀態變更事件", len(event_rows), "PASS", "事件表可為 0，但需有表頭"),
             ("03_分數趨勢", len(trend_rows), "PASS" if len(trend_rows) > 0 else "FAIL", "分數趨勢需讀取 tracking 歷史"),
             ("04_加速度排行", len(acceleration_rows), "PASS" if len(acceleration_rows) > 0 else "WARN", "缺歷史時 delta 可能空白，但仍需產出排行"),
@@ -9433,7 +9461,7 @@ class WatchPoolCultivationEngine:
                     if isinstance(cell.value, float):
                         cell.number_format = "0.00"
         wb.save(out)
-        self.log(f"R5N29M_CULTIVATION_REPORT_WRITTEN output={out} effective_date={effective_date} sheets=01_08")
+        self.log(f"R5N29P_CULTIVATION_REPORT_WRITTEN output={out} effective_date={effective_date} sheets=01_08 snapshot_date_format=YYYY-MM-DD")
         return str(out)
 
 
