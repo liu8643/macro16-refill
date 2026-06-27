@@ -25,7 +25,6 @@ import sys
 import time
 import sqlite3
 import html as html_lib
-import zipfile
 from dataclasses import dataclass, asdict
 from io import StringIO
 from pathlib import Path
@@ -8507,39 +8506,51 @@ class Macro16Engine:
             self.logger.warning(f"R5N29I_EXISTING_CULTIVATION_REPORT_REBUILD_FAIL db={cult_db} error={exc}")
             return None
 
-    def _package_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str) -> str:
-        """R5N29I：恢復 01/02 使用者期待的 data.zip 交付。
-        觸發條件：macro_refill 正常完成後，如果同資料夾已有 watch_pool_cultivation.db，
-        自動輸出 data.zip，內容維持附件設計：
-          data/watch_pool_cultivation.db
-          reports/watch_pool_cultivation_YYYYMMDD.xlsx
-          logs/macro16_debug_*.txt
-        若沒有培養DB，僅記錄 WARN，不影響原宏觀16報表。
+    def _prepare_macro_side_data_outputs(self, out_path: str, db_path: Optional[str], base_date: str) -> Dict[str, str]:
+        """R5N29J：不再自動壓縮 data.zip。
+
+        修正原因：
+        - R5N29I 把使用者提供的 data.zip 附件誤解為程式每日必要交付物。
+        - 正確設計是保留可直接讀寫的 data/、reports/、logs/ 工作資料夾，
+          讓主程式與觀察池培養程式隔日可直接延續，不需要先解壓縮。
+        - 若需要交付壓縮包，應另設「輸出完整成果包」功能，不應在 macro_refill
+          或 watch_pool_cultivation 每次執行時強制產生 data.zip。
+
+        本函式只做三件事：
+        1. 確保 data/reports/logs 目錄存在。
+        2. 若 root 目錄已有 watch_pool_cultivation.db，複製到 data/ 供後續固定讀取。
+        3. 若已有培養 DB 但沒有培養報表，重建 reports/watch_pool_cultivation_YYYYMMDD.xlsx。
         """
+        result = {"data_folder": "", "reports_folder": "", "logs_folder": "", "cultivation_db": "", "cultivation_report": ""}
         try:
             base_dir = Path(db_path).resolve().parent if db_path else Path(out_path).resolve().parent
+            data_dir = base_dir / "data"
+            reports_dir = base_dir / "reports"
+            logs_dir = base_dir / "logs"
+            for d in (data_dir, reports_dir, logs_dir):
+                d.mkdir(parents=True, exist_ok=True)
+            result.update({"data_folder": str(data_dir), "reports_folder": str(reports_dir), "logs_folder": str(logs_dir)})
+
+            root_cult_db = base_dir / "watch_pool_cultivation.db"
+            data_cult_db = data_dir / "watch_pool_cultivation.db"
+            if root_cult_db.exists() and not data_cult_db.exists():
+                try:
+                    import shutil
+                    shutil.copy2(root_cult_db, data_cult_db)
+                    self.logger.info(f"R5N29J_CULTIVATION_DB_COPIED_TO_DATA src={root_cult_db} dst={data_cult_db}")
+                except Exception as copy_exc:
+                    self.logger.warning(f"R5N29J_CULTIVATION_DB_COPY_FAIL src={root_cult_db} dst={data_cult_db} error={copy_exc}")
             cult_db = self._find_existing_cultivation_db(base_dir)
-            if not cult_db:
-                self.logger.warning(f"R5N29I_DATA_PACKAGE_SKIP no watch_pool_cultivation.db under {base_dir}")
-                return ""
-            report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date)
-            zip_path = base_dir / "data.zip"
-            artifacts = [(cult_db, "data/watch_pool_cultivation.db")]
-            if report and Path(report).exists():
-                artifacts.append((Path(report), f"reports/{Path(report).name}"))
-            if self.logger.log_file and Path(self.logger.log_file).exists():
-                artifacts.append((Path(self.logger.log_file), f"logs/{Path(self.logger.log_file).name}"))
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                seen = set()
-                for src, arc in artifacts:
-                    if src.exists() and arc not in seen:
-                        zf.write(src, arc)
-                        seen.add(arc)
-            self.logger.info(f"R5N29I_MACRO_DATA_PACKAGE_WRITTEN path={zip_path} files={list(seen)}")
-            return str(zip_path)
+            if cult_db:
+                result["cultivation_db"] = str(cult_db)
+                report = self._export_existing_cultivation_report_if_possible(base_dir, cult_db, base_date)
+                if report:
+                    result["cultivation_report"] = str(report)
+            self.logger.info(f"R5N29J_DATA_ZIP_DISABLED folders={result}")
+            return result
         except Exception as exc:
-            self.logger.warning(f"R5N29I_MACRO_DATA_PACKAGE_FAIL error={exc}")
-            return ""
+            self.logger.warning(f"R5N29J_PREPARE_DATA_OUTPUTS_FAIL error={exc}")
+            return result
 
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO) -> Dict[str, Any]:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
@@ -8631,15 +8642,16 @@ class Macro16Engine:
         evidence_word = ""
         if report_mode == REPORT_MODE_ALL:
             evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
-        # R5N29I：macro_refill / macro_teacher / teacher_full 完成後，若同資料夾已有培養DB，
-        # 自動恢復 data.zip 交付；不影響原宏觀16報表與老師策略報表產出。
-        data_package = ""
+        # R5N29J：保留 data/reports/logs 工作資料夾，不再自動產出 data.zip。
+        # 原因：data.zip 只是附件/交付包形式，不是每日培養迴路的工作資料。
+        data_outputs: Dict[str, str] = {}
         if report_mode in (REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_TEACHER_FULL, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_ALL):
-            data_package = self._package_macro_side_data_outputs(output, db_path, market.base_date or base_date or dt.date.today().isoformat())
-            if data_package:
-                summary["data.zip"] = data_package
+            data_outputs = self._prepare_macro_side_data_outputs(output, db_path, market.base_date or base_date or dt.date.today().isoformat())
+            summary["data_folder"] = data_outputs.get("data_folder", "")
+            summary["reports_folder"] = data_outputs.get("reports_folder", "")
+            summary["logs_folder"] = data_outputs.get("logs_folder", "")
         self.logger.info("執行完成")
-        return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file), "data_package": data_package}
+        return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file), "data_outputs": data_outputs}
 
 
 class WatchPoolCultivationEngine:
@@ -9037,32 +9049,30 @@ class WatchPoolCultivationEngine:
         return str(out)
 
 
-    def package_cultivation_outputs(self, main_db_path: str, cult_db: Path, report_path: str, log_file: Optional[Path] = None) -> str:
-        """R5N29H：將培養模式必要交付物固定打包成 data.zip。
-        目的：避免只產生 Excel/DB，卻沒有交付 data/watch_pool_cultivation.db 與 reports/watch_pool_cultivation_YYYYMMDD.xlsx。
-        輸出位置：主DB同資料夾 data.zip；內容固定使用相對路徑 data/、reports/、logs/。
+    def prepare_cultivation_outputs(self, main_db_path: str, cult_db: Path, report_path: str, log_file: Optional[Path] = None) -> Dict[str, str]:
+        """R5N29J：培養模式不再固定打包成 data.zip。
+
+        正確輸出是可直接持續更新的工作資料：
+        - data/watch_pool_cultivation.db
+        - reports/watch_pool_cultivation_YYYYMMDD.xlsx
+        - logs/r5n29_watch_pool_*.log
         """
         base_dir = Path(main_db_path).resolve().parent if main_db_path else Path.cwd()
-        zip_path = base_dir / "data.zip"
-        artifacts = []
-        if cult_db and Path(cult_db).exists():
-            artifacts.append((Path(cult_db), "data/watch_pool_cultivation.db"))
-        if report_path and Path(report_path).exists():
-            artifacts.append((Path(report_path), f"reports/{Path(report_path).name}"))
-        if log_file and Path(log_file).exists():
-            artifacts.append((Path(log_file), f"logs/{Path(log_file).name}"))
-        if not artifacts:
-            self.warn("R5N29_DATA_PACKAGE_SKIP no_artifacts")
-            return ""
-        try:
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for src, arc in artifacts:
-                    zf.write(src, arc)
-            self.log(f"R5N29_DATA_PACKAGE_WRITTEN path={zip_path} files={[arc for _, arc in artifacts]}")
-            return str(zip_path)
-        except Exception as exc:
-            self.warn(f"R5N29_DATA_PACKAGE_FAIL path={zip_path} error={exc}")
-            return ""
+        data_dir = base_dir / "data"
+        reports_dir = base_dir / "reports"
+        logs_dir = base_dir / "logs"
+        for d in (data_dir, reports_dir, logs_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        output_info = {
+            "data_folder": str(data_dir),
+            "reports_folder": str(reports_dir),
+            "logs_folder": str(logs_dir),
+            "cultivation_db": str(cult_db) if cult_db else "",
+            "cultivation_report": str(report_path) if report_path else "",
+            "log_file": str(log_file) if log_file else "",
+        }
+        self.log(f"R5N29J_DATA_ZIP_DISABLED outputs={output_info}")
+        return output_info
 
     def run(self, template: Optional[str], out_path: str, base_date: str, main_db_path: str, cultivation_db_path: Optional[str] = None, launch_ready_path: Optional[str] = None) -> Dict[str, Any]:
         base_date = self._parse_date(base_date)
@@ -9099,10 +9109,11 @@ class WatchPoolCultivationEngine:
             log_file.write_text("\n".join(self.messages), encoding="utf-8")
         except Exception as exc:
             self.warn(f"R5N29_LOG_WRITE_FAIL {exc}")
-        data_package = self.package_cultivation_outputs(main_db_path, cult_db, output, log_file)
-        if data_package:
-            summary["data.zip"] = data_package
-        return {"output": output, "cultivation_db": str(cult_db), "data_package": data_package, "summary": summary, "log_file": str(log_file)}
+        data_outputs = self.prepare_cultivation_outputs(main_db_path, cult_db, output, log_file)
+        summary["data_folder"] = data_outputs.get("data_folder", "")
+        summary["reports_folder"] = data_outputs.get("reports_folder", "")
+        summary["logs_folder"] = data_outputs.get("logs_folder", "")
+        return {"output": output, "cultivation_db": str(cult_db), "data_outputs": data_outputs, "summary": summary, "log_file": str(log_file)}
 
 
 def run_gui():
