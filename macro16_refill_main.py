@@ -79,6 +79,8 @@ REPORT_MODE_TEACHER_FULL = "teacher_full"
 REPORT_MODE_ALL = "all"
 # R5N29：獨立觀察池培養模式；非預設，不影響原宏觀16 / 老師策略報表。
 REPORT_MODE_WATCH_POOL = "watch_pool_cultivation"
+# R5N31：大師六 V5 AI 投資決策模式；只讀原始DB表，禁止讀取已挑選結果表。
+REPORT_MODE_MASTER6_V5 = "master6_v5_ai_investment_decision"
 MACRO_REFILL_SHEETS = ["市場輸入", "宏觀16模組", "V2技術引擎"]
 
 
@@ -8452,6 +8454,478 @@ class AuditEngine:
             self.logger.info("QA檢查完成，未發現重大缺失")
         return warnings
 
+
+class Master6V5RawDbEngine:
+    """R5N31：大師六 V5 AI 投資決策系統（Raw DB Only）。
+
+    設計原則：
+    1. 只讀 stock_system_v6_2.db 原始資料表。
+    2. 禁止 ranking_result / trade_plan / watchlist / prebreakout / top20 / teacher_pool 等已挑選結果表。
+    3. 重新計算 EPS / 營收 / 法人 / 技術 / 估值 / 題材分數。
+    4. 重新通過五層 Gate，重新評分，輸出 TOP20、TOP5、交易策略與淘汰原因。
+    """
+    ALLOWED_TABLES = {
+        "price_history", "quarterly_financial_history", "annual_eps_history",
+        "external_revenue_history", "external_institutional", "external_valuation",
+        "external_margin", "stocks_master"
+    }
+    PROHIBITED_TABLES = {
+        "ranking_result", "trade_plan", "trade_plan_prebreakout", "watchlist",
+        "prebreakout", "prebreakout_signal_daily", "top20", "teacher_pool",
+        "launch_ready_history", "launch_ready_candidates", "teacher_watchlist"
+    }
+
+    def __init__(self, logger: Macro16Logger):
+        self.logger = logger
+
+    def _norm_sid(self, s: Any) -> str:
+        try:
+            if s is None:
+                return ""
+            value = str(s).strip().split(".")[0]
+            if value.isdigit() and len(value) <= 4:
+                return value.zfill(4)
+            return value
+        except Exception:
+            return str(s or "")
+
+    def _assert_sql_safe(self, sql: str) -> None:
+        low = re.sub(r"\s+", " ", str(sql).lower())
+        hits = []
+        for t in self.PROHIBITED_TABLES:
+            if re.search(r"\b" + re.escape(t.lower()) + r"\b", low):
+                hits.append(t)
+        if hits:
+            raise RuntimeError(f"R5N31_RAW_ONLY_BLOCKED: 禁止讀取已挑選結果表 {hits}")
+
+    def _assert_table_allowed(self, table: str) -> None:
+        if table not in self.ALLOWED_TABLES:
+            raise RuntimeError(f"R5N31_RAW_ONLY_BLOCKED: 非白名單原始表 {table}")
+        if table in self.PROHIBITED_TABLES:
+            raise RuntimeError(f"R5N31_RAW_ONLY_BLOCKED: 禁用表 {table}")
+
+    def _table_exists(self, conn: sqlite3.Connection, table: str) -> bool:
+        row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        return row is not None
+
+    def _cols(self, conn: sqlite3.Connection, table: str) -> List[str]:
+        return [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+    def _read_allowed_table(self, conn: sqlite3.Connection, table: str, where: str = "", params: Optional[List[Any]] = None):
+        if pd is None:
+            raise RuntimeError("Master6V5RawDbEngine 需要 pandas")
+        self._assert_table_allowed(table)
+        if not self._table_exists(conn, table):
+            self.logger.warning(f"R5N31_TABLE_MISSING table={table}")
+            return pd.DataFrame()
+        sql = f"SELECT * FROM {table}"
+        if where:
+            sql += " WHERE " + where
+        self._assert_sql_safe(sql)
+        self.logger.info(f"R5N31_RAW_TABLE_READ table={table} where={where or 'ALL'}")
+        df = pd.read_sql_query(sql, conn, params=params or [])
+        if "stock_id" in df.columns:
+            df["stock_id"] = df["stock_id"].map(self._norm_sid)
+        return df
+
+    def _pick_col(self, df, candidates: List[str]) -> Optional[str]:
+        if df is None or df.empty:
+            return None
+        norm = {str(c).lower().replace("_", "").replace(" ", ""): c for c in df.columns}
+        for cand in candidates:
+            key = cand.lower().replace("_", "").replace(" ", "")
+            if key in norm:
+                return norm[key]
+        for key, col in norm.items():
+            for cand in candidates:
+                ck = cand.lower().replace("_", "").replace(" ", "")
+                if ck and ck in key:
+                    return col
+        return None
+
+    def _to_num(self, s, default=math.nan):
+        try:
+            return pd.to_numeric(s, errors="coerce")
+        except Exception:
+            try:
+                return float(s)
+            except Exception:
+                return default
+
+    def _latest_by_stock(self, df, date_candidates: List[str]):
+        if df is None or df.empty or "stock_id" not in df.columns:
+            return pd.DataFrame()
+        date_col = self._pick_col(df, date_candidates)
+        x = df.copy()
+        if date_col:
+            x["_sort_date"] = x[date_col].astype(str)
+            x = x.sort_values(["stock_id", "_sort_date"])
+        return x.drop_duplicates("stock_id", keep="last")
+
+    def _resolve_analysis_date(self, conn: sqlite3.Connection, base_date: Optional[str]) -> str:
+        ph_cols = self._cols(conn, "price_history") if self._table_exists(conn, "price_history") else []
+        if "date" not in ph_cols:
+            return base_date or dt.date.today().isoformat()
+        target = (base_date or dt.date.today().isoformat()).replace("-", "")
+        rows = conn.execute("SELECT MAX(date) FROM price_history WHERE REPLACE(date,'-','')<=?", (target,)).fetchone()
+        if rows and rows[0]:
+            return str(rows[0])
+        rows = conn.execute("SELECT MAX(date) FROM price_history").fetchone()
+        return str(rows[0]) if rows and rows[0] else (base_date or dt.date.today().isoformat())
+
+    def _build_universe(self, stocks):
+        if stocks.empty:
+            return pd.DataFrame(columns=["stock_id", "stock_name", "industry", "theme", "sub_theme", "market_type"])
+        sid_col = self._pick_col(stocks, ["stock_id", "代號", "公司代號"])
+        name_col = self._pick_col(stocks, ["stock_name", "name", "股票名稱", "公司名稱", "名稱"])
+        industry_col = self._pick_col(stocks, ["industry", "產業", "industry_name"])
+        theme_col = self._pick_col(stocks, ["theme", "題材", "theme_final"])
+        sub_col = self._pick_col(stocks, ["sub_theme", "子題材", "sub_theme_final"])
+        market_col = self._pick_col(stocks, ["market_type", "market", "市場"])
+        active_col = self._pick_col(stocks, ["is_active", "active", "status"])
+        etf_col = self._pick_col(stocks, ["is_etf", "ETF"])
+        u = pd.DataFrame()
+        u["stock_id"] = stocks[sid_col].map(self._norm_sid) if sid_col else ""
+        u["stock_name"] = stocks[name_col].astype(str) if name_col else ""
+        u["industry"] = stocks[industry_col].astype(str) if industry_col else ""
+        u["theme"] = stocks[theme_col].astype(str) if theme_col else ""
+        u["sub_theme"] = stocks[sub_col].astype(str) if sub_col else ""
+        u["market_type"] = stocks[market_col].astype(str) if market_col else ""
+        if active_col:
+            active = stocks[active_col].astype(str).str.lower()
+            u = u[~active.isin(["0", "false", "delisted", "下市", "下櫃", "停用"])]
+        if etf_col:
+            etf = stocks[etf_col].astype(str).str.lower()
+            u = u[~etf.isin(["1", "true", "y", "yes"])]
+        u = u[u["stock_id"].astype(str).str.len() >= 4]
+        return u.drop_duplicates("stock_id")
+
+    def _price_features(self, ph, analysis_date: str):
+        if ph.empty:
+            return pd.DataFrame(columns=["stock_id"])
+        date_col = self._pick_col(ph, ["date", "trade_date"])
+        close_col = self._pick_col(ph, ["close", "收盤價", "closing_price"])
+        high_col = self._pick_col(ph, ["high", "最高價"])
+        low_col = self._pick_col(ph, ["low", "最低價"])
+        open_col = self._pick_col(ph, ["open", "開盤價"])
+        vol_col = self._pick_col(ph, ["volume", "成交股數", "成交量"])
+        if not date_col or not close_col:
+            return pd.DataFrame(columns=["stock_id"])
+        x = ph.copy()
+        x["_date_key"] = x[date_col].astype(str).str.replace("-", "", regex=False)
+        x = x[x["_date_key"] <= str(analysis_date).replace("-", "")]
+        rows = []
+        for sid, g in x.groupby("stock_id"):
+            g = g.sort_values("_date_key").tail(260)
+            close = self._to_num(g[close_col])
+            high = self._to_num(g[high_col]) if high_col else close
+            low = self._to_num(g[low_col]) if low_col else close
+            open_ = self._to_num(g[open_col]) if open_col else close
+            vol = self._to_num(g[vol_col]) if vol_col else pd.Series([math.nan] * len(g))
+            if close.dropna().empty:
+                continue
+            c = float(close.dropna().iloc[-1])
+            ma20 = float(close.tail(20).mean()) if len(close.dropna()) >= 20 else math.nan
+            ma60 = float(close.tail(60).mean()) if len(close.dropna()) >= 60 else math.nan
+            high20 = float(high.tail(20).max()) if len(high.dropna()) >= 1 else c
+            high60 = float(high.tail(60).max()) if len(high.dropna()) >= 1 else c
+            low20 = float(low.tail(20).min()) if len(low.dropna()) >= 1 else c
+            low60 = float(low.tail(60).min()) if len(low.dropna()) >= 1 else c
+            prev = float(close.dropna().iloc[-2]) if len(close.dropna()) >= 2 else c
+            tr1 = high - low
+            tr2 = (high - close.shift(1)).abs()
+            tr3 = (low - close.shift(1)).abs()
+            atr = float(pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).tail(14).mean()) if len(g) >= 14 else max(c * 0.03, 0.01)
+            delta = close.diff()
+            gain = delta.clip(lower=0).tail(14).mean()
+            loss = (-delta.clip(upper=0)).tail(14).mean()
+            rsi = 100 - 100/(1 + (gain/loss)) if loss and not math.isnan(loss) and loss != 0 else 50
+            pct20 = (c / float(close.dropna().iloc[-20]) - 1) * 100 if len(close.dropna()) >= 20 and float(close.dropna().iloc[-20]) else 0
+            rows.append({
+                "stock_id": sid, "close": c, "prev_close": prev, "ma20": ma20, "ma60": ma60,
+                "high20": high20, "high60": high60, "low20": low20, "low60": low60,
+                "atr": atr, "rsi": float(rsi), "pct20": float(pct20),
+                "vol5": float(vol.tail(5).mean()) if len(vol.dropna()) >= 1 else math.nan,
+                "vol20": float(vol.tail(20).mean()) if len(vol.dropna()) >= 1 else math.nan,
+                "last_date": str(g[date_col].iloc[-1]),
+            })
+        return pd.DataFrame(rows)
+
+    def _eps_features(self, quarterly, annual):
+        q = self._latest_by_stock(quarterly, ["date", "data_date", "quarter", "year_quarter", "report_date"])
+        a = self._latest_by_stock(annual, ["date", "data_date", "year", "data_year"])
+        out = pd.DataFrame()
+        ids = sorted(set(q.get("stock_id", pd.Series(dtype=str)).astype(str)).union(set(a.get("stock_id", pd.Series(dtype=str)).astype(str))))
+        out["stock_id"] = ids
+        if not q.empty:
+            eps_col = self._pick_col(q, ["eps", "basic_eps", "actual_q1_eps", "q1_eps", "每股盈餘", "基本每股盈餘"])
+            margin_cols = [self._pick_col(q, ["gross_margin", "毛利率"]), self._pick_col(q, ["operating_margin", "營益率"]), self._pick_col(q, ["net_margin", "淨利率"])]
+            qm = q[["stock_id"]].copy()
+            qm["q_eps"] = self._to_num(q[eps_col]) if eps_col else math.nan
+            for idx, col in enumerate(margin_cols, 1):
+                qm[f"margin_{idx}"] = self._to_num(q[col]) if col else math.nan
+            out = out.merge(qm, on="stock_id", how="left")
+        if not a.empty:
+            eps_col = self._pick_col(a, ["annual_eps", "eps", "eps_2025", "全年EPS", "每股盈餘"])
+            am = a[["stock_id"]].copy()
+            am["annual_eps"] = self._to_num(a[eps_col]) if eps_col else math.nan
+            out = out.merge(am, on="stock_id", how="left")
+        return out
+
+    def _revenue_features(self, rev):
+        if rev.empty or "stock_id" not in rev.columns:
+            return pd.DataFrame(columns=["stock_id"])
+        month_col = self._pick_col(rev, ["revenue_month", "month", "data_month", "年月"])
+        yoy_col = self._pick_col(rev, ["yoy", "revenue_yoy", "YoY", "月營收年增率"])
+        mom_col = self._pick_col(rev, ["mom", "revenue_mom", "MoM"])
+        if not month_col:
+            return pd.DataFrame(columns=["stock_id"])
+        rows = []
+        x = rev.copy().sort_values(["stock_id", month_col])
+        for sid, g in x.groupby("stock_id"):
+            g = g.tail(6)
+            yoys = self._to_num(g[yoy_col]) if yoy_col else pd.Series([math.nan] * len(g))
+            moms = self._to_num(g[mom_col]) if mom_col else pd.Series([math.nan] * len(g))
+            last3 = yoys.tail(3).dropna().tolist()
+            cont_up = len(last3) >= 3 and last3[0] < last3[1] < last3[2]
+            accel = (last3[-1] - last3[0]) if len(last3) >= 2 else math.nan
+            rows.append({"stock_id": sid, "rev_yoy_3m_avg": float(pd.Series(last3).mean()) if last3 else math.nan,
+                         "rev_yoy_accel": float(accel) if not pd.isna(accel) else math.nan,
+                         "rev_yoy_cont_up": bool(cont_up), "rev_mom_latest": float(moms.dropna().iloc[-1]) if len(moms.dropna()) else math.nan,
+                         "rev_latest_month": str(g[month_col].iloc[-1])})
+        return pd.DataFrame(rows)
+
+    def _institution_features(self, inst):
+        if inst.empty or "stock_id" not in inst.columns:
+            return pd.DataFrame(columns=["stock_id"])
+        date_col = self._pick_col(inst, ["trade_date", "date", "data_date"])
+        net_col = self._pick_col(inst, ["net_buy", "net_buy_sell", "foreign_net", "institutional_net", "三大法人買賣超", "total_net"])
+        if not net_col:
+            # sum any buy-sell like numeric columns except identifiers
+            num_cols = [c for c in inst.columns if c != "stock_id" and any(k in str(c).lower() for k in ["net", "買賣超", "買超"])]
+            net_col = num_cols[0] if num_cols else None
+        x = inst.copy()
+        if date_col:
+            x = x.sort_values(["stock_id", date_col])
+        rows = []
+        for sid, g in x.groupby("stock_id"):
+            vals = self._to_num(g[net_col]) if net_col else pd.Series([0] * len(g))
+            rows.append({"stock_id": sid, "inst_5d": float(vals.tail(5).sum()), "inst_10d": float(vals.tail(10).sum()), "inst_20d": float(vals.tail(20).sum())})
+        return pd.DataFrame(rows)
+
+    def _valuation_features(self, val, margin):
+        v = self._latest_by_stock(val, ["data_date", "date", "trade_date"])
+        m = self._latest_by_stock(margin, ["trade_date", "date", "data_date"])
+        ids = sorted(set(v.get("stock_id", pd.Series(dtype=str))).union(set(m.get("stock_id", pd.Series(dtype=str)))))
+        out = pd.DataFrame({"stock_id": ids}) if ids else pd.DataFrame(columns=["stock_id"])
+        if not v.empty:
+            vm = v[["stock_id"]].copy()
+            for out_col, names in {"pe": ["pe", "PER", "本益比"], "pb": ["pb", "PBR", "股價淨值比"], "dividend_yield": ["dividend_yield", "殖利率"], "eps_ttm": ["eps_ttm", "EPS_TTM"]}.items():
+                col = self._pick_col(v, names)
+                vm[out_col] = self._to_num(v[col]) if col else math.nan
+            out = out.merge(vm, on="stock_id", how="left")
+        if not m.empty:
+            mm = m[["stock_id"]].copy()
+            col = self._pick_col(m, ["margin_balance", "融資餘額", "margin_change", "融資增減"])
+            mm["margin_balance"] = self._to_num(m[col]) if col else math.nan
+            out = out.merge(mm, on="stock_id", how="left")
+        return out
+
+    def _theme_score(self, row) -> Tuple[float, str]:
+        text = " ".join([str(row.get(k, "")) for k in ["industry", "theme", "sub_theme", "stock_name"]])
+        hot = ["AI", "人工智慧", "伺服器", "散熱", "CPO", "矽光子", "半導體", "先進封裝", "電源", "網通", "PCB", "ASIC"]
+        hits = [k for k in hot if k.lower() in text.lower()]
+        if hits:
+            return 15.0, "AI/主流題材命中:" + ",".join(hits[:5])
+        return 5.0, "一般題材"
+
+    def _gate_and_score(self, df):
+        x = df.copy()
+        for c in ["q_eps", "annual_eps", "rev_yoy_3m_avg", "rev_yoy_accel", "inst_20d", "close", "ma20", "ma60", "pe", "pb", "rsi"]:
+            if c not in x.columns:
+                x[c] = math.nan
+            x[c] = self._to_num(x[c])
+        x["eps_gate"] = "FAIL"
+        x.loc[(x["q_eps"] > 0) & (x["annual_eps"].notna()) & (x["q_eps"] > x["annual_eps"]), "eps_gate"] = "PASS"
+        x.loc[(x["q_eps"] > 0) & (x["annual_eps"].isna()), "eps_gate"] = "DEGRADE"
+        x["revenue_gate"] = "FAIL"
+        x.loc[(x["rev_yoy_3m_avg"] >= 50) | (x.get("rev_yoy_cont_up", False) == True) | (x["rev_yoy_accel"] > 0), "revenue_gate"] = "PASS"
+        x.loc[x["rev_yoy_3m_avg"].isna(), "revenue_gate"] = "DEGRADE"
+        x["institution_gate"] = "PASS"
+        x.loc[x["inst_20d"] < 0, "institution_gate"] = "DEGRADE"
+        x.loc[x["inst_20d"].isna(), "institution_gate"] = "DEGRADE"
+        x["technical_gate"] = "FAIL"
+        x.loc[(x["close"] >= x["ma20"]) | (x["close"] >= x["ma60"]), "technical_gate"] = "PASS"
+        x.loc[x["close"].isna(), "technical_gate"] = "DEGRADE"
+        x["valuation_gate"] = "PASS"
+        x.loc[(x["pe"] > 45) & (x["close"] > 100), "valuation_gate"] = "DEGRADE"
+        x.loc[x["pe"].isna(), "valuation_gate"] = "DEGRADE"
+
+        gate_score_map = {"PASS": 1.0, "DEGRADE": 0.45, "FAIL": 0.0}
+        x["eps_score"] = x["eps_gate"].map(gate_score_map) * 30
+        x["revenue_score"] = x["revenue_gate"].map(gate_score_map) * 25
+        x["institution_score"] = x["institution_gate"].map(gate_score_map) * 15
+        x["technical_score"] = x["technical_gate"].map(gate_score_map) * 20
+        x["valuation_score"] = x["valuation_gate"].map(gate_score_map) * 10
+        theme = x.apply(lambda r: self._theme_score(r), axis=1)
+        x["theme_score"] = [t[0] for t in theme]
+        x["theme_reason"] = [t[1] for t in theme]
+        x["ai_total_score"] = x[["eps_score", "revenue_score", "institution_score", "technical_score", "valuation_score"]].sum(axis=1) + x["theme_score"]
+        x["strategy_grade"] = "C"
+        x.loc[x["ai_total_score"] >= 85, "strategy_grade"] = "S"
+        x.loc[(x["ai_total_score"] >= 75) & (x["ai_total_score"] < 85), "strategy_grade"] = "A"
+        x.loc[(x["ai_total_score"] >= 65) & (x["ai_total_score"] < 75), "strategy_grade"] = "B"
+        return x.sort_values("ai_total_score", ascending=False)
+
+    def _strategy(self, x):
+        y = x.copy()
+        for c in ["close", "ma20", "ma60", "low20", "low60", "high20", "high60", "atr"]:
+            if c not in y.columns:
+                y[c] = math.nan
+            y[c] = self._to_num(y[c])
+        c = y["close"]
+        atr = y["atr"].fillna((c * 0.03).clip(lower=0.01))
+        support1 = y["ma20"].fillna(y["low20"]).fillna(c * 0.97)
+        support2 = y["ma60"].fillna(y["low60"]).fillna(c * 0.93)
+        support3 = y["low60"].fillna(c * 0.88)
+        resistance1 = y["high20"].fillna(c * 1.05)
+        resistance2 = y["high60"].fillna(c * 1.10)
+        y["support1"] = support1.round(2)
+        y["support2"] = support2.round(2)
+        y["support3"] = support3.round(2)
+        y["resistance1"] = resistance1.round(2)
+        y["resistance2"] = resistance2.round(2)
+        y["entry1"] = pd.concat([c * 0.985, y["ma20"] * 1.005, support1 * 1.01], axis=1).min(axis=1).round(2)
+        y["entry2"] = pd.concat([y["ma20"] * 0.98, y["ma60"] * 1.01, support2 * 1.01], axis=1).min(axis=1).round(2)
+        y["breakout_trigger"] = pd.concat([y["high20"] * 1.01, c * 1.03], axis=1).max(axis=1).round(2)
+        y["stop_loss"] = pd.concat([support2 * 0.98, y["ma60"] * 0.97, c - 1.5 * atr], axis=1).min(axis=1).round(2)
+        y["target1"] = pd.concat([y["entry1"] + 2.0 * (y["entry1"] - y["stop_loss"]), resistance1], axis=1).max(axis=1).round(2)
+        y["target2"] = pd.concat([y["entry1"] + 3.0 * (y["entry1"] - y["stop_loss"]), resistance2], axis=1).max(axis=1).round(2)
+        risk = (y["entry1"] - y["stop_loss"]).replace(0, math.nan)
+        y["rr"] = ((y["target1"] - y["entry1"]) / risk).replace([math.inf, -math.inf], math.nan).round(2)
+        y["win_rate_est"] = (45 + (y["ai_total_score"] - 60) * 0.5).clip(35, 72).round(1)
+        return y
+
+    def _reason_columns(self, x, top_n=5):
+        y = x.copy().reset_index(drop=True)
+        y["rank"] = y.index + 1
+        y["selected_top5"] = y["rank"] <= top_n
+        selected_reasons = []
+        eliminated = []
+        gate_cols = ["eps_gate", "revenue_gate", "institution_gate", "technical_gate", "valuation_gate"]
+        for _, r in y.iterrows():
+            ok = [g for g in gate_cols if r.get(g) == "PASS"]
+            bad = [g for g in gate_cols if r.get(g) != "PASS"]
+            selected_reasons.append(f"AI總分{r.get('ai_total_score',0):.1f}；通過{len(ok)}/5 Gate；{r.get('theme_reason','')}")
+            reasons = []
+            for g in bad:
+                reasons.append(f"{g}={r.get(g)}")
+            if r.get("rr", 0) < 1.2:
+                reasons.append(f"RR不足={r.get('rr')}")
+            if not reasons and r.get("rank", 999) > top_n:
+                reasons.append("總分低於TOP5，列入TOP20/觀察池")
+            eliminated.append("；".join(reasons) if reasons else "入選TOP5")
+        y["selection_reason"] = selected_reasons
+        y["elimination_reason"] = eliminated
+        return y
+
+    def _write_sheet(self, wb, name: str, rows: List[List[Any]], header_fill: str = "1F4E79"):
+        if name in wb.sheetnames:
+            ws = wb[name]
+            ws.delete_rows(1, ws.max_row)
+        else:
+            ws = wb.create_sheet(name)
+        for row in rows:
+            ws.append(row)
+        if rows:
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor=header_fill)
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            ws.freeze_panes = "A2"
+            for col in range(1, min(ws.max_column, 40) + 1):
+                ws.column_dimensions[get_column_letter(col)].width = min(28, max(10, len(str(ws.cell(1, col).value or "")) + 2))
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+        return ws
+
+    def _export_report(self, out_path: str, result, table_counts: Dict[str, int], analysis_date: str, db_path: str) -> str:
+        wb = Workbook()
+        if wb.active:
+            wb.remove(wb.active)
+        df = result.copy()
+        base_cols = ["rank", "stock_id", "stock_name", "industry", "theme", "sub_theme", "close", "ai_total_score", "strategy_grade", "eps_gate", "revenue_gate", "institution_gate", "technical_gate", "valuation_gate", "selection_reason"]
+        top5_cols = base_cols + ["entry1", "entry2", "breakout_trigger", "stop_loss", "target1", "target2", "rr", "win_rate_est", "support1", "support2", "support3", "resistance1", "resistance2"]
+        top20_cols = base_cols + ["elimination_reason"]
+        elim_cols = ["rank", "stock_id", "stock_name", "ai_total_score", "eps_gate", "revenue_gate", "institution_gate", "technical_gate", "valuation_gate", "rr", "elimination_reason"]
+        gate_cols = ["stock_id", "stock_name", "q_eps", "annual_eps", "rev_yoy_3m_avg", "rev_yoy_accel", "inst_20d", "close", "ma20", "ma60", "pe", "eps_gate", "revenue_gate", "institution_gate", "technical_gate", "valuation_gate", "ai_total_score"]
+        audit_rows = [["項目", "結果"]]
+        audit_rows += [["DB", db_path], ["分析日期", analysis_date], ["資料原則", "只讀原始白名單表；禁止讀取 ranking_result/trade_plan/watchlist/prebreakout/top20/teacher_pool"], ["白名單", ", ".join(sorted(self.ALLOWED_TABLES))], ["黑名單", ", ".join(sorted(self.PROHIBITED_TABLES))]]
+        for t in sorted(self.ALLOWED_TABLES):
+            audit_rows.append([f"{t} 筆數", table_counts.get(t, 0)])
+        audit_rows.append(["TOP5 筆數", int((df["rank"] <= 5).sum())])
+        audit_rows.append(["TOP20 筆數", int((df["rank"] <= 20).sum())])
+        self._write_sheet(wb, "00_執行摘要", audit_rows)
+        def rows_from(cols, data):
+            return [cols] + data[[c for c in cols if c in data.columns]].where(pd.notna(data[[c for c in cols if c in data.columns]]), "").values.tolist()
+        self._write_sheet(wb, "01_TOP5總表", rows_from(top5_cols, df[df["rank"] <= 5]))
+        self._write_sheet(wb, "02_TOP20候選池", rows_from(top20_cols, df[df["rank"] <= 20]))
+        self._write_sheet(wb, "03_五層Gate明細", rows_from(gate_cols, df))
+        self._write_sheet(wb, "04_淘汰原因", rows_from(elim_cols, df[df["rank"] > 5]))
+        lineage = [["分數/欄位", "來源表", "來源欄位/計算方式"]]
+        lineage += [
+            ["EPS Gate", "quarterly_financial_history + annual_eps_history", "q_eps > annual_eps 且 q_eps > 0"],
+            ["Revenue Gate", "external_revenue_history", "近三月YoY均值/連升/加速度"],
+            ["Institution Gate", "external_institutional", "法人5/10/20日淨買賣超"],
+            ["Technical Gate", "price_history", "close/MA20/MA60/High20/Low60/ATR/RSI"],
+            ["Valuation Gate", "external_valuation + external_margin", "PE/PB/殖利率/EPS_TTM/融資風險"],
+            ["Theme Score", "stocks_master", "industry/theme/sub_theme 關鍵字"],
+        ]
+        self._write_sheet(wb, "05_Feature_Lineage", lineage)
+        # simple validation
+        for ws in wb.worksheets:
+            ws.auto_filter.ref = ws.dimensions
+        out = Path(out_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(out)
+        return str(out)
+
+    def run(self, db_path: str, out_path: str, base_date: Optional[str] = None, top_n: int = 5) -> Dict[str, Any]:
+        if pd is None:
+            raise RuntimeError("Master6V5RawDbEngine 需要 pandas")
+        if not db_path or not Path(db_path).exists():
+            raise RuntimeError("大師六V5必須指定有效主DB檔案")
+        self.logger.info("R5N31_MASTER6_V5_START raw-db-only pipeline")
+        with sqlite3.connect(db_path) as conn:
+            # 防污染：先檢查所有黑名單是否存在並記錄，但不讀取。
+            existing = [t for t in self.PROHIBITED_TABLES if self._table_exists(conn, t)]
+            self.logger.info(f"R5N31_PROHIBITED_TABLES_EXIST_BUT_NOT_READ {existing}")
+            analysis_date = self._resolve_analysis_date(conn, base_date)
+            table_counts = {t: (int(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]) if self._table_exists(conn, t) else 0) for t in self.ALLOWED_TABLES}
+            stocks = self._read_allowed_table(conn, "stocks_master")
+            ph = self._read_allowed_table(conn, "price_history", "REPLACE(date,'-','')<=?" if self._table_exists(conn, "price_history") and "date" in self._cols(conn, "price_history") else "", [str(analysis_date).replace("-", "")] if self._table_exists(conn, "price_history") and "date" in self._cols(conn, "price_history") else None)
+            q = self._read_allowed_table(conn, "quarterly_financial_history")
+            a = self._read_allowed_table(conn, "annual_eps_history")
+            rev = self._read_allowed_table(conn, "external_revenue_history")
+            inst = self._read_allowed_table(conn, "external_institutional")
+            val = self._read_allowed_table(conn, "external_valuation")
+            margin = self._read_allowed_table(conn, "external_margin")
+        universe = self._build_universe(stocks)
+        features = universe.merge(self._price_features(ph, analysis_date), on="stock_id", how="left")
+        features = features.merge(self._eps_features(q, a), on="stock_id", how="left")
+        features = features.merge(self._revenue_features(rev), on="stock_id", how="left")
+        features = features.merge(self._institution_features(inst), on="stock_id", how="left")
+        features = features.merge(self._valuation_features(val, margin), on="stock_id", how="left")
+        scored = self._gate_and_score(features)
+        strat = self._strategy(scored)
+        final = self._reason_columns(strat, top_n=top_n)
+        output = self._export_report(out_path, final, table_counts, analysis_date, db_path)
+        summary = {"模式": REPORT_MODE_MASTER6_V5, "分析日期": analysis_date, "Universe": int(len(universe)), "候選池": int(len(final)), "TOP5": int((final["rank"] <= 5).sum()), "資料原則": "RAW_DB_ONLY; prohibited result tables not read", "output": output}
+        self.logger.info(f"R5N31_MASTER6_V5_DONE summary={json.dumps(summary, ensure_ascii=False)}")
+        return {"output": output, "summary": summary, "warnings": [], "log_file": str(self.logger.log_file), "raw_dir": str(self.logger.raw_dir), "data_outputs": {}}
+
+
 class Macro16Engine:
     def __init__(self, log_dir: Path):
         self.logger = Macro16Logger(log_dir)
@@ -8591,6 +9065,10 @@ class Macro16Engine:
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
         self.logger.info("CHANGELOG v3.0.0: Add AI Project Rotation Monitor sheets and full 201-stock AI tracking page")
         self.logger.strategy_trace("STRATEGY_VERSION", {"strategy_version": STRATEGY_VERSION, "program_version": VERSION})
+        if report_mode == REPORT_MODE_MASTER6_V5:
+            result = Master6V5RawDbEngine(self.logger).run(db_path or "", out_path, base_date, top_n=5)
+            self.logger.info("執行完成")
+            return result
         raw: Dict[str, RawData] = {}
         requested_date = base_date.replace("-", "") if base_date else None
         raw["台股指數"] = self.source.fetch_twse_taiex_history(requested_date)
@@ -10192,7 +10670,7 @@ def run_gui():
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill="both", expand=True)
-    ttk.Label(frm, text="宏觀16模組 自動抓取與Excel回填 / R5N29觀察池培養", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
+    ttk.Label(frm, text="宏觀16模組 自動抓取與Excel回填 / R5N29觀察池培養 / 大師六V5", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
     ttk.Label(frm, text="Excel模板").grid(row=1, column=0, sticky="w")
     ttk.Entry(frm, textvariable=template_var, width=90).grid(row=1, column=1, sticky="we")
     ttk.Button(frm, text="選擇", command=browse_template).grid(row=1, column=2)
@@ -10201,7 +10679,7 @@ def run_gui():
     ttk.Button(frm, text="另存", command=browse_out).grid(row=2, column=2)
     ttk.Label(frm, text="基準日(YYYY-MM-DD)").grid(row=3, column=0, sticky="w")
     ttk.Entry(frm, textvariable=date_var, width=20).grid(row=3, column=1, sticky="w")
-    ttk.Label(frm, text="主DB檔案(選填；R5N29必填)").grid(row=4, column=0, sticky="w")
+    ttk.Label(frm, text="主DB檔案(選填；R5N29/大師六V5必填)").grid(row=4, column=0, sticky="w")
     ttk.Entry(frm, textvariable=db_var, width=90).grid(row=4, column=1, sticky="we")
     ttk.Button(frm, text="選擇DB", command=browse_db).grid(row=4, column=2)
     ttk.Label(frm, text="TEJ八大官股檔(宏觀模式選填)").grid(row=5, column=0, sticky="w")
@@ -10215,7 +10693,7 @@ def run_gui():
     ttk.Button(frm, text="選擇報表", command=browse_launch_ready).grid(row=7, column=2)
     ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=8, column=1, sticky="w")
     ttk.Label(frm, text="輸出模式").grid(row=9, column=0, sticky="w")
-    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], width=36, state="readonly").grid(row=9, column=1, sticky="w")
+    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL, REPORT_MODE_MASTER6_V5], width=36, state="readonly").grid(row=9, column=1, sticky="w")
     ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=10, column=0, columnspan=3, sticky="w", pady=8)
 
     log_text = tk.Text(frm, height=24, wrap="word")
@@ -10274,7 +10752,7 @@ def main():
     parser.add_argument("--launch-ready-path", default="", help="R5N29 Launch Ready報表檔案或資料夾；watch_pool_cultivation模式直接使用；macro_refill模式若有填則在宏觀報表完成後執行旁路培養輸出")
     parser.add_argument("--tej-gov-file", default="", help="TEJ八大公股行庫買賣超排名xls/xlsx；用於gov_net_100m主來源")
     parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
-    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug")
+    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL, REPORT_MODE_MASTER6_V5], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug；master6_v5_ai_investment_decision只讀原始DB表重新選股")
     args = parser.parse_args()
     if args.cli:
         if args.report_mode == REPORT_MODE_WATCH_POOL:
