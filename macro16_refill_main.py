@@ -9279,16 +9279,21 @@ class WatchPoolCultivationEngine:
             first_enter_date = p.get("first_enter_date") if p else base_date
             track.update({"first_enter_date": first_enter_date, "last_update_date": base_date, "score_1d_delta": d1, "score_3d_delta": d3, "score_5d_delta": d5, "days_in_watch": days, "created_at": now})
             tracking.append(track)
-            before = p.get("watch_status") if p else None
+            raw_before = p.get("watch_status") if p else None
+            before = self._normalize_watch_status(raw_before) or raw_before
             after = row.get("watch_status") or "WATCH"
             event_type = None
             reason = ""
+            before_note = f"（原始前狀態={raw_before}）" if raw_before and before != raw_before else ""
             if p is None:
                 event_type = "ENTER"
                 reason = "首次進入觀察池"
             elif before != after:
-                event_type = "STATUS_CHANGE"
-                reason = f"狀態變更 {before} -> {after}"
+                event_type = "UPGRADE_TO_LAUNCH_READY" if after == "LAUNCH_READY" else "STATUS_CHANGE"
+                reason = f"流程狀態變更 {before} -> {after}{before_note}"
+            elif after == "LAUNCH_READY":
+                event_type = "LAUNCH_READY_REFRESH"
+                reason = f"今日 Launch Ready 報表持續命中；流程狀態維持 {after}{before_note}"
             elif d1 is not None and d1 >= 10:
                 event_type = "ACCELERATING"
                 reason = f"分數單日增加 {d1:.2f}"
@@ -9390,6 +9395,37 @@ class WatchPoolCultivationEngine:
                 pass
         conn.commit()
         self.log(f"R5N30B_LAUNCH_GRADE_NORMALIZED changed={changed}")
+
+    def normalize_existing_lifecycle_statuses(self, conn: sqlite3.Connection) -> None:
+        """R5N30D：把流程狀態欄位與 Launch Grade 分離。
+
+        目的：舊版資料可能把 S/A/B/C、🚀S、�A 等等級值寫入 watch_status 或
+        watch_pool_event.before_status，導致 Lifecycle 欄位混入 Grade。
+        R5N30D 僅正規化流程欄位：
+          - watch_pool_tracking.watch_status
+          - watch_pool_event.before_status
+          - watch_pool_event.after_status
+        等級仍保存在 launch_grade，不會遺失 S/A/B/C。
+        """
+        changed = 0
+        targets = [
+            ("watch_pool_tracking", "watch_status"),
+            ("watch_pool_event", "before_status"),
+            ("watch_pool_event", "after_status"),
+        ]
+        for table, col in targets:
+            try:
+                rows = conn.execute(f"SELECT rowid, {col} FROM {table} WHERE COALESCE({col}, '')<>''").fetchall()
+                for rowid, value in rows:
+                    raw = str(value or "").strip()
+                    normalized = self._normalize_watch_status(raw)
+                    if normalized and normalized != raw:
+                        conn.execute(f"UPDATE {table} SET {col}=? WHERE rowid=?", (normalized, rowid))
+                        changed += 1
+            except Exception as exc:
+                self.warn(f"R5N30D_LIFECYCLE_STATUS_NORMALIZE_SKIP table={table} col={col} error={exc}")
+        conn.commit()
+        self.log(f"R5N30D_LIFECYCLE_STATUS_NORMALIZED changed={changed}")
 
     def _load_trade_features_for_trade_plan(self, main_db_path: Optional[str], stock_ids: List[str]) -> Dict[str, Dict[str, float]]:
         """R5N30C：從主DB讀取交易策略所需的價格特徵。
@@ -9563,6 +9599,7 @@ class WatchPoolCultivationEngine:
         """
         self.ensure_cultivation_schema(conn)
         self.normalize_existing_launch_grades(conn)
+        self.normalize_existing_lifecycle_statuses(conn)
         rows = conn.execute("""
             SELECT track_date, stock_id, COALESCE(stock_name,''), COALESCE(watch_status,''),
                    COALESCE(launch_grade,''), COALESCE(launch_score,0), COALESCE(status_reason,'')
@@ -9785,9 +9822,9 @@ class WatchPoolCultivationEngine:
                 "讓 R5N29 從觀察池培養延伸到可追蹤的交易決策閉環，回答今天要怎麼操作。",
                 "新增第四張資料表 watch_pool_trade_plan；不混入 watch_pool_tracking、watch_pool_event、watch_pool_performance。",
                 "DB schema + WatchPoolCultivationEngine + Excel 報表 09_交易策略",
-                "DB 存在 watch_pool_trade_plan；09_交易策略有表頭與資料；Log 出現 R5N30_TRADE_PLAN_UPDATED；99_查核紀錄列出 PASS/WARN。",
-                "WatchPoolCultivationEngine / TradePlanLayer", "NEXT_VERSION",
-                "列為下一版第一個新增功能；本 Sheet 僅做需求落點追蹤，不代表本版已完成交易策略運算。"
+                "DB 存在 watch_pool_trade_plan；09_交易策略有表頭與資料；Log 出現 R5N30C_TRADE_PLAN_UPDATED；99_查核紀錄列出 PASS/WARN。",
+                "WatchPoolCultivationEngine / TradePlanLayer", "IMPLEMENTED_IN_R5N30C",
+                "本版已完成交易策略層落地；R5N30D 追加修正 Lifecycle 欄位與需求追蹤狀態一致性。"
             ),
             (
                 "P1", "R5N30/R5N29B", "R5N30-P1-002", "watch_pool_trade_plan 資料表",
@@ -9796,8 +9833,8 @@ class WatchPoolCultivationEngine:
                 "欄位包含 stock_id、trade_date、strategy_level、trade_status、first_buy_price、second_buy_price、stop_loss_price、pressure_1、pressure_2、target_price、suggested_action、strategy_source、confidence_score。",
                 "ensure_cultivation_schema() 建表/遷移 + write_trade_plan() 寫入",
                 "PRAGMA table_info(watch_pool_trade_plan) 欄位完整；每次培養至少寫入今日 WatchPool/LaunchReady 股票策略列。",
-                "Cultivation DB Schema", "NEXT_VERSION",
-                "與現有三表並列，作為第四張核心表。"
+                "Cultivation DB Schema", "IMPLEMENTED_IN_R5N30C",
+                "已與現有三表並列，作為第四張核心表；本版驗證 watch_pool_trade_plan 有資料。"
             ),
             (
                 "P1", "R5N30/R5N29B", "R5N30-P1-003", "09_交易策略 Sheet",
@@ -9806,8 +9843,8 @@ class WatchPoolCultivationEngine:
                 "報表欄位包含 股票、狀態、等級、第一買點、第二買點、停損、壓力1、壓力2、目標價、建議。",
                 "export_cultivation_report() 新增 09_交易策略",
                 "報表存在 09_交易策略；列數與 watch_pool_trade_plan 今日資料一致；缺資料時 99_查核紀錄需 WARN 不可默默空白。",
-                "Excel Report Writer", "NEXT_VERSION",
-                "不可取代 01~08 舊報表，必須追加。"
+                "Excel Report Writer", "IMPLEMENTED_IN_R5N30C",
+                "已追加 09_交易策略；不可取代 01~08 舊報表。"
             ),
             (
                 "P1", "R5N30/R5N29B", "R5N30-P1-004", "交易策略驗收與查核",
@@ -9816,8 +9853,8 @@ class WatchPoolCultivationEngine:
                 "新增 10_下一版規劃追蹤；99_查核紀錄列入此 Sheet。",
                 "export_cultivation_report() 每次輸出 10_下一版規劃追蹤",
                 "10_下一版規劃追蹤列出 P1 來源、目的、範圍、驗收條件；99_查核紀錄列出 PASS。",
-                "Report Governance", "IMPLEMENTED_IN_THIS_PATCH",
-                "本次修正先完成需求落點追蹤 Sheet。"
+                "Report Governance", "IMPLEMENTED_IN_R5N30A",
+                "已完成需求落點追蹤 Sheet；R5N30D 修正本 Sheet 對 R5N30C 已實作項目的狀態描述。"
             ),
         ]
         write_sheet("10_下一版規劃追蹤", next_plan_headers, next_plan_rows)
