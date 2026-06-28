@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "3.0.0-ai-project-rotation-monitor"
+VERSION = "3.0.0-ai-project-rotation-monitor-R5N31F-master6v5-auto-side-output"
 STRATEGY_VERSION = "teacher_strategy_v3.0_ai_project_rotation_monitor_20260525"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
@@ -8681,6 +8681,25 @@ class Macro16Engine:
         evidence_word = ""
         if report_mode == REPORT_MODE_ALL:
             evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
+
+        # R5N31F FIX：避免 GUI 使用者仍選 macro_refill 時誤以為沒有產出大師六V5。
+        # 只要有主DB且不是已進入 V5 主模式，就在宏觀報表完成後自動側掛輸出
+        # reports/大師六V5_AI投資決策_YYYYMMDD.xlsx。
+        # 此側掛輸出使用 Master6V5RawDbAIEngine，僅讀白名單原始表，禁止讀 ranking_result/trade_plan/watchlist/prebreakout/top20/teacher_pool。
+        master6_v5_output = ""
+        if db_path and report_mode != REPORT_MODE_MASTER6_V5:
+            try:
+                base_dir = Path(output).resolve().parent
+                reports_dir = base_dir / "reports"
+                reports_dir.mkdir(parents=True, exist_ok=True)
+                v5_date = (base_date or dt.date.today().isoformat()).replace("-", "")
+                master6_v5_output = str(reports_dir / f"大師六V5_AI投資決策_{v5_date}.xlsx")
+                self.logger.info(f"R5N31F_MASTER6_V5_SIDE_OUTPUT_START report_mode={report_mode} output={master6_v5_output}")
+                Master6V5RawDbAIEngine(self.logger).run(db_path, master6_v5_output, base_date)
+                self.logger.info(f"R5N31F_MASTER6_V5_SIDE_OUTPUT_DONE output={master6_v5_output}")
+            except Exception as exc:
+                master6_v5_output = ""
+                self.logger.warning(f"R5N31F_MASTER6_V5_SIDE_OUTPUT_FAIL error={exc}")
         # R5N29K：保留 data/reports/logs 工作資料夾，不再自動產出 data.zip。
         # 原因：data.zip 只是附件/交付包形式，不是每日培養迴路的工作資料。
         data_outputs: Dict[str, str] = {}
@@ -8693,7 +8712,7 @@ class Macro16Engine:
             summary["reports_folder"] = data_outputs.get("reports_folder", "")
             summary["logs_folder"] = data_outputs.get("logs_folder", "")
         self.logger.info("執行完成")
-        return {"output": output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file), "data_outputs": data_outputs}
+        return {"output": output, "master6_v5_output": master6_v5_output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file), "data_outputs": data_outputs}
 
 
 class WatchPoolCultivationEngine:
