@@ -9236,7 +9236,7 @@ class WatchPoolCultivationEngine:
 
     def load_previous_tracking(self, conn: sqlite3.Connection, base_date: str) -> Dict[str, Dict[str, Any]]:
         sql = """
-        SELECT t.track_date, t.stock_id, t.watch_status, t.launch_score, t.days_in_watch, t.first_enter_date
+        SELECT t.track_date, t.stock_id, t.watch_status, t.launch_score, t.days_in_watch, t.first_enter_date, COALESCE(t.launch_grade,'') AS launch_grade
         FROM watch_pool_tracking t
         JOIN (
             SELECT stock_id, MAX(track_date) AS max_date
@@ -9246,8 +9246,8 @@ class WatchPoolCultivationEngine:
         ) x ON x.stock_id=t.stock_id AND x.max_date=t.track_date
         """
         prev = {}
-        for track_date, stock_id, status, score, days, first_enter_date in conn.execute(sql, (base_date,)).fetchall():
-            prev[str(stock_id)] = {"track_date": track_date, "watch_status": status, "launch_score": score, "days_in_watch": days or 0, "first_enter_date": first_enter_date or track_date}
+        for track_date, stock_id, status, score, days, first_enter_date, launch_grade in conn.execute(sql, (base_date,)).fetchall():
+            prev[str(stock_id)] = {"track_date": track_date, "watch_status": status, "launch_score": score, "days_in_watch": days or 0, "first_enter_date": first_enter_date or track_date, "launch_grade": launch_grade or ""}
         self.log(f"R5N29_PREVIOUS_TRACKING rows={len(prev)}")
         return prev
 
@@ -9264,6 +9264,13 @@ class WatchPoolCultivationEngine:
         return float(score) - float(row[0])
 
     def compare_today_previous(self, conn: sqlite3.Connection, today_rows: List[Dict[str, Any]], prev: Dict[str, Dict[str, Any]], base_date: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """R5N30D：比較今日與前次狀態，並分離 Lifecycle Status / Launch Grade。
+
+        修正重點：
+        - before_status / after_status 不再輸出 🚀S / 🚀A / S / A / B / C。
+        - 等級變化寫在 launch_grade 與 event_reason，不污染流程狀態欄。
+        - 升級到 LAUNCH_READY 時使用 UPGRADE_TO_LAUNCH_READY；同狀態更新使用 LAUNCH_READY_REFRESH。
+        """
         now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         tracking: List[Dict[str, Any]] = []
         events: List[Dict[str, Any]] = []
@@ -9275,31 +9282,47 @@ class WatchPoolCultivationEngine:
             d1 = (float(score) - float(p["launch_score"])) if p and score is not None and p.get("launch_score") is not None else None
             d3 = self._score_delta_days(conn, sid, base_date, 3, score)
             d5 = self._score_delta_days(conn, sid, base_date, 5, score)
+
+            grade = self._clean_launch_grade(row.get("launch_grade", ""))
+            normalized_after = self._normalize_lifecycle_status(row.get("watch_status"), grade)
             track = dict(row)
+            track["watch_status"] = normalized_after
+            track["launch_grade"] = grade
             first_enter_date = p.get("first_enter_date") if p else base_date
             track.update({"first_enter_date": first_enter_date, "last_update_date": base_date, "score_1d_delta": d1, "score_3d_delta": d3, "score_5d_delta": d5, "days_in_watch": days, "created_at": now})
             tracking.append(track)
-            raw_before = p.get("watch_status") if p else None
-            before = self._normalize_watch_status(raw_before) or raw_before
-            after = row.get("watch_status") or "WATCH"
+
+            before_raw = p.get("watch_status") if p else None
+            before_grade = self._clean_launch_grade(p.get("launch_grade", "") if p else "")
+            before = self._normalize_lifecycle_status(before_raw, before_grade) if p else None
+            after = normalized_after or "WATCH"
             event_type = None
             reason = ""
-            before_note = f"（原始前狀態={raw_before}）" if raw_before and before != raw_before else ""
             if p is None:
                 event_type = "ENTER"
-                reason = "首次進入觀察池"
+                reason = f"首次進入觀察池；status={after}; grade={grade or '-'}"
             elif before != after:
-                event_type = "UPGRADE_TO_LAUNCH_READY" if after == "LAUNCH_READY" else "STATUS_CHANGE"
-                reason = f"流程狀態變更 {before} -> {after}{before_note}"
-            elif after == "LAUNCH_READY":
+                if after == "LAUNCH_READY" and before != "LAUNCH_READY":
+                    event_type = "UPGRADE_TO_LAUNCH_READY"
+                    reason = f"流程升級 {before} -> {after}；Launch Grade={grade or '-'}"
+                elif before == "LAUNCH_READY" and after == "LAUNCH_READY":
+                    event_type = "LAUNCH_READY_REFRESH"
+                    reason = f"Launch Ready 狀態刷新；Launch Grade={grade or '-'}"
+                else:
+                    event_type = "STATUS_CHANGE"
+                    reason = f"流程狀態變更 {before} -> {after}；Launch Grade={grade or '-'}"
+            elif before == "LAUNCH_READY" and after == "LAUNCH_READY" and grade and before_grade and grade != before_grade:
+                event_type = "LAUNCH_GRADE_CHANGE"
+                reason = f"Launch Grade 變更 {before_grade} -> {grade}；流程狀態維持 LAUNCH_READY"
+            elif after == "LAUNCH_READY" and d1 is not None and d1 >= 0:
                 event_type = "LAUNCH_READY_REFRESH"
-                reason = f"今日 Launch Ready 報表持續命中；流程狀態維持 {after}{before_note}"
+                reason = f"Launch Ready 狀態刷新；Launch Grade={grade or '-'}；score_delta_1d={d1:.2f}"
             elif d1 is not None and d1 >= 10:
                 event_type = "ACCELERATING"
-                reason = f"分數單日增加 {d1:.2f}"
+                reason = f"分數單日增加 {d1:.2f}；Launch Grade={grade or '-'}"
             if event_type:
-                events.append({"event_date": base_date, "stock_id": sid, "stock_name": row.get("stock_name", ""), "market_type": row.get("market_type", ""), "industry": row.get("industry", ""), "theme": row.get("theme", ""), "sub_theme": row.get("sub_theme", ""), "launch_grade": row.get("launch_grade", ""), "first_enter_date": row.get("first_enter_date", base_date), "last_update_date": row.get("last_update_date", base_date), "event_type": event_type, "before_status": before, "after_status": after, "event_reason": reason, "launch_score": score, "created_at": now})
-        self.log(f"R5N29_COMPARE tracking_rows={len(tracking)} event_rows={len(events)}")
+                events.append({"event_date": base_date, "stock_id": sid, "stock_name": row.get("stock_name", ""), "market_type": row.get("market_type", ""), "industry": row.get("industry", ""), "theme": row.get("theme", ""), "sub_theme": row.get("sub_theme", ""), "launch_grade": grade, "first_enter_date": first_enter_date, "last_update_date": base_date, "event_type": event_type, "before_status": before, "after_status": after, "event_reason": reason, "launch_score": score, "created_at": now})
+        self.log(f"R5N30D_COMPARE tracking_rows={len(tracking)} event_rows={len(events)} lifecycle_status_clean=1")
         return tracking, events
 
     def write_tracking_rows(self, conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> None:
@@ -9396,36 +9419,118 @@ class WatchPoolCultivationEngine:
         conn.commit()
         self.log(f"R5N30B_LAUNCH_GRADE_NORMALIZED changed={changed}")
 
-    def normalize_existing_lifecycle_statuses(self, conn: sqlite3.Connection) -> None:
-        """R5N30D：把流程狀態欄位與 Launch Grade 分離。
 
-        目的：舊版資料可能把 S/A/B/C、🚀S、�A 等等級值寫入 watch_status 或
-        watch_pool_event.before_status，導致 Lifecycle 欄位混入 Grade。
-        R5N30D 僅正規化流程欄位：
-          - watch_pool_tracking.watch_status
-          - watch_pool_event.before_status
-          - watch_pool_event.after_status
-        等級仍保存在 launch_grade，不會遺失 S/A/B/C。
+    def _is_launch_grade_token(self, value: Optional[str]) -> bool:
+        """R5N30D：判斷欄位值是否其實是 Launch Grade，而不是 Lifecycle Status。
+
+        必須使用嚴格判斷，避免 LAUNCH_READY 因包含字母 A 被誤判成 A 級。
         """
-        changed = 0
-        targets = [
-            ("watch_pool_tracking", "watch_status"),
-            ("watch_pool_event", "before_status"),
-            ("watch_pool_event", "after_status"),
-        ]
-        for table, col in targets:
-            try:
-                rows = conn.execute(f"SELECT rowid, {col} FROM {table} WHERE COALESCE({col}, '')<>''").fetchall()
-                for rowid, value in rows:
-                    raw = str(value or "").strip()
-                    normalized = self._normalize_watch_status(raw)
-                    if normalized and normalized != raw:
-                        conn.execute(f"UPDATE {table} SET {col}=? WHERE rowid=?", (normalized, rowid))
-                        changed += 1
-            except Exception as exc:
-                self.warn(f"R5N30D_LIFECYCLE_STATUS_NORMALIZE_SKIP table={table} col={col} error={exc}")
+        raw = str(value or "").strip()
+        if not raw:
+            return False
+        u = raw.replace("�", "").replace("🚀", "").replace("⭐", "").replace("★", "").strip().upper()
+        u = u.replace(" ", "").replace("級", "")
+        return u in {"S", "A", "B", "C", "S+", "A+", "B+", "C+"}
+
+    def _normalize_lifecycle_status(self, raw_status: Optional[str], launch_grade: Optional[str] = None) -> str:
+        """R5N30D：流程狀態正規化。
+
+        watch_status / before_status / after_status 只能放 Lifecycle：
+        WATCH / ACCELERATING / LAUNCH_READY / EXIT。
+        S/A/B/C、🚀S/🚀A/🚀B 是 Launch Grade，不可再直接寫入流程狀態欄。
+        """
+        s = str(raw_status or "").strip()
+        u = s.upper().replace(" ", "_").replace("-", "_")
+        if u in {"WATCH", "WATCH_POOL", "OBSERVE", "OBSERVING", "觀察", "觀察池"}:
+            return "WATCH"
+        if u in {"ACCELERATING", "ACCELERATION", "加速", "加速觀察"}:
+            return "ACCELERATING"
+        if u in {"LAUNCH_READY", "PROMOTED", "BREAKOUT", "READY", "起爆", "噴射", "突破", "升級"}:
+            return "LAUNCH_READY"
+        if u in {"EXIT", "REMOVE", "REMOVED", "AVOID", "退場", "淘汰", "排除"}:
+            return "EXIT"
+        grade = self._clean_launch_grade(launch_grade or s)
+        if grade in {"S", "A"}:
+            return "LAUNCH_READY"
+        if grade == "B":
+            return "ACCELERATING"
+        if grade == "C":
+            return "WATCH"
+        return "WATCH"
+
+    def normalize_existing_lifecycle_statuses(self, conn: sqlite3.Connection, base_date: Optional[str] = None) -> None:
+        """R5N30D：清理既有資料中 Lifecycle Status 與 Launch Grade 混用問題。
+
+        只修正語意欄位，不改變交易策略、不改變產報表主流程：
+        - watch_pool_tracking.watch_status 不再保存 S/A/B/C/🚀S/🚀A/🚀B。
+        - watch_pool_event.before_status / after_status 不再保存 S/A/B/C/🚀S/🚀A/🚀B。
+        - 若流程狀態欄內原本塞了等級，會把等級補到 launch_grade，再把狀態轉為 Lifecycle。
+        """
+        changed_tracking = 0
+        changed_event = 0
+        changed_trade = 0
+        date_filter = " AND track_date=?" if base_date else ""
+        params = (base_date,) if base_date else ()
+        try:
+            rows = conn.execute(
+                "SELECT rowid, watch_status, launch_grade FROM watch_pool_tracking WHERE 1=1" + date_filter,
+                params,
+            ).fetchall()
+            for rowid, watch_status, launch_grade in rows:
+                inferred_grade = self._clean_launch_grade(launch_grade or "")
+                if not inferred_grade and self._is_launch_grade_token(watch_status):
+                    inferred_grade = self._clean_launch_grade(watch_status)
+                new_status = self._normalize_lifecycle_status(watch_status, inferred_grade)
+                if new_status != str(watch_status or "") or inferred_grade != str(launch_grade or ""):
+                    conn.execute(
+                        "UPDATE watch_pool_tracking SET watch_status=?, launch_grade=? WHERE rowid=?",
+                        (new_status, inferred_grade, rowid),
+                    )
+                    changed_tracking += 1
+        except Exception as exc:
+            self.warn(f"R5N30D_LIFECYCLE_TRACKING_NORMALIZE_FAIL error={exc}")
+
+        try:
+            rows = conn.execute("SELECT rowid, before_status, after_status, launch_grade FROM watch_pool_event").fetchall()
+            for rowid, before_status, after_status, launch_grade in rows:
+                inferred_grade = self._clean_launch_grade(launch_grade or "")
+                if not inferred_grade:
+                    if self._is_launch_grade_token(after_status):
+                        inferred_grade = self._clean_launch_grade(after_status)
+                    elif self._is_launch_grade_token(before_status):
+                        inferred_grade = self._clean_launch_grade(before_status)
+                new_before = self._normalize_lifecycle_status(before_status, inferred_grade) if before_status not in (None, "") else before_status
+                new_after = self._normalize_lifecycle_status(after_status, inferred_grade) if after_status not in (None, "") else after_status
+                if new_before != before_status or new_after != after_status or inferred_grade != str(launch_grade or ""):
+                    conn.execute(
+                        "UPDATE watch_pool_event SET before_status=?, after_status=?, launch_grade=? WHERE rowid=?",
+                        (new_before, new_after, inferred_grade, rowid),
+                    )
+                    changed_event += 1
+        except Exception as exc:
+            self.warn(f"R5N30D_LIFECYCLE_EVENT_NORMALIZE_FAIL error={exc}")
+
+        try:
+            rows = conn.execute("SELECT rowid, watch_status, launch_grade FROM watch_pool_trade_plan").fetchall()
+            for rowid, watch_status, launch_grade in rows:
+                inferred_grade = self._clean_launch_grade(launch_grade or "")
+                if not inferred_grade and self._is_launch_grade_token(watch_status):
+                    inferred_grade = self._clean_launch_grade(watch_status)
+                new_status = self._normalize_lifecycle_status(watch_status, inferred_grade)
+                if new_status != str(watch_status or "") or inferred_grade != str(launch_grade or ""):
+                    conn.execute(
+                        "UPDATE watch_pool_trade_plan SET watch_status=?, launch_grade=? WHERE rowid=?",
+                        (new_status, inferred_grade, rowid),
+                    )
+                    changed_trade += 1
+        except Exception as exc:
+            self.warn(f"R5N30D_LIFECYCLE_TRADE_PLAN_NORMALIZE_FAIL error={exc}")
+
         conn.commit()
-        self.log(f"R5N30D_LIFECYCLE_STATUS_NORMALIZED changed={changed}")
+        self.log(
+            f"R5N30D_LIFECYCLE_STATUS_NORMALIZED base_date={base_date or 'ALL'} "
+            f"tracking_changed={changed_tracking} event_changed={changed_event} trade_plan_changed={changed_trade}"
+        )
 
     def _load_trade_features_for_trade_plan(self, main_db_path: Optional[str], stock_ids: List[str]) -> Dict[str, Dict[str, float]]:
         """R5N30C：從主DB讀取交易策略所需的價格特徵。
@@ -9599,7 +9704,7 @@ class WatchPoolCultivationEngine:
         """
         self.ensure_cultivation_schema(conn)
         self.normalize_existing_launch_grades(conn)
-        self.normalize_existing_lifecycle_statuses(conn)
+        self.normalize_existing_lifecycle_statuses(conn, base_date)
         rows = conn.execute("""
             SELECT track_date, stock_id, COALESCE(stock_name,''), COALESCE(watch_status,''),
                    COALESCE(launch_grade,''), COALESCE(launch_score,0), COALESCE(status_reason,'')
@@ -9626,8 +9731,9 @@ class WatchPoolCultivationEngine:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, plans)
         conn.commit()
+        self.normalize_existing_lifecycle_statuses(conn, base_date)
         rr_lt = sum(1 for p in plans if (p[13] or 0) < 1.2)
-        self.log(f"R5N30C_TRADE_PLAN_UPDATED rows={len(plans)} date={base_date} rr_lt_1_2_downgraded={rr_lt} strategy_source=RULE_R5N30C_ATR_PRESSURE_RR")
+        self.log(f"R5N30D_TRADE_PLAN_UPDATED rows={len(plans)} date={base_date} rr_lt_1_2_downgraded={rr_lt} strategy_source=RULE_R5N30C_ATR_PRESSURE_RR lifecycle_normalized=1")
 
     def export_cultivation_report(self, conn: sqlite3.Connection, output_xlsx: str, base_date: str) -> str:
         """R5N29L：依規劃表 04_報表設計輸出 01~08 指定 Sheet，並補齊股票名稱/市場/產業/題材 Snapshot 欄位。
@@ -9789,6 +9895,8 @@ class WatchPoolCultivationEngine:
                   (SELECT COUNT(*) FROM watch_pool_event WHERE event_date=? AND (LENGTH(COALESCE(first_enter_date,''))>10 OR LENGTH(COALESCE(last_update_date,''))>10)) +
                   (SELECT COUNT(*) FROM watch_pool_performance WHERE LENGTH(COALESCE(first_enter_date,''))>10 OR LENGTH(COALESCE(last_update_date,''))>10)
             """, (effective_date, effective_date)).fetchone()[0], "R5N29P 驗收：first_enter_date/last_update_date 必須是 YYYY-MM-DD，不可混入時分秒"),
+            ("tracking_lifecycle_mixed_count", conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND UPPER(REPLACE(REPLACE(COALESCE(watch_status,''),'🚀',''),'�','')) IN ('S','A','B','C')", (effective_date,)).fetchone()[0], "R5N30D 驗收：watch_status 不可混入 Launch Grade"),
+            ("event_lifecycle_mixed_count", conn.execute("SELECT COUNT(*) FROM watch_pool_event WHERE event_date=? AND (UPPER(REPLACE(REPLACE(COALESCE(before_status,''),'🚀',''),'�','')) IN ('S','A','B','C') OR UPPER(REPLACE(REPLACE(COALESCE(after_status,''),'🚀',''),'�','')) IN ('S','A','B','C'))", (effective_date,)).fetchone()[0], "R5N30D 驗收：before_status/after_status 不可混入 Launch Grade"),
             ("today_event_count", len(event_rows), "02 狀態事件筆數；首次培養通常為 ENTER"),
             ("trend_count", len(trend_rows), "03 分數趨勢總筆數"),
             ("acceleration_rank_count", len(acceleration_rows), "04 加速度排行筆數"),
@@ -9822,9 +9930,9 @@ class WatchPoolCultivationEngine:
                 "讓 R5N29 從觀察池培養延伸到可追蹤的交易決策閉環，回答今天要怎麼操作。",
                 "新增第四張資料表 watch_pool_trade_plan；不混入 watch_pool_tracking、watch_pool_event、watch_pool_performance。",
                 "DB schema + WatchPoolCultivationEngine + Excel 報表 09_交易策略",
-                "DB 存在 watch_pool_trade_plan；09_交易策略有表頭與資料；Log 出現 R5N30C_TRADE_PLAN_UPDATED；99_查核紀錄列出 PASS/WARN。",
+                "DB 存在 watch_pool_trade_plan；09_交易策略有表頭與資料；Log 出現 R5N30_TRADE_PLAN_UPDATED；99_查核紀錄列出 PASS/WARN。",
                 "WatchPoolCultivationEngine / TradePlanLayer", "IMPLEMENTED_IN_R5N30C",
-                "本版已完成交易策略層落地；R5N30D 追加修正 Lifecycle 欄位與需求追蹤狀態一致性。"
+                "R5N30C 已完成交易策略運算；R5N30D 不改交易公式，只處理 Lifecycle/Grade 語意分離。"
             ),
             (
                 "P1", "R5N30/R5N29B", "R5N30-P1-002", "watch_pool_trade_plan 資料表",
@@ -9834,7 +9942,7 @@ class WatchPoolCultivationEngine:
                 "ensure_cultivation_schema() 建表/遷移 + write_trade_plan() 寫入",
                 "PRAGMA table_info(watch_pool_trade_plan) 欄位完整；每次培養至少寫入今日 WatchPool/LaunchReady 股票策略列。",
                 "Cultivation DB Schema", "IMPLEMENTED_IN_R5N30C",
-                "已與現有三表並列，作為第四張核心表；本版驗證 watch_pool_trade_plan 有資料。"
+                "已與現有三表並列，作為第四張核心表；R5N30D 保持此架構不混入 tracking/event/performance。"
             ),
             (
                 "P1", "R5N30/R5N29B", "R5N30-P1-003", "09_交易策略 Sheet",
@@ -9844,7 +9952,7 @@ class WatchPoolCultivationEngine:
                 "export_cultivation_report() 新增 09_交易策略",
                 "報表存在 09_交易策略；列數與 watch_pool_trade_plan 今日資料一致；缺資料時 99_查核紀錄需 WARN 不可默默空白。",
                 "Excel Report Writer", "IMPLEMENTED_IN_R5N30C",
-                "已追加 09_交易策略；不可取代 01~08 舊報表。"
+                "09_交易策略已追加，不取代 01~08 舊報表。"
             ),
             (
                 "P1", "R5N30/R5N29B", "R5N30-P1-004", "交易策略驗收與查核",
@@ -9853,8 +9961,18 @@ class WatchPoolCultivationEngine:
                 "新增 10_下一版規劃追蹤；99_查核紀錄列入此 Sheet。",
                 "export_cultivation_report() 每次輸出 10_下一版規劃追蹤",
                 "10_下一版規劃追蹤列出 P1 來源、目的、範圍、驗收條件；99_查核紀錄列出 PASS。",
-                "Report Governance", "IMPLEMENTED_IN_R5N30A",
-                "已完成需求落點追蹤 Sheet；R5N30D 修正本 Sheet 對 R5N30C 已實作項目的狀態描述。"
+                "Report Governance", "IMPLEMENTED_IN_THIS_PATCH",
+                "本次修正先完成需求落點追蹤 Sheet。"
+            ),
+            (
+                "P2", "R5N30D", "R5N30D-P2-001", "Lifecycle Status / Launch Grade 語意分離",
+                "使用者確認：watch_status 與 before_status/after_status 不應保存 S/A/B/C/🚀S，避免 02_狀態變更事件顯示 🚀S -> LAUNCH_READY。",
+                "讓流程狀態只回答今天處於哪個生命週期，Launch Grade 只回答等級，避免事件表誤導。",
+                "新增 normalize_existing_lifecycle_statuses()；修改 compare_today_previous()；update_trade_plan() 前後正規化；10_下一版規劃追蹤記錄本項。",
+                "WatchPoolCultivationEngine / compare_today_previous / update_trade_plan / export_cultivation_report",
+                "watch_pool_tracking.watch_status 與 watch_pool_event.before_status/after_status 不得出現 S/A/B/C/🚀S/🚀A/🚀B；Log 出現 R5N30D_LIFECYCLE_STATUS_NORMALIZED。",
+                "WatchPoolCultivationEngine", "IMPLEMENTED_IN_R5N30D",
+                "此為資料語意改善，不改交易策略公式，也不應破壞原本 DB / reports 產出。"
             ),
         ]
         write_sheet("10_下一版規劃追蹤", next_plan_headers, next_plan_rows)
@@ -9883,6 +10001,8 @@ class WatchPoolCultivationEngine:
             ("08_模型驗證", len(validation_rows), "PASS", "需列出統計與日期校正"),
             ("09_交易策略", len(trade_plan_rows), "PASS" if len(trade_plan_rows) > 0 else "FAIL", "進入觀察池後需產出買點/停損/壓力/目標價與建議操作"),
             ("10_下一版規劃追蹤", len(next_plan_rows), "PASS" if len(next_plan_rows) > 0 else "FAIL", "需列出 P1 來源、目的、範圍、驗收條件，避免需求無落點"),
+            ("R5N30D_tracking_lifecycle_status", conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND UPPER(REPLACE(REPLACE(COALESCE(watch_status,''),'🚀',''),'�','')) IN ('S','A','B','C')", (effective_date,)).fetchone()[0], "PASS" if conn.execute("SELECT COUNT(*) FROM watch_pool_tracking WHERE track_date=? AND UPPER(REPLACE(REPLACE(COALESCE(watch_status,''),'🚀',''),'�','')) IN ('S','A','B','C')", (effective_date,)).fetchone()[0] == 0 else "FAIL", "watch_status 不可混入 Launch Grade"),
+            ("R5N30D_event_lifecycle_status", conn.execute("SELECT COUNT(*) FROM watch_pool_event WHERE event_date=? AND (UPPER(REPLACE(REPLACE(COALESCE(before_status,''),'🚀',''),'�','')) IN ('S','A','B','C') OR UPPER(REPLACE(REPLACE(COALESCE(after_status,''),'🚀',''),'�','')) IN ('S','A','B','C'))", (effective_date,)).fetchone()[0], "PASS" if conn.execute("SELECT COUNT(*) FROM watch_pool_event WHERE event_date=? AND (UPPER(REPLACE(REPLACE(COALESCE(before_status,''),'🚀',''),'�','')) IN ('S','A','B','C') OR UPPER(REPLACE(REPLACE(COALESCE(after_status,''),'🚀',''),'�','')) IN ('S','A','B','C'))", (effective_date,)).fetchone()[0] == 0 else "FAIL", "before_status/after_status 不可混入 Launch Grade"),
         ]
         write_sheet("99_查核紀錄", ["sheet", "rows", "status", "check_note"], required)
 
@@ -9892,7 +10012,7 @@ class WatchPoolCultivationEngine:
                     if isinstance(cell.value, float):
                         cell.number_format = "0.00"
         wb.save(out)
-        self.log(f"R5N30A_CULTIVATION_REPORT_WRITTEN output={out} effective_date={effective_date} sheets=01_10_99_with_09_trade_strategy snapshot_date_format=YYYY-MM-DD next_plan_rows={len(next_plan_rows)}")
+        self.log(f"R5N30D_CULTIVATION_REPORT_WRITTEN output={out} effective_date={effective_date} sheets=01_10_99_with_09_trade_strategy snapshot_date_format=YYYY-MM-DD next_plan_rows={len(next_plan_rows)}")
         return str(out)
 
 
@@ -9985,11 +10105,14 @@ class WatchPoolCultivationEngine:
         self.log(f"R5N29_CULTIVATION_DB path={cult_db}")
         with sqlite3.connect(cult_db) as conn:
             self.ensure_cultivation_schema(conn)
+            self.normalize_existing_launch_grades(conn)
+            self.normalize_existing_lifecycle_statuses(conn)
             today_rows, source = self.load_today_launch_ready(main_db_path, launch_ready_path, base_date)
             prev = self.load_previous_tracking(conn, base_date)
             tracking_rows, event_rows = self.compare_today_previous(conn, today_rows, prev, base_date)
             self.write_tracking_rows(conn, tracking_rows)
             self.write_event_rows(conn, event_rows)
+            self.normalize_existing_lifecycle_statuses(conn, base_date)
             self.update_performance(conn, main_db_path, base_date)
             self.backfill_existing_snapshot_fields(conn, main_db_path, base_date)
             self.update_trade_plan(conn, main_db_path, base_date)
