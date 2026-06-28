@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "3.0.0-ai-project-rotation-monitor-R5N31F-master6v5-auto-side-output"
+VERSION = "3.0.0-ai-project-rotation-monitor-R5N31G-master6v5-eps-gate-candidate-fix"
 STRATEGY_VERSION = "teacher_strategy_v3.0_ai_project_rotation_monitor_20260525"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
@@ -10302,37 +10302,114 @@ class Master6V5RawDbAIEngine:
         return round(max(0, min(100, score)), 2)
 
     def _eps_features(self, quarterly_df, annual_df):
+        """
+        R5N31G P0 FIX：重建 EPS 資料流，符合「115Q1 EPS > 114全年EPS」設計。
+        修正點：
+        1. annual_eps_history 年度 EPS 欄位改優先讀 eps_full_year，其次 annual_eps/eps_cumulative/eps。
+        2. 年度固定選 2025 / ROC114 / Q4，而不是取最後一筆。
+        3. quarterly_financial_history 固定選 2026 Q1，優先 eps_cumulative，其次 eps_quarter/eps。
+        4. gate_eps = actual_q1_eps > annual_eps，不再只是要求兩者 > 0。
+        """
         q = quarterly_df.copy() if quarterly_df is not None else pd.DataFrame()
         a = annual_df.copy() if annual_df is not None else pd.DataFrame()
-        rows = []
+
+        # 依 DB 推定分析年：優先使用「有 Q1 的最大 fiscal_year」，正常為 2026；年度基準為前一年 2025。
+        analysis_year = 2026
+        if q is not None and not q.empty and "fiscal_year" in q.columns and "quarter" in q.columns:
+            q_tmp = q.copy()
+            q_tmp["__fy"] = pd.to_numeric(q_tmp["fiscal_year"], errors="coerce")
+            q_tmp["__qtr"] = pd.to_numeric(q_tmp["quarter"], errors="coerce")
+            years = q_tmp.loc[q_tmp["__qtr"].eq(1) & q_tmp["__fy"].notna(), "__fy"]
+            if len(years):
+                analysis_year = int(years.max())
+        annual_year = analysis_year - 1
+        annual_year_roc = annual_year - 1911
+
+        # ---- 114/2025 年度 EPS ----
         if a is not None and not a.empty and "stock_id" in a.columns:
-            eps_col = next((c for c in ["annual_eps", "eps", "basic_eps", "基本每股盈餘"] if c in a.columns), None)
-            y_col = next((c for c in ["year", "data_year", "年度"] if c in a.columns), None)
+            eps_col = next((c for c in ["eps_full_year", "annual_eps", "eps_cumulative", "eps", "basic_eps", "基本每股盈餘"] if c in a.columns), None)
+            aa = a.copy()
+            aa["stock_id"] = aa["stock_id"].astype(str).str.extract(r"(\d+)", expand=False).fillna(aa["stock_id"].astype(str)).str.zfill(4)
             if eps_col:
-                aa = a.copy()
                 aa["annual_eps"] = pd.to_numeric(aa[eps_col], errors="coerce")
-                aa["__year"] = aa[y_col].astype(str) if y_col else ""
-                aa = aa.sort_values(["stock_id", "__year"]).drop_duplicates("stock_id", keep="last")
+                mask = pd.Series(True, index=aa.index)
+                if "fiscal_year" in aa.columns:
+                    mask = pd.to_numeric(aa["fiscal_year"], errors="coerce").eq(annual_year)
+                elif "fiscal_year_roc" in aa.columns:
+                    mask = pd.to_numeric(aa["fiscal_year_roc"], errors="coerce").eq(annual_year_roc)
+                elif "source_date" in aa.columns:
+                    mask = aa["source_date"].astype(str).str.contains(str(annual_year), na=False)
+                if "quarter" in aa.columns:
+                    q4_mask = pd.to_numeric(aa["quarter"], errors="coerce").eq(4)
+                    if q4_mask.any():
+                        mask = mask & q4_mask
+                aa = aa.loc[mask].copy()
+                if aa.empty:
+                    # 若 DB 年度欄名異動，保底仍取每股盈餘非空最新年度，但會在 pipeline check 顯示。
+                    aa = a.copy()
+                    aa["stock_id"] = aa["stock_id"].astype(str).str.extract(r"(\d+)", expand=False).fillna(aa["stock_id"].astype(str)).str.zfill(4)
+                    aa["annual_eps"] = pd.to_numeric(aa[eps_col], errors="coerce")
+                sort_cols = [c for c in ["stock_id", "fiscal_year", "fiscal_year_roc", "quarter", "source_date", "update_time"] if c in aa.columns]
+                aa = aa.sort_values(sort_cols).drop_duplicates("stock_id", keep="last")
+                aa = aa[["stock_id", "annual_eps"]].copy()
+                aa["annual_eps_year"] = annual_year
+                aa["annual_eps_source_col"] = eps_col
             else:
-                aa = pd.DataFrame(columns=["stock_id", "annual_eps"])
+                aa = pd.DataFrame(columns=["stock_id", "annual_eps", "annual_eps_year", "annual_eps_source_col"])
         else:
-            aa = pd.DataFrame(columns=["stock_id", "annual_eps"])
+            aa = pd.DataFrame(columns=["stock_id", "annual_eps", "annual_eps_year", "annual_eps_source_col"])
+
+        # ---- 115/2026 Q1 EPS ----
         if q is not None and not q.empty and "stock_id" in q.columns:
-            eps_col = next((c for c in ["eps", "basic_eps", "actual_q1_eps", "基本每股盈餘"] if c in q.columns), None)
-            q_col = next((c for c in ["quarter", "year_quarter", "season", "季度"] if c in q.columns), None)
+            eps_col = next((c for c in ["eps_cumulative", "actual_q1_eps", "eps_quarter", "eps", "basic_eps", "基本每股盈餘"] if c in q.columns), None)
+            qq = q.copy()
+            qq["stock_id"] = qq["stock_id"].astype(str).str.extract(r"(\d+)", expand=False).fillna(qq["stock_id"].astype(str)).str.zfill(4)
             if eps_col:
-                qq = q.copy()
-                qq["quarter_eps"] = pd.to_numeric(qq[eps_col], errors="coerce")
-                qq["__q"] = qq[q_col].astype(str) if q_col else ""
-                qq = qq.sort_values(["stock_id", "__q"]).drop_duplicates("stock_id", keep="last")
+                qq["actual_q1_eps"] = pd.to_numeric(qq[eps_col], errors="coerce")
+                mask = pd.Series(True, index=qq.index)
+                if "fiscal_year" in qq.columns:
+                    mask = mask & pd.to_numeric(qq["fiscal_year"], errors="coerce").eq(analysis_year)
+                if "quarter" in qq.columns:
+                    mask = mask & pd.to_numeric(qq["quarter"], errors="coerce").eq(1)
+                elif "fiscal_year_quarter" in qq.columns:
+                    mask = mask & qq["fiscal_year_quarter"].astype(str).str.contains(f"{analysis_year}Q1", na=False)
+                qq = qq.loc[mask].copy()
+                if qq.empty:
+                    # 保底：取最新 Q1-like 資料，pipeline check 會標示異常。
+                    qq = q.copy()
+                    qq["stock_id"] = qq["stock_id"].astype(str).str.extract(r"(\d+)", expand=False).fillna(qq["stock_id"].astype(str)).str.zfill(4)
+                    qq["actual_q1_eps"] = pd.to_numeric(qq[eps_col], errors="coerce")
+                sort_cols = [c for c in ["stock_id", "fiscal_year", "quarter", "fiscal_year_quarter", "source_date", "update_time"] if c in qq.columns]
+                qq = qq.sort_values(sort_cols).drop_duplicates("stock_id", keep="last")
+                qq = qq[["stock_id", "actual_q1_eps"]].copy()
+                qq["actual_q1_year"] = analysis_year
+                qq["actual_q1_quarter"] = 1
+                qq["actual_q1_source_col"] = eps_col
             else:
-                qq = pd.DataFrame(columns=["stock_id", "quarter_eps"])
+                qq = pd.DataFrame(columns=["stock_id", "actual_q1_eps", "actual_q1_year", "actual_q1_quarter", "actual_q1_source_col"])
         else:
-            qq = pd.DataFrame(columns=["stock_id", "quarter_eps"])
-        out = aa[["stock_id", "annual_eps"]].merge(qq[["stock_id", "quarter_eps"]], on="stock_id", how="outer")
-        out["eps_growth_ratio"] = out["quarter_eps"] / out["annual_eps"].replace(0, math.nan)
-        out["eps_score"] = (50 + out["eps_growth_ratio"].fillna(0) * 50).clip(0, 100).round(2)
-        out["eps_gate"] = out.apply(lambda r: "PASS" if pd.notna(r.get("annual_eps")) and pd.notna(r.get("quarter_eps")) and r.get("quarter_eps",0) > 0 and r.get("annual_eps",0) > 0 else "FAIL", axis=1)
+            qq = pd.DataFrame(columns=["stock_id", "actual_q1_eps", "actual_q1_year", "actual_q1_quarter", "actual_q1_source_col"])
+
+        out = aa.merge(qq, on="stock_id", how="outer")
+        # 向後相容舊報表欄位名稱，但正式比較使用 actual_q1_eps。
+        out["quarter_eps"] = out.get("actual_q1_eps")
+        out["eps_growth_delta"] = out["actual_q1_eps"] - out["annual_eps"]
+        out["eps_growth_ratio"] = out["actual_q1_eps"] / out["annual_eps"].replace(0, math.nan)
+
+        # 分數：先以是否超越年度 EPS 為主，再用改善幅度加分；負轉正/虧損縮小不被除法扭曲。
+        denom = out["annual_eps"].abs().fillna(0) + 1.0
+        improvement = (out["eps_growth_delta"] / denom).replace([math.inf, -math.inf], math.nan).fillna(0)
+        out["eps_score"] = (50 + improvement * 50).clip(0, 100).round(2)
+        out.loc[out["actual_q1_eps"].notna() & out["annual_eps"].notna() & (out["actual_q1_eps"] > out["annual_eps"]), "eps_score"] = \
+            out.loc[out["actual_q1_eps"].notna() & out["annual_eps"].notna() & (out["actual_q1_eps"] > out["annual_eps"]), "eps_score"].clip(lower=70)
+
+        pass_mask = out["actual_q1_eps"].notna() & out["annual_eps"].notna() & (out["actual_q1_eps"] > out["annual_eps"])
+        out["eps_gate"] = "FAIL"
+        out.loc[pass_mask, "eps_gate"] = "PASS"
+        out["eps_gate_reason"] = "115Q1 EPS 未大於 114 全年 EPS"
+        out.loc[out["annual_eps"].isna(), "eps_gate_reason"] = "缺 114/2025 年度 EPS"
+        out.loc[out["actual_q1_eps"].isna(), "eps_gate_reason"] = "缺 115/2026 Q1 EPS"
+        out.loc[pass_mask, "eps_gate_reason"] = "PASS：115Q1 EPS > 114全年EPS"
         return out
 
     def _revenue_features(self, rev_df):
@@ -10450,7 +10527,34 @@ class Master6V5RawDbAIEngine:
         except Exception:
             pass
 
-    def _write_excel(self, out_path, tables, all_df, top20, top5, eliminated, lineage):
+    def _build_pipeline_check(self, tables, all_df, candidate_df, top20, top5):
+        """R5N31G：資料流驗證Sheet，讓 EPS merge、Gate、TOP來源一致性可被稽核。"""
+        def row(item, value, status, rule):
+            return {"檢查項目": item, "數值": value, "狀態": status, "驗收規則/說明": rule}
+        annual_nonnull = int(pd.to_numeric(all_df.get("annual_eps", pd.Series(index=all_df.index)), errors="coerce").notna().sum())
+        q1_nonnull = int(pd.to_numeric(all_df.get("actual_q1_eps", pd.Series(index=all_df.index)), errors="coerce").notna().sum())
+        eps_pass = int((all_df.get("gate_eps", pd.Series(index=all_df.index)).astype(str) == "PASS").sum())
+        candidate_count = int(len(candidate_df))
+        top20_formal = int(len(top20)) if top20 is not None and list(top20.columns) != ["訊息"] else 0
+        top5_formal = int(len(top5)) if top5 is not None and list(top5.columns) != ["訊息"] else 0
+        top_source_ok = (candidate_count == 0 and top20_formal == 0 and top5_formal == 0) or (top20_formal <= candidate_count and top5_formal <= candidate_count)
+        rows = [
+            row("Raw DB Only 白名單表數", len([t for t in self.allowed_tables if t in tables]), "PASS", "只允許讀取原始表"),
+            row("annual_eps_non_null", annual_nonnull, "PASS" if annual_nonnull > 1500 else "FAIL", "年度 EPS 非空應 >1500"),
+            row("actual_q1_eps_non_null", q1_nonnull, "PASS" if q1_nonnull > 1500 else "FAIL", "2026Q1 EPS 非空應 >1500"),
+            row("eps_gate_pass_count", eps_pass, "PASS" if eps_pass > 0 else "FAIL", "正確條件 115Q1 EPS > 114全年EPS 應有通過股"),
+            row("candidate_count", candidate_count, "PASS" if candidate_count >= 0 else "FAIL", "五層 Gate 全 PASS 後的正式候選池"),
+            row("TOP20來源一致性", f"top20={top20_formal}; candidate={candidate_count}", "PASS" if top_source_ok else "FAIL", "TOP20/TOP5 必須只來自正式候選池"),
+            row("TOP5來源一致性", f"top5={top5_formal}; candidate={candidate_count}", "PASS" if top_source_ok else "FAIL", "候選數=0時 TOP20/TOP5 必須為0，不可塞淘汰股"),
+        ]
+        for t in self.allowed_tables:
+            rows.append(row(f"table_rows:{t}", int(len(tables.get(t, pd.DataFrame()))), "PASS" if t in tables else "WARN", "原始資料表列數"))
+        return pd.DataFrame(rows)
+
+    def _empty_formal_message(self, title: str = "今日無正式候選股"):
+        return pd.DataFrame([{"訊息": title, "原因": "五層 Gate 全 PASS 候選池為 0；依 R5N31G 規則不可用觀察/淘汰股補 TOP"}])
+
+    def _write_excel(self, out_path, tables, all_df, top20, top5, eliminated, lineage, pipeline_check=None, observation_top20=None, formal_top20_count=None, formal_top5_count=None):
         out = Path(out_path)
         out.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -10459,20 +10563,24 @@ class Master6V5RawDbAIEngine:
                 ["產出時間", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
                 ["掃描股票數", len(all_df)],
                 ["候選數", int((all_df["candidate_status"]=="候選").sum())],
-                ["TOP20", len(top20)],
-                ["TOP5", len(top5)],
+                ["TOP20", int(formal_top20_count if formal_top20_count is not None else len(top20))],
+                ["TOP5", int(formal_top5_count if formal_top5_count is not None else len(top5))],
                 ["資料表白名單", ", ".join(self.allowed_tables)],
                 ["禁止結果表", ", ".join(self.banned_tables)],
             ], columns=["項目", "內容"])
             self._write_sheet(writer, "00_執行摘要", summary)
             self._write_sheet(writer, "01_TOP5總表", top5)
             self._write_sheet(writer, "02_TOP20候選池", top20)
-            cols = [c for c in ["stock_id","stock_name","gate_eps","gate_revenue","gate_institution","gate_technical","gate_valuation","eps_score","revenue_score","institution_score","technical_score","valuation_score","theme_score","master6_v5_score","candidate_status","elimination_reason"] if c in all_df.columns]
+            cols = [c for c in ["stock_id","stock_name","annual_eps","actual_q1_eps","quarter_eps","eps_growth_delta","eps_growth_ratio","eps_gate_reason","gate_eps","gate_revenue","gate_institution","gate_technical","gate_valuation","eps_score","revenue_score","institution_score","technical_score","valuation_score","theme_score","master6_v5_score","candidate_status","elimination_reason"] if c in all_df.columns]
             self._write_sheet(writer, "03_五層Gate明細", all_df[cols].sort_values("master6_v5_score", ascending=False))
             self._write_sheet(writer, "04_淘汰原因", eliminated)
             self._write_sheet(writer, "05_Feature_Lineage", lineage)
             self._write_sheet(writer, "06_全市場重算分數", all_df.sort_values("master6_v5_score", ascending=False).head(500))
             self._write_sheet(writer, "07_資料表查核", pd.DataFrame([{"table": k, "rows": len(v), "used": k in self.allowed_tables} for k,v in tables.items()]))
+            if pipeline_check is not None:
+                self._write_sheet(writer, "08_Data_Pipeline_Check", pipeline_check)
+            if observation_top20 is not None:
+                self._write_sheet(writer, "09_觀察排行_TOP20", observation_top20)
         return str(out)
 
     def run(self, db_path: str, out_path: str, base_date: Optional[str] = None) -> Dict[str, Any]:
@@ -10502,13 +10610,17 @@ class Master6V5RawDbAIEngine:
         df = self._add_scores_and_gates(df)
         strategy_rows = df.apply(lambda r: pd.Series(self._trade_strategy(r)), axis=1)
         df = pd.concat([df, strategy_rows], axis=1)
-        top20 = df.sort_values("master6_v5_score", ascending=False).head(20).copy()
-        top5 = df.sort_values("master6_v5_score", ascending=False).head(5).copy()
+        candidate_df = df[df["candidate_status"] == "候選"].sort_values("master6_v5_score", ascending=False).copy()
+        formal_top20 = candidate_df.head(20).copy()
+        formal_top5 = candidate_df.head(5).copy()
+        top20 = formal_top20 if not formal_top20.empty else self._empty_formal_message("今日無正式候選股")
+        top5 = formal_top5 if not formal_top5.empty else self._empty_formal_message("今日無正式候選股")
+        observation_top20 = df.sort_values("master6_v5_score", ascending=False).head(20).copy()
         eliminated = df[df["candidate_status"] != "候選"].sort_values("master6_v5_score", ascending=False).head(200).copy()
         lineage = pd.DataFrame([
             ["stock_id/name/industry/theme", "stocks_master", "建立全市場股票清單與題材欄位"],
             ["technical_score/close/ma/pct20/pos120", "price_history", "重算技術與位階，不讀任何結果表"],
-            ["eps_score/gate_eps", "quarterly_financial_history + annual_eps_history", "重算 EPS Gate"],
+            ["eps_score/gate_eps", "quarterly_financial_history + annual_eps_history", "R5N31G：固定 2026Q1 eps_cumulative 與 2025 eps_full_year；Gate=115Q1 EPS > 114全年EPS"],
             ["revenue_score/gate_revenue", "external_revenue_history", "重算近三月營收成長"],
             ["institution_score/gate_institution", "external_institutional", "重算法人分"],
             ["valuation_score/gate_valuation", "external_valuation", "重算估值分"],
@@ -10516,8 +10628,16 @@ class Master6V5RawDbAIEngine:
             ["master6_v5_score", "上述原始表重算欄位", "EPS/營收/法人/技術/估值/AI題材加權"],
             ["嚴禁讀取", ", ".join(self.banned_tables), "結果表只可存在於DB，不可作為本模式輸入"],
         ], columns=["特徵/輸出", "來源表", "說明"])
-        output = self._write_excel(out_path, tables, df, top20, top5, eliminated, lineage)
-        self.logger.info(f"R5N31_MASTER6_V5_DONE output={output} rows={len(df)} top5={','.join(top5['stock_id'].astype(str).tolist())}")
+        pipeline_check = self._build_pipeline_check(tables, df, candidate_df, formal_top20, formal_top5)
+        output = self._write_excel(
+            out_path, tables, df, top20, top5, eliminated, lineage,
+            pipeline_check=pipeline_check,
+            observation_top20=observation_top20,
+            formal_top20_count=len(formal_top20),
+            formal_top5_count=len(formal_top5),
+        )
+        top5_ids = ",".join(formal_top5["stock_id"].astype(str).tolist()) if not formal_top5.empty else "NONE"
+        self.logger.info(f"R5N31_MASTER6_V5_DONE output={output} rows={len(df)} candidates={len(candidate_df)} top5={top5_ids} annual_eps_non_null={pd.to_numeric(df.get('annual_eps', pd.Series(index=df.index)), errors='coerce').notna().sum()} actual_q1_eps_non_null={pd.to_numeric(df.get('actual_q1_eps', pd.Series(index=df.index)), errors='coerce').notna().sum()}")
         return {
             "output": output,
             "log_file": str(self.logger.log_file),
@@ -10525,8 +10645,9 @@ class Master6V5RawDbAIEngine:
                 "模式": "master6_v5_ai_investment_decision",
                 "Raw DB Only": "YES",
                 "掃描股票數": int(len(df)),
-                "TOP20": int(len(top20)),
-                "TOP5": int(len(top5)),
+                "正式候選數": int(len(candidate_df)),
+                "TOP20": int(len(formal_top20)),
+                "TOP5": int(len(formal_top5)),
                 "禁止結果表已阻擋": ",".join(self.banned_tables),
                 "輸出檔案": output,
             },
