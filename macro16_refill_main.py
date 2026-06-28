@@ -8857,7 +8857,7 @@ class WatchPoolCultivationEngine:
             "rr": "REAL", "suggested_action": "TEXT", "strategy_source": "TEXT", "confidence_score": "REAL",
         })
         conn.commit()
-        self.log("R5N30C_SCHEMA_READY tables=watch_pool_tracking,watch_pool_event,watch_pool_performance,watch_pool_trade_plan launch_grade=plain_SABC")
+        self.log("R5N30C_SCHEMA_READY tables=watch_pool_tracking,watch_pool_event,watch_pool_performance,watch_pool_trade_plan launch_grade=plain_SABC trade_plan=ATR_PRESSURE_RR")
 
     def _find_latest_report(self, launch_ready_path: Optional[str]) -> Optional[Path]:
         if not launch_ready_path:
@@ -8927,7 +8927,7 @@ class WatchPoolCultivationEngine:
         return ""
 
     def _clean_launch_grade(self, raw_grade: Optional[str]) -> str:
-        """R5N30C：Launch Grade 正規化。
+        """R5N30B：Launch Grade 正規化。
 
         問題：Excel/Windows 環境可能把 🚀S/🚀A 顯示成 �S/�A，造成報表看起來像亂碼。
         原則：DB 與報表欄位 launch_grade 只保存策略等級 S/A/B/C；流程狀態仍放 watch_status。
@@ -9376,7 +9376,7 @@ class WatchPoolCultivationEngine:
             self.warn(f"R5N29_PERFORMANCE_FAIL error={exc}")
 
     def normalize_existing_launch_grades(self, conn: sqlite3.Connection) -> None:
-        """R5N30C：把歷史資料中的 🚀S/�S 正規化為 S/A/B/C，避免 Excel 顯示亂碼。"""
+        """R5N30B：把歷史資料中的 🚀S/�S 正規化為 S/A/B/C，避免 Excel 顯示亂碼。"""
         changed = 0
         for table in ["watch_pool_tracking", "watch_pool_event", "watch_pool_performance"]:
             try:
@@ -9389,73 +9389,24 @@ class WatchPoolCultivationEngine:
             except Exception:
                 pass
         conn.commit()
-        self.log(f"R5N30C_LAUNCH_GRADE_NORMALIZED changed={changed}")
+        self.log(f"R5N30B_LAUNCH_GRADE_NORMALIZED changed={changed}")
 
-    def _load_latest_prices_for_trade_plan(self, main_db_path: Optional[str], stock_ids: List[str]) -> Dict[str, float]:
-        """R5N30C：相容舊呼叫，只回傳最新 close。新交易策略會改用 _load_trade_plan_features。"""
-        features = self._load_trade_plan_features(main_db_path, stock_ids)
-        return {sid: vals.get("close") for sid, vals in features.items() if vals.get("close") is not None}
+    def _load_trade_features_for_trade_plan(self, main_db_path: Optional[str], stock_ids: List[str]) -> Dict[str, Dict[str, float]]:
+        """R5N30C：從主DB讀取交易策略所需的價格特徵。
 
-    def _calc_atr14_from_rows(self, rows: List[Tuple[Any, Any, Any, Any]]) -> Optional[float]:
-        """R5N30C：由 price_history 最近資料計算 ATR14；rows=(date, high, low, close)。"""
-        if not rows or len(rows) < 2:
-            return None
-        trs = []
-        prev_close = None
-        for _, high, low, close in rows:
-            h = self._num(high)
-            l = self._num(low)
-            c = self._num(close)
-            if h is None or l is None or c is None:
-                continue
-            if prev_close is None:
-                tr = h - l
-            else:
-                tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
-            if tr is not None and tr >= 0:
-                trs.append(float(tr))
-            prev_close = c
-        if not trs:
-            return None
-        use = trs[-14:] if len(trs) >= 14 else trs
-        return sum(use) / len(use)
+        與 R5N30B 只讀 latest close 不同，本函式會從 price_history 計算：
+        - latest_close：最新收盤價
+        - atr14：14 日平均真實波幅，作為動態停損/壓力延伸依據
+        - support_20：近20日支撐
+        - high_20 / high_60：第一/第二壓力候選
 
-    def _load_existing_trade_plan_base_prices(self, conn: sqlite3.Connection, base_date: str, stock_ids: List[str]) -> Dict[str, float]:
-        """R5N30C：沒有主DB時，從舊 watch_pool_trade_plan 反推參考價，避免退回 launch_score 當股價。"""
-        out: Dict[str, float] = {}
-        if not stock_ids:
-            return out
-        try:
-            placeholders = ",".join(["?"] * len(stock_ids))
-            rows = conn.execute(f"""
-                SELECT stock_id, trade_status, first_buy_price, pressure_1, pressure_2, target_price
-                FROM watch_pool_trade_plan
-                WHERE trade_date=? AND stock_id IN ({placeholders})
-            """, [base_date] + [str(s) for s in stock_ids]).fetchall()
-            for sid, trade_status, first_buy, p1, p2, target in rows:
-                fb = self._num(first_buy)
-                if fb is None or fb <= 0:
-                    continue
-                # R5N30B 舊邏輯：BREAKOUT first_buy=base*0.98，LOW_BUY first_buy=base*0.95，WATCH first_buy=base*0.93
-                if str(trade_status or "") == "BREAKOUT_BUY":
-                    out[str(sid)] = fb / 0.98
-                elif str(trade_status or "") == "LOW_BUY":
-                    out[str(sid)] = fb / 0.95
-                else:
-                    out[str(sid)] = fb / 0.93
-        except Exception:
-            pass
-        return out
-
-    def _load_trade_plan_features(self, main_db_path: Optional[str], stock_ids: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
-        """R5N30C：讀主DB price_history/market_snapshot，提供 Trade Strategy Layer 真正的技術價位。
-
-        回傳欄位：close, ma20, ma60, atr14, high20_prev, high60_prev, low20_prev, low60_prev。
-        若主DB缺失或欄位不存在，回傳可用欄位；後續策略會用保守 fallback。
+        若 price_history 不足，仍回退 market_snapshot / close，並用價格 3% 作 ATR fallback，
+        避免 pressure_1=pressure_2=target 的假策略。
         """
-        features: Dict[str, Dict[str, Optional[float]]] = {str(s): {} for s in stock_ids}
         if not main_db_path or not Path(main_db_path).exists() or not stock_ids:
-            return features
+            return {}
+        features: Dict[str, Dict[str, float]] = {}
+        wanted = {str(s).zfill(4) for s in stock_ids}
         try:
             with sqlite3.connect(f"file:{main_db_path}?mode=ro", uri=True) as mconn:
                 tables = [r[0] for r in mconn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
@@ -9464,128 +9415,151 @@ class WatchPoolCultivationEngine:
                     stock_col = next((c for c in ["stock_id", "code", "證券代號"] if c in cols), None)
                     date_col = next((c for c in ["date", "trade_date", "日期"] if c in cols), None)
                     close_col = next((c for c in ["close", "close_price", "收盤價"] if c in cols), None)
-                    high_col = next((c for c in ["high", "high_price", "最高價"] if c in cols), None)
-                    low_col = next((c for c in ["low", "low_price", "最低價"] if c in cols), None)
+                    high_col = next((c for c in ["high", "最高價"] if c in cols), None)
+                    low_col = next((c for c in ["low", "最低價"] if c in cols), None)
                     if stock_col and date_col and close_col:
-                        for sid in stock_ids:
-                            rows = mconn.execute(f"""
-                                SELECT {date_col},
-                                       {high_col if high_col else close_col} AS high_v,
-                                       {low_col if low_col else close_col} AS low_v,
-                                       {close_col} AS close_v
-                                FROM price_history
-                                WHERE CAST({stock_col} AS TEXT)=?
-                                ORDER BY {date_col} DESC
-                                LIMIT 120
-                            """, (str(sid),)).fetchall()
+                        select_cols = [date_col, close_col]
+                        if high_col:
+                            select_cols.append(high_col)
+                        if low_col:
+                            select_cols.append(low_col)
+                        sql = f"SELECT {', '.join(select_cols)} FROM price_history WHERE CAST({stock_col} AS TEXT)=? ORDER BY {date_col} DESC LIMIT 80"
+                        for sid in wanted:
+                            rows = mconn.execute(sql, (sid,)).fetchall()
                             if not rows:
                                 continue
-                            rows_asc = list(reversed(rows))
-                            closes = [self._num(r[3]) for r in rows_asc if self._num(r[3]) is not None]
-                            highs = [self._num(r[1]) for r in rows_asc if self._num(r[1]) is not None]
-                            lows = [self._num(r[2]) for r in rows_asc if self._num(r[2]) is not None]
+                            closes, highs, lows = [], [], []
+                            for row in rows:
+                                close_v = self._num(row[1])
+                                high_v = self._num(row[2]) if high_col and len(row) >= 3 else close_v
+                                low_idx = 3 if high_col else 2
+                                low_v = self._num(row[low_idx]) if low_col and len(row) > low_idx else close_v
+                                if close_v is not None:
+                                    closes.append(float(close_v))
+                                    highs.append(float(high_v if high_v is not None else close_v))
+                                    lows.append(float(low_v if low_v is not None else close_v))
                             if not closes:
                                 continue
-                            f = features.setdefault(str(sid), {})
-                            f["close"] = float(closes[-1])
-                            f["ma20"] = sum(closes[-20:]) / min(len(closes), 20) if closes else None
-                            f["ma60"] = sum(closes[-60:]) / min(len(closes), 60) if closes else None
-                            f["atr14"] = self._calc_atr14_from_rows(rows_asc)
-                            prev_highs = highs[:-1] if len(highs) > 1 else highs
-                            prev_lows = lows[:-1] if len(lows) > 1 else lows
-                            f["high20_prev"] = max(prev_highs[-20:]) if prev_highs else None
-                            f["high60_prev"] = max(prev_highs[-60:]) if prev_highs else None
-                            f["low20_prev"] = min(prev_lows[-20:]) if prev_lows else None
-                            f["low60_prev"] = min(prev_lows[-60:]) if prev_lows else None
+                            latest = closes[0]
+                            # rows are DESC; true range approximation uses adjacent closes in DESC order.
+                            trs = []
+                            n = min(14, len(closes) - 1)
+                            for i in range(n):
+                                prev_close = closes[i + 1]
+                                tr = max(highs[i] - lows[i], abs(highs[i] - prev_close), abs(lows[i] - prev_close))
+                                if tr >= 0:
+                                    trs.append(tr)
+                            atr14 = sum(trs) / len(trs) if trs else latest * 0.03
+                            atr14 = max(float(atr14 or 0), latest * 0.02)
+                            features[sid] = {
+                                "latest_close": latest,
+                                "atr14": atr14,
+                                "support_20": min(lows[:20]) if lows else latest * 0.92,
+                                "high_20": max(highs[:20]) if highs else latest * 1.05,
+                                "high_60": max(highs[:60]) if highs else latest * 1.10,
+                            }
                 if "market_snapshot" in tables:
                     cols = [r[1] for r in mconn.execute("PRAGMA table_info(market_snapshot)").fetchall()]
                     stock_col = next((c for c in ["stock_id", "code", "證券代號"] if c in cols), None)
                     date_col = next((c for c in ["snapshot_date", "date", "trade_date"] if c in cols), None)
-                    selectable = []
-                    for key, aliases in {
-                        "close": ["close", "close_price", "收盤價"],
-                        "ma20": ["ma20", "ma20_final"],
-                        "ma60": ["ma60", "ma60_final"],
-                        "atr14": ["atr", "atr14"],
-                        "high20_prev": ["high20_prev"],
-                        "high60_prev": ["high60_prev"],
-                        "low20_prev": ["low20_prev"],
-                        "low60_prev": ["low60_prev"],
-                    }.items():
-                        col = next((c for c in aliases if c in cols), None)
-                        if col:
-                            selectable.append((key, col))
-                    if stock_col and selectable:
+                    close_col = next((c for c in ["close", "close_price", "收盤價"] if c in cols), None)
+                    if stock_col and close_col:
                         order = f" ORDER BY {date_col} DESC" if date_col else ""
-                        for sid in stock_ids:
-                            select_sql = ", ".join([f"{col}" for _, col in selectable])
-                            row = mconn.execute(f"SELECT {select_sql} FROM market_snapshot WHERE CAST({stock_col} AS TEXT)=?{order} LIMIT 1", (str(sid),)).fetchone()
-                            if not row:
+                        for sid in wanted:
+                            if sid in features:
                                 continue
-                            f = features.setdefault(str(sid), {})
-                            for (key, _), val in zip(selectable, row):
-                                num = self._num(val)
-                                if num is not None and num > 0 and not f.get(key):
-                                    f[key] = float(num)
+                            row = mconn.execute(f"SELECT {close_col} FROM market_snapshot WHERE CAST({stock_col} AS TEXT)=?{order} LIMIT 1", (sid,)).fetchone()
+                            if row and self._num(row[0]) is not None:
+                                latest = float(self._num(row[0]))
+                                features[sid] = {
+                                    "latest_close": latest,
+                                    "atr14": latest * 0.03,
+                                    "support_20": latest * 0.92,
+                                    "high_20": latest * 1.05,
+                                    "high_60": latest * 1.10,
+                                }
         except Exception as exc:
             self.warn(f"R5N30C_TRADE_PLAN_FEATURE_READ_FAIL error={exc}")
         return features
 
-    def _positive_or_none(self, value: Any) -> Optional[float]:
-        v = self._num(value)
-        return float(v) if v is not None and v > 0 else None
+    def _build_r5n30c_trade_plan_row(self, base_date: str, sid: str, stock_name: str, watch_status: str,
+                                      launch_grade: str, launch_score: float, features: Dict[str, float],
+                                      now: str) -> Tuple[Any, ...]:
+        """R5N30C：ATR + 支撐/壓力分層 + RR Gate 的單檔交易策略。"""
+        grade = self._clean_launch_grade(launch_grade)
+        score = float(launch_score or 0)
+        base_price = float(features.get("latest_close") or score or 0.0)
+        if base_price <= 0:
+            base_price = max(score, 1.0)
+        atr = float(features.get("atr14") or base_price * 0.03)
+        atr = max(atr, base_price * 0.02)
+        support_20 = float(features.get("support_20") or base_price * 0.92)
+        high_20 = float(features.get("high_20") or base_price * 1.05)
+        high_60 = float(features.get("high_60") or base_price * 1.10)
 
-    def _trade_plan_levels(self, base_price: float, feat: Dict[str, Optional[float]], trade_status: str) -> Tuple[float, float, float, float, float, float, float]:
-        """R5N30C：獨立計算第一/第二買點、停損、壓力1/2、目標價與 RR。
-
-        設計原則：
-        - pressure_1 不再等於 pressure_2。
-        - target_price 不再直接等於 pressure_1/pressure_2，而是 pressure_2 + ATR/比例延伸。
-        - stop_loss 不用固定 10%，改用 ATR 與支撐位保守計算。
-        """
-        close = base_price
-        atr = self._positive_or_none(feat.get("atr14")) or max(close * 0.035, 0.01)
-        ma20 = self._positive_or_none(feat.get("ma20"))
-        ma60 = self._positive_or_none(feat.get("ma60"))
-        high20 = self._positive_or_none(feat.get("high20_prev"))
-        high60 = self._positive_or_none(feat.get("high60_prev"))
-        low20 = self._positive_or_none(feat.get("low20_prev"))
-        low60 = self._positive_or_none(feat.get("low60_prev"))
-        support1 = max([v for v in [low20, ma20, close * 0.94] if v is not None and v < close] or [close * 0.94])
-        support2 = max([v for v in [low60, ma60, close * 0.88] if v is not None and v < support1] or [close * 0.88])
-        if trade_status == "BREAKOUT_BUY":
-            breakout = max([v for v in [high20, close * 1.01] if v is not None] or [close * 1.01])
-            first_buy = max(close * 0.985, min(breakout * 1.003, close * 1.04))
-            second_buy = min(support1, first_buy * 0.95)
-            stop_loss = min(support2 * 0.98, first_buy - max(atr * 2.0, first_buy * 0.075))
-        elif trade_status == "LOW_BUY":
-            first_buy = min(support1, close * 0.96)
-            second_buy = min(support2, first_buy * 0.94)
-            stop_loss = min(support2 * 0.97, first_buy - max(atr * 1.8, first_buy * 0.07))
+        strategy_level = grade if grade in {"S", "A", "B", "C"} else ("S" if score >= 85 else "A" if score >= 70 else "B" if score >= 55 else "C")
+        if watch_status == "LAUNCH_READY" and strategy_level in {"S", "A"}:
+            trade_status = "BREAKOUT_BUY" if strategy_level == "S" else "LOW_BUY"
+        elif watch_status in {"LAUNCH_READY", "ACCELERATING"}:
+            trade_status = "LOW_BUY"
         else:
-            first_buy = min(support1, close * 0.94)
-            second_buy = min(support2, first_buy * 0.94)
-            stop_loss = min(support2 * 0.97, first_buy - max(atr * 1.6, first_buy * 0.07))
-        pressure_1 = max([v for v in [high20, close * 1.04, first_buy + atr * 1.5] if v is not None] or [close * 1.04])
-        pressure_2 = max([v for v in [high60, pressure_1 + atr * 1.8, close * 1.09] if v is not None] or [pressure_1 + atr * 1.8])
-        if pressure_2 <= pressure_1:
-            pressure_2 = pressure_1 + max(atr * 1.8, close * 0.035)
-        target = pressure_2 + max(atr * 1.2, close * 0.025)
-        if target <= pressure_2:
-            target = pressure_2 + max(atr, close * 0.02)
-        stop_loss = max(0.01, stop_loss)
+            trade_status = "WATCH"
+
+        if trade_status == "BREAKOUT_BUY":
+            first_buy = min(base_price * 0.99, max(base_price - 0.25 * atr, base_price * 0.96))
+            second_buy = max(base_price - 1.25 * atr, support_20 * 1.01)
+            stop_loss = min(second_buy - 1.0 * atr, support_20 * 0.98, first_buy * 0.90)
+            pressure_1 = max(high_20, base_price + 1.2 * atr, base_price * 1.03)
+            pressure_2 = max(high_60, pressure_1 + 1.8 * atr, pressure_1 * 1.05)
+            target = max(pressure_2 + 1.2 * atr, pressure_2 * 1.03)
+            action_prefix = "接近壓力突破區，需放量突破才分批"
+        elif trade_status == "LOW_BUY":
+            first_buy = max(base_price - 0.8 * atr, base_price * 0.94)
+            second_buy = max(base_price - 1.8 * atr, support_20 * 1.01)
+            stop_loss = min(second_buy - 0.8 * atr, support_20 * 0.98, first_buy * 0.90)
+            pressure_1 = max(high_20, base_price + 1.0 * atr, base_price * 1.03)
+            pressure_2 = max(high_60, pressure_1 + 1.5 * atr, pressure_1 * 1.05)
+            target = max(pressure_2 + 1.0 * atr, pressure_2 * 1.03)
+            action_prefix = "Launch Ready 命中，拉回不破第一買點可分批"
+        else:
+            first_buy = max(base_price - 1.0 * atr, base_price * 0.93)
+            second_buy = max(base_price - 2.0 * atr, support_20 * 1.00)
+            stop_loss = min(second_buy - 0.8 * atr, support_20 * 0.97, first_buy * 0.90)
+            pressure_1 = max(high_20, base_price + 1.0 * atr, base_price * 1.04)
+            pressure_2 = max(high_60, pressure_1 + 1.3 * atr, pressure_1 * 1.05)
+            target = pressure_1
+            action_prefix = "觀察池追蹤，等待分數/量價確認後再啟動"
+
+        # 防呆：確保 stop < second <= first < pressure1 < pressure2 <= target，避免假壓力/假目標。
+        second_buy = min(second_buy, first_buy * 0.98)
+        stop_loss = min(stop_loss, second_buy * 0.97)
+        pressure_1 = max(pressure_1, first_buy + max(atr, first_buy * 0.03))
+        pressure_2 = max(pressure_2, pressure_1 + max(atr, pressure_1 * 0.03))
+        target = max(target, pressure_2 + max(0.8 * atr, pressure_2 * 0.02))
+
         risk = max(first_buy - stop_loss, 0.01)
-        rr = (target - first_buy) / risk
-        return first_buy, second_buy, stop_loss, pressure_1, pressure_2, target, rr
+        rr = (target - first_buy) / risk if risk else 0.0
+        if rr < 1.2:
+            trade_status = "WATCH"
+            action = f"RR={rr:.2f}<1.20，不放行買進；等待拉回或壓力突破重新計算"
+        else:
+            action = f"{action_prefix}；RR={rr:.2f}；跌破停損退出"
+        confidence = 92 if strategy_level == "S" else 85 if strategy_level == "A" else 75 if strategy_level == "B" else 60
+        if rr < 1.2:
+            confidence = min(confidence, 60)
+        return (base_date, str(sid), stock_name, watch_status, grade, strategy_level, trade_status,
+                round(first_buy, 2), round(second_buy, 2), round(stop_loss, 2), round(pressure_1, 2),
+                round(pressure_2, 2), round(target, 2), round(rr, 2), action,
+                "RULE_R5N30C_ATR_PRESSURE_RR", confidence, now)
 
     def update_trade_plan(self, conn: sqlite3.Connection, main_db_path: Optional[str], base_date: str) -> None:
-        """R5N30C：建立 watch_pool_trade_plan，讓進入觀察池後直接有買賣策略。
+        """R5N30C：建立 watch_pool_trade_plan。
 
-        本版修正 R5N30B 的四個交易策略缺口：
-        1. Pressure1/Pressure2 分層計算。
-        2. Target Price 獨立於 Pressure2 延伸計算。
-        3. StopLoss 改用 ATR/支撐位動態估算，不再固定比例。
-        4. RR < 1.2 自動降為 WATCH，不輸出可買訊號。
+        修改重點：
+        1. 不再使用固定百分比/target=pressure 的簡化算法。
+        2. 使用主DB price_history 計算 ATR、支撐、20日/60日壓力。
+        3. Target 由 pressure_2 再延伸，避免 target_price 等於 pressure_2。
+        4. RR < 1.20 自動降級 WATCH，不輸出 BUY。
         """
         self.ensure_cultivation_schema(conn)
         self.normalize_existing_launch_grades(conn)
@@ -9599,41 +9573,14 @@ class WatchPoolCultivationEngine:
         if not rows:
             self.warn(f"R5N30C_TRADE_PLAN_SKIP no_tracking_rows base_date={base_date}")
             return
-        stock_ids = [str(r[1]) for r in rows]
-        feature_map = self._load_trade_plan_features(main_db_path, stock_ids)
-        old_price_map = self._load_existing_trade_plan_base_prices(conn, base_date, stock_ids)
+        stock_ids = [str(r[1]).zfill(4) for r in rows]
+        feature_map = self._load_trade_features_for_trade_plan(main_db_path, stock_ids)
         now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         plans = []
-        rr_block_count = 0
         for track_date, sid, stock_name, watch_status, launch_grade, launch_score, status_reason in rows:
-            sid = str(sid)
-            grade = self._clean_launch_grade(launch_grade)
-            score = float(launch_score or 0)
-            feat = feature_map.get(sid, {}) or {}
-            base_price = self._positive_or_none(feat.get("close")) or self._positive_or_none(old_price_map.get(sid)) or (score if score > 0 else 0.0)
-            strategy_level = grade if grade in {"S", "A", "B", "C"} else ("S" if score >= 85 else "A" if score >= 70 else "B" if score >= 55 else "C")
-            if watch_status == "LAUNCH_READY" and strategy_level in {"S", "A"}:
-                trade_status = "BREAKOUT_BUY" if strategy_level == "S" else "LOW_BUY"
-            elif watch_status in {"LAUNCH_READY", "ACCELERATING"}:
-                trade_status = "LOW_BUY"
-            else:
-                trade_status = "WATCH"
-            first_buy, second_buy, stop_loss, pressure_1, pressure_2, target, rr = self._trade_plan_levels(float(base_price), feat, trade_status)
-            action_prefix = "接近壓力突破區，需放量突破才分批" if trade_status == "BREAKOUT_BUY" else ("Launch Ready 命中，拉回不破第一買點可分批" if trade_status == "LOW_BUY" else "觀察池追蹤，等待分數/量價確認")
-            if rr < 1.20:
-                rr_block_count += 1
-                trade_status = "WATCH"
-                action = f"RR={rr:.2f} 不足1.20，暫不買；等待拉回或壓力突破後重算，跌破停損退出"
-                confidence_adj = -15
-            else:
-                action = f"{action_prefix}；RR={rr:.2f}；跌破停損退出"
-                confidence_adj = 0
-            confidence = (92 if strategy_level == "S" else 85 if strategy_level == "A" else 75 if strategy_level == "B" else 60) + confidence_adj
-            confidence = max(40, min(95, confidence))
-            plans.append((base_date, sid, stock_name, watch_status, grade, strategy_level, trade_status,
-                          round(first_buy, 2), round(second_buy, 2), round(stop_loss, 2), round(pressure_1, 2),
-                          round(pressure_2, 2), round(target, 2), round(rr, 2),
-                          action, "RULE_R5N30C_ATR_PRESSURE_RR", confidence, now))
+            clean_sid = str(sid).zfill(4)
+            features = feature_map.get(clean_sid, {})
+            plans.append(self._build_r5n30c_trade_plan_row(base_date, clean_sid, stock_name, watch_status, launch_grade, float(launch_score or 0), features, now))
         conn.executemany("""
             INSERT OR REPLACE INTO watch_pool_trade_plan
             (trade_date, stock_id, stock_name, watch_status, launch_grade, strategy_level, trade_status,
@@ -9642,7 +9589,8 @@ class WatchPoolCultivationEngine:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, plans)
         conn.commit()
-        self.log(f"R5N30C_TRADE_PLAN_UPDATED rows={len(plans)} date={base_date} rr_block_count={rr_block_count} source=ATR_PRESSURE_RR")
+        rr_lt = sum(1 for p in plans if (p[13] or 0) < 1.2)
+        self.log(f"R5N30C_TRADE_PLAN_UPDATED rows={len(plans)} date={base_date} rr_lt_1_2_downgraded={rr_lt} strategy_source=RULE_R5N30C_ATR_PRESSURE_RR")
 
     def export_cultivation_report(self, conn: sqlite3.Connection, output_xlsx: str, base_date: str) -> str:
         """R5N29L：依規劃表 04_報表設計輸出 01~08 指定 Sheet，並補齊股票名稱/市場/產業/題材 Snapshot 欄位。
@@ -9837,7 +9785,7 @@ class WatchPoolCultivationEngine:
                 "讓 R5N29 從觀察池培養延伸到可追蹤的交易決策閉環，回答今天要怎麼操作。",
                 "新增第四張資料表 watch_pool_trade_plan；不混入 watch_pool_tracking、watch_pool_event、watch_pool_performance。",
                 "DB schema + WatchPoolCultivationEngine + Excel 報表 09_交易策略",
-                "DB 存在 watch_pool_trade_plan；09_交易策略有表頭與資料；Log 出現 R5N30C_TRADE_PLAN_UPDATED；99_查核紀錄列出 PASS/WARN。",
+                "DB 存在 watch_pool_trade_plan；09_交易策略有表頭與資料；Log 出現 R5N30_TRADE_PLAN_UPDATED；99_查核紀錄列出 PASS/WARN。",
                 "WatchPoolCultivationEngine / TradePlanLayer", "NEXT_VERSION",
                 "列為下一版第一個新增功能；本 Sheet 僅做需求落點追蹤，不代表本版已完成交易策略運算。"
             ),
