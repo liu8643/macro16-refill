@@ -8798,6 +8798,29 @@ class WatchPoolCultivationEngine:
             PRIMARY KEY(stock_id, entry_date)
         )
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS watch_pool_trade_plan (
+            trade_date TEXT NOT NULL,
+            stock_id TEXT NOT NULL,
+            stock_name TEXT,
+            watch_status TEXT,
+            launch_grade TEXT,
+            strategy_level TEXT,
+            trade_status TEXT,
+            first_buy_price REAL,
+            second_buy_price REAL,
+            stop_loss_price REAL,
+            pressure_1 REAL,
+            pressure_2 REAL,
+            target_price REAL,
+            rr REAL,
+            suggested_action TEXT,
+            strategy_source TEXT,
+            confidence_score REAL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(trade_date, stock_id)
+        )
+        """)
 
         def _ensure_columns(table: str, required: Dict[str, str]) -> None:
             existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -8826,8 +8849,15 @@ class WatchPoolCultivationEngine:
             "max_return_5d": "REAL", "max_return_10d": "REAL", "max_return_20d": "REAL",
             "outcome": "TEXT", "outcome_reason": "TEXT",
         })
+        _ensure_columns("watch_pool_trade_plan", {
+            "stock_name": "TEXT", "watch_status": "TEXT", "launch_grade": "TEXT",
+            "strategy_level": "TEXT", "trade_status": "TEXT",
+            "first_buy_price": "REAL", "second_buy_price": "REAL", "stop_loss_price": "REAL",
+            "pressure_1": "REAL", "pressure_2": "REAL", "target_price": "REAL",
+            "rr": "REAL", "suggested_action": "TEXT", "strategy_source": "TEXT", "confidence_score": "REAL",
+        })
         conn.commit()
-        self.log("R5N29M_SCHEMA_READY tables=watch_pool_tracking,watch_pool_event,watch_pool_performance snapshot_columns=stock_name,market_type,industry,theme,sub_theme,launch_grade,first_enter_date,last_update_date")
+        self.log("R5N30B_SCHEMA_READY tables=watch_pool_tracking,watch_pool_event,watch_pool_performance,watch_pool_trade_plan launch_grade=plain_SABC")
 
     def _find_latest_report(self, launch_ready_path: Optional[str]) -> Optional[Path]:
         if not launch_ready_path:
@@ -8896,6 +8926,31 @@ class WatchPoolCultivationEngine:
             return "WATCH"
         return ""
 
+    def _clean_launch_grade(self, raw_grade: Optional[str]) -> str:
+        """R5N30B：Launch Grade 正規化。
+
+        問題：Excel/Windows 環境可能把 🚀S/🚀A 顯示成 �S/�A，造成報表看起來像亂碼。
+        原則：DB 與報表欄位 launch_grade 只保存策略等級 S/A/B/C；流程狀態仍放 watch_status。
+        若日後 UI 需要圖示，應另以顯示層加入 icon，不可把圖示混入等級欄位。
+        """
+        s = str(raw_grade or "").strip()
+        if not s:
+            return ""
+        # 移除常見 emoji / replacement char / 裝飾字元，只保留分級語意。
+        s = s.replace("�", "").replace("🚀", "").replace("⭐", "").replace("★", "").strip()
+        u = s.upper().replace(" ", "").replace("級", "")
+        if u in {"S", "A", "B", "C"}:
+            return u
+        if "S" in u:
+            return "S"
+        if "A" in u:
+            return "A"
+        if "B" in u:
+            return "B"
+        if "C" in u:
+            return "C"
+        return s
+
     def _derive_status(self, score: Optional[float], raw_status: Optional[str] = None, force_launch_ready: bool = False) -> str:
         normalized = self._normalize_watch_status(raw_status)
         if normalized:
@@ -8952,7 +9007,7 @@ class WatchPoolCultivationEngine:
                     grade_col = next((c for c in ["launch_grade", "formal_eps_grade", "grade", "等級"] if c in cols), None)
                     if sid_col and grade_col:
                         for sid, grade in conn.execute(f"SELECT CAST({sid_col} AS TEXT), COALESCE({grade_col}, '') FROM ranking_result").fetchall():
-                            meta.setdefault(str(sid).strip(), {})["launch_grade"] = grade or ""
+                            meta.setdefault(str(sid).strip(), {})["launch_grade"] = self._clean_launch_grade(grade or "")
 
                 for row in rows:
                     sid = str(row.get("stock_id", "")).strip()
@@ -9109,7 +9164,7 @@ class WatchPoolCultivationEngine:
                                 "industry": str(ws.cell(r, industry_col).value or "").strip() if industry_col else "",
                                 "theme": str(ws.cell(r, theme_col).value or "").strip() if theme_col else "",
                                 "sub_theme": str(ws.cell(r, sub_theme_col).value or "").strip() if sub_theme_col else "",
-                                "launch_grade": str(ws.cell(r, launch_grade_col).value or "").strip() if launch_grade_col else raw_status,
+                                "launch_grade": self._clean_launch_grade(str(ws.cell(r, launch_grade_col).value or "").strip() if launch_grade_col else raw_status),
                                 # R5N29AC：Launch Ready 報表來源的列，若原始等級無法標準化，仍應歸入 LAUNCH_READY，
                                 # 否則 06_升級LaunchReady 會空表；原始 A/S/中文等級保存在 launch_grade。
                                 "watch_status": self._derive_status(score, raw_status, force_launch_ready=True),
@@ -9320,6 +9375,127 @@ class WatchPoolCultivationEngine:
         except Exception as exc:
             self.warn(f"R5N29_PERFORMANCE_FAIL error={exc}")
 
+    def normalize_existing_launch_grades(self, conn: sqlite3.Connection) -> None:
+        """R5N30B：把歷史資料中的 🚀S/�S 正規化為 S/A/B/C，避免 Excel 顯示亂碼。"""
+        changed = 0
+        for table in ["watch_pool_tracking", "watch_pool_event", "watch_pool_performance"]:
+            try:
+                rows = conn.execute(f"SELECT rowid, launch_grade FROM {table} WHERE COALESCE(launch_grade,'')<>''").fetchall()
+                for rowid, grade in rows:
+                    clean = self._clean_launch_grade(grade)
+                    if clean != str(grade or ""):
+                        conn.execute(f"UPDATE {table} SET launch_grade=? WHERE rowid=?", (clean, rowid))
+                        changed += 1
+            except Exception:
+                pass
+        conn.commit()
+        self.log(f"R5N30B_LAUNCH_GRADE_NORMALIZED changed={changed}")
+
+    def _load_latest_prices_for_trade_plan(self, main_db_path: Optional[str], stock_ids: List[str]) -> Dict[str, float]:
+        """從主DB讀最新 close；讀不到時回傳空 dict，TradePlan 會用 launch_score 作保守 fallback。"""
+        if not main_db_path or not Path(main_db_path).exists() or not stock_ids:
+            return {}
+        prices: Dict[str, float] = {}
+        try:
+            with sqlite3.connect(f"file:{main_db_path}?mode=ro", uri=True) as mconn:
+                tables = [r[0] for r in mconn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+                if "price_history" in tables:
+                    cols = [r[1] for r in mconn.execute("PRAGMA table_info(price_history)").fetchall()]
+                    stock_col = next((c for c in ["stock_id", "code", "證券代號"] if c in cols), None)
+                    date_col = next((c for c in ["date", "trade_date", "日期"] if c in cols), None)
+                    close_col = next((c for c in ["close", "close_price", "收盤價"] if c in cols), None)
+                    if stock_col and date_col and close_col:
+                        for sid in stock_ids:
+                            row = mconn.execute(f"SELECT {close_col} FROM price_history WHERE CAST({stock_col} AS TEXT)=? ORDER BY {date_col} DESC LIMIT 1", (sid,)).fetchone()
+                            if row and self._num(row[0]) is not None:
+                                prices[sid] = float(self._num(row[0]))
+                if "market_snapshot" in tables:
+                    cols = [r[1] for r in mconn.execute("PRAGMA table_info(market_snapshot)").fetchall()]
+                    stock_col = next((c for c in ["stock_id", "code", "證券代號"] if c in cols), None)
+                    date_col = next((c for c in ["snapshot_date", "date", "trade_date"] if c in cols), None)
+                    close_col = next((c for c in ["close", "close_price", "收盤價"] if c in cols), None)
+                    if stock_col and close_col:
+                        for sid in stock_ids:
+                            if sid in prices:
+                                continue
+                            order = f" ORDER BY {date_col} DESC" if date_col else ""
+                            row = mconn.execute(f"SELECT {close_col} FROM market_snapshot WHERE CAST({stock_col} AS TEXT)=?{order} LIMIT 1", (sid,)).fetchone()
+                            if row and self._num(row[0]) is not None:
+                                prices[sid] = float(self._num(row[0]))
+        except Exception as exc:
+            self.warn(f"R5N30B_TRADE_PLAN_PRICE_READ_FAIL error={exc}")
+        return prices
+
+    def update_trade_plan(self, conn: sqlite3.Connection, main_db_path: Optional[str], base_date: str) -> None:
+        """R5N30B：建立 watch_pool_trade_plan，讓進入觀察池後直接有買賣策略。"""
+        self.ensure_cultivation_schema(conn)
+        self.normalize_existing_launch_grades(conn)
+        rows = conn.execute("""
+            SELECT track_date, stock_id, COALESCE(stock_name,''), COALESCE(watch_status,''),
+                   COALESCE(launch_grade,''), COALESCE(launch_score,0), COALESCE(status_reason,'')
+            FROM watch_pool_tracking
+            WHERE track_date=?
+            ORDER BY COALESCE(launch_score,-999999) DESC, stock_id
+        """, (base_date,)).fetchall()
+        if not rows:
+            self.warn(f"R5N30B_TRADE_PLAN_SKIP no_tracking_rows base_date={base_date}")
+            return
+        stock_ids = [str(r[1]) for r in rows]
+        price_map = self._load_latest_prices_for_trade_plan(main_db_path, stock_ids)
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        plans = []
+        for track_date, sid, stock_name, watch_status, launch_grade, launch_score, status_reason in rows:
+            grade = self._clean_launch_grade(launch_grade)
+            score = float(launch_score or 0)
+            base_price = price_map.get(str(sid)) or score or 0.0
+            strategy_level = grade if grade in {"S", "A", "B", "C"} else ("S" if score >= 85 else "A" if score >= 70 else "B" if score >= 55 else "C")
+            if watch_status == "LAUNCH_READY" and strategy_level in {"S", "A"}:
+                trade_status = "BREAKOUT_BUY" if score >= 30 or strategy_level == "S" else "LOW_BUY"
+            elif watch_status in {"LAUNCH_READY", "ACCELERATING"}:
+                trade_status = "LOW_BUY"
+            else:
+                trade_status = "WATCH"
+            if trade_status == "BREAKOUT_BUY":
+                first_buy = base_price * 0.98
+                second_buy = base_price * 0.93
+                stop_loss = base_price * 0.88
+                pressure_1 = base_price * 1.03
+                pressure_2 = base_price * 1.08
+                target = pressure_2
+                action = "接近壓力突破區，需放量突破才分批；跌破停損不凹單"
+            elif trade_status == "LOW_BUY":
+                first_buy = base_price * 0.95
+                second_buy = base_price * 0.90
+                stop_loss = base_price * 0.85
+                pressure_1 = base_price * 1.03
+                pressure_2 = base_price * 1.08
+                target = pressure_1
+                action = "Launch Ready 命中，拉回不破第一買點可分批；跌破停損退出"
+            else:
+                first_buy = base_price * 0.93
+                second_buy = base_price * 0.88
+                stop_loss = base_price * 0.83
+                pressure_1 = base_price * 1.05
+                pressure_2 = base_price * 1.10
+                target = pressure_1
+                action = "觀察池追蹤，等待分數/量價確認後再啟動"
+            risk = max(first_buy - stop_loss, 0.01)
+            rr = (target - first_buy) / risk if risk else None
+            confidence = 92 if strategy_level == "S" else 85 if strategy_level == "A" else 75 if strategy_level == "B" else 60
+            plans.append((base_date, str(sid), stock_name, watch_status, grade, strategy_level, trade_status,
+                          round(first_buy, 2), round(second_buy, 2), round(stop_loss, 2), round(pressure_1, 2),
+                          round(pressure_2, 2), round(target, 2), round(rr, 2) if rr is not None else None,
+                          action, "RULE_R5N30B", confidence, now))
+        conn.executemany("""
+            INSERT OR REPLACE INTO watch_pool_trade_plan
+            (trade_date, stock_id, stock_name, watch_status, launch_grade, strategy_level, trade_status,
+             first_buy_price, second_buy_price, stop_loss_price, pressure_1, pressure_2, target_price, rr,
+             suggested_action, strategy_source, confidence_score, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, plans)
+        conn.commit()
+        self.log(f"R5N30B_TRADE_PLAN_UPDATED rows={len(plans)} date={base_date} grade_plain=SABC")
+
     def export_cultivation_report(self, conn: sqlite3.Connection, output_xlsx: str, base_date: str) -> str:
         """R5N29L：依規劃表 04_報表設計輸出 01~08 指定 Sheet，並補齊股票名稱/市場/產業/題材 Snapshot 欄位。
 
@@ -9446,6 +9622,20 @@ class WatchPoolCultivationEngine:
         perf_rows = _fetch("SELECT " + ",".join(perf_headers) + " FROM watch_pool_performance ORDER BY entry_date DESC, stock_id")
         write_sheet("07_績效追蹤", perf_headers, perf_rows)
 
+        # R5N30B：交易策略層輸出。launch_grade 使用純 S/A/B/C，避免 Excel 顯示 🚀 成 �。
+        trade_plan_headers = ["trade_date", "stock_id", "stock_name", "watch_status", "launch_grade", "strategy_level", "trade_status", "first_buy_price", "second_buy_price", "stop_loss_price", "pressure_1", "pressure_2", "target_price", "RR", "suggested_action", "strategy_source", "confidence_score", "created_at"]
+        trade_plan_rows = _fetch("""
+            SELECT trade_date, stock_id, stock_name, watch_status, launch_grade, strategy_level, trade_status,
+                   first_buy_price, second_buy_price, stop_loss_price, pressure_1, pressure_2, target_price, rr,
+                   suggested_action, strategy_source, confidence_score, created_at
+            FROM watch_pool_trade_plan
+            WHERE trade_date=?
+            ORDER BY CASE strategy_level WHEN 'S' THEN 1 WHEN 'A' THEN 2 WHEN 'B' THEN 3 ELSE 4 END,
+                     CASE trade_status WHEN 'BREAKOUT_BUY' THEN 1 WHEN 'LOW_BUY' THEN 2 WHEN 'WATCH' THEN 3 ELSE 4 END,
+                     stock_id
+        """, (effective_date,))
+        write_sheet("09_交易策略", trade_plan_headers, trade_plan_rows)
+
         status_counts = _fetch("SELECT watch_status, COUNT(*) FROM watch_pool_tracking WHERE track_date=? GROUP BY watch_status ORDER BY COUNT(*) DESC", (effective_date,))
         event_counts = _fetch("SELECT event_type, COUNT(*) FROM watch_pool_event WHERE event_date=? GROUP BY event_type ORDER BY COUNT(*) DESC", (effective_date,))
         outcome_counts = _fetch("SELECT outcome, COUNT(*) FROM watch_pool_performance GROUP BY outcome ORDER BY COUNT(*) DESC")
@@ -9472,6 +9662,7 @@ class WatchPoolCultivationEngine:
             ("exit_count", len(exit_rows), "05 淘汰清單筆數"),
             ("launch_ready_count", len(promoted_rows), "06 升級/Launch Ready 筆數"),
             ("performance_count", len(perf_rows), "07 績效追蹤筆數"),
+            ("trade_plan_count", len(trade_plan_rows), "09 交易策略筆數；需與今日觀察池/Launch Ready 對應"),
             ("success_rate", success_rate, "SUCCESS / performance total"),
             ("avg_days_in_watch", avg_days, "今日平均觀察天數"),
         ]
@@ -9557,6 +9748,7 @@ class WatchPoolCultivationEngine:
             ("06_升級LaunchReady", len(promoted_rows), "PASS" if len(promoted_rows) > 0 else "WARN", "若今日無 Launch Ready 則可空，但本輪應有"),
             ("07_績效追蹤", len(perf_rows), "PASS" if len(perf_rows) > 0 else "WARN", "price_history 不足時可能為空"),
             ("08_模型驗證", len(validation_rows), "PASS", "需列出統計與日期校正"),
+            ("09_交易策略", len(trade_plan_rows), "PASS" if len(trade_plan_rows) > 0 else "FAIL", "進入觀察池後需產出買點/停損/壓力/目標價與建議操作"),
             ("10_下一版規劃追蹤", len(next_plan_rows), "PASS" if len(next_plan_rows) > 0 else "FAIL", "需列出 P1 來源、目的、範圍、驗收條件，避免需求無落點"),
         ]
         write_sheet("99_查核紀錄", ["sheet", "rows", "status", "check_note"], required)
@@ -9567,7 +9759,7 @@ class WatchPoolCultivationEngine:
                     if isinstance(cell.value, float):
                         cell.number_format = "0.00"
         wb.save(out)
-        self.log(f"R5N30A_CULTIVATION_REPORT_WRITTEN output={out} effective_date={effective_date} sheets=01_08_10_99 snapshot_date_format=YYYY-MM-DD next_plan_rows={len(next_plan_rows)}")
+        self.log(f"R5N30A_CULTIVATION_REPORT_WRITTEN output={out} effective_date={effective_date} sheets=01_10_99_with_09_trade_strategy snapshot_date_format=YYYY-MM-DD next_plan_rows={len(next_plan_rows)}")
         return str(out)
 
 
@@ -9667,6 +9859,7 @@ class WatchPoolCultivationEngine:
             self.write_event_rows(conn, event_rows)
             self.update_performance(conn, main_db_path, base_date)
             self.backfill_existing_snapshot_fields(conn, main_db_path, base_date)
+            self.update_trade_plan(conn, main_db_path, base_date)
             output = self.export_cultivation_report(conn, out_path, base_date)
             summary = {
                 "基準日": base_date,
