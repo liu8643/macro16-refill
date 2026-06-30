@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "3.0.0-ai-project-rotation-monitor-R5N31I-master6v5-revenue-ladder-macro-governance-fix"
+VERSION = "3.0.0-ai-project-rotation-monitor-R5N31J-master6v5-conditional-top-output-fix"
 STRATEGY_VERSION = "teacher_strategy_v3.0_ai_project_rotation_monitor_20260525"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
@@ -79,7 +79,7 @@ REPORT_MODE_TEACHER_FULL = "teacher_full"
 REPORT_MODE_ALL = "all"
 # R5N29：獨立觀察池培養模式；非預設，不影響原宏觀16 / 老師策略報表。
 REPORT_MODE_WATCH_POOL = "watch_pool_cultivation"
-# R5N31I：大師六 V5 AI 投資決策模式；Raw DB Only，禁止讀取已挑選結果表；Revenue Ladder / Macro Governance 強化。
+# R5N31J：大師六 V5 AI 投資決策模式；Raw DB Only，禁止讀取已挑選結果表；Revenue Ladder / Macro Governance / Conditional TOP 輸出強化。
 REPORT_MODE_MASTER6_V5 = "master6_v5_ai_investment_decision"
 MACRO_REFILL_SHEETS = ["市場輸入", "宏觀16模組", "V2技術引擎"]
 
@@ -10539,6 +10539,7 @@ class Master6V5RawDbAIEngine:
 
         reasons = []
         strict_candidate = []
+        conditional_candidate = []
         for _, r in df.iterrows():
             rr=[]
             if r.get("gate_eps") == "TURNAROUND_WATCH":
@@ -10553,17 +10554,38 @@ class Master6V5RawDbAIEngine:
             elif r.get("gate_institution") != "PASS": rr.append("法人分不足")
             if r.get("gate_valuation") == "DATA_INSUFFICIENT": rr.append("估值資料不足")
             elif r.get("gate_valuation") != "PASS": rr.append("估值風險")
-            reasons.append(";".join(rr))
-            strict_candidate.append(
+
+            strict_ok = (
                 r.get("gate_eps") == "PASS" and
                 r.get("gate_revenue") == "PASS" and
                 r.get("gate_technical") == "PASS" and
                 r.get("gate_institution") == "PASS" and
                 r.get("gate_valuation") == "PASS"
             )
+            # R5N31J FIX：
+            # 正式候選仍維持五層Gate全PASS；但若正式候選=0，報表不能只剩空白TOP5。
+            # 另建立「條件式候選」：EPS/Revenue/Technical 三個硬Gate必須PASS；
+            # 法人/估值為風險Gate，FAIL或缺資料只能進條件式TOP，並在策略欄強制 LOW_BUY_ONLY/WATCH，不可升級成積極BUY。
+            conditional_ok = (
+                r.get("gate_eps") == "PASS" and
+                r.get("gate_revenue") == "PASS" and
+                r.get("gate_technical") == "PASS" and
+                not strict_ok
+            )
+            strict_candidate.append(strict_ok)
+            conditional_candidate.append(conditional_ok)
+            reasons.append(";".join(rr))
         df["elimination_reason"] = reasons
         df["strict_candidate"] = strict_candidate
-        df["candidate_status"] = df.apply(lambda r: "正式候選" if bool(r.get("strict_candidate")) else ("Turnaround觀察" if r.get("gate_eps") == "TURNAROUND_WATCH" else "觀察/淘汰"), axis=1)
+        df["conditional_candidate"] = conditional_candidate
+        df["candidate_status"] = df.apply(
+            lambda r: "正式候選" if bool(r.get("strict_candidate")) else (
+                "條件式候選" if bool(r.get("conditional_candidate")) else (
+                    "Turnaround觀察" if r.get("gate_eps") == "TURNAROUND_WATCH" else "觀察/淘汰"
+                )
+            ),
+            axis=1
+        )
         return df
 
     def _trade_strategy(self, r, macro_risk_score: Optional[float] = None, macro_judgement: Optional[str] = None):
@@ -10596,8 +10618,13 @@ class Master6V5RawDbAIEngine:
         target1 = round(close * 1.08, 2)
         target2 = round(close * 1.15, 2)
         is_candidate = r.get("candidate_status") == "正式候選"
-        if is_candidate and r.get("master6_v5_score",0) >= 70:
+        if r.get("candidate_status") == "正式候選" and r.get("master6_v5_score",0) >= 70:
             action = "LOW_BUY_ONLY/禁追高" if macro_caution else "BUY/分批"
+        elif r.get("candidate_status") == "條件式候選" and r.get("master6_v5_score",0) >= 70:
+            # 條件式候選代表硬Gate通過，但法人/估值風險未全PASS；只能低接觀察，不可積極BUY。
+            action = "LOW_BUY_ONLY/條件候選"
+            if macro_caution:
+                action = "LOW_BUY_ONLY/禁追高/條件候選"
         else:
             action = "WATCH"
         base_risk = r.get("elimination_reason") or "需控管大盤與個股跌破停損"
@@ -10624,7 +10651,7 @@ class Master6V5RawDbAIEngine:
         except Exception:
             pass
 
-    def _write_excel(self, out_path, tables, all_df, top20, top5, eliminated, lineage, macro_risk_score=None, macro_judgement=None):
+    def _write_excel(self, out_path, tables, all_df, top20, top5, eliminated, lineage, macro_risk_score=None, macro_judgement=None, top_source="正式候選"):
         out = Path(out_path)
         out.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -10633,7 +10660,9 @@ class Master6V5RawDbAIEngine:
                 ["產出時間", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
                 ["掃描股票數", len(all_df)],
                 ["正式候選數", int((all_df["candidate_status"]=="正式候選").sum())],
+                ["條件式候選數", int((all_df["candidate_status"]=="條件式候選").sum())],
                 ["Turnaround觀察數", int((all_df["candidate_status"]=="Turnaround觀察").sum())],
+                ["TOP20/TOP5來源", top_source],
                 ["Macro風控", str(macro_judgement or "")],
                 ["Macro風險分數", "" if macro_risk_score is None else macro_risk_score],
                 ["TOP20目標筆數", 20],
@@ -10656,11 +10685,12 @@ class Master6V5RawDbAIEngine:
             validation = pd.DataFrame([
                 {"驗收項目":"Raw DB Only", "結果":"PASS", "說明":"只讀白名單原始表，禁止結果表"},
                 {"驗收項目":"Revenue Ladder Gate", "結果":"PASS", "說明":"gate_revenue 只有 PASS 才可進正式候選；LADDER_FAIL 不可進TOP20/TOP5"},
-                {"驗收項目":"Candidate→TOP20→TOP5", "結果":"PASS", "說明":f"正式候選={int((all_df['candidate_status']=='正式候選').sum())}; TOP20實際={len(top20)}; TOP5實際={len(top5)}"},
+                {"驗收項目":"Candidate→TOP20→TOP5", "結果":"PASS", "說明":f"正式候選={int((all_df['candidate_status']=='正式候選').sum())}; 條件式候選={int((all_df['candidate_status']=='條件式候選').sum())}; TOP來源={top_source}; TOP20實際={len(top20)}; TOP5實際={len(top5)}"},
+                {"驗收項目":"Conditional Candidate Governance", "結果":"PASS", "說明":"若正式候選為0，條件式候選只可由EPS/Revenue/Technical硬Gate全PASS股票輸出，法人/估值風險保留在淘汰/風險原因與策略欄"},
                 {"驗收項目":"Macro Risk Gate", "結果":"PASS", "說明":"停止新倉不輸出數字買點；禁追高只允許LOW_BUY_ONLY"},
                 {"驗收項目":"Banned Tables", "結果":"PASS", "說明":", ".join(self.banned_tables)},
             ])
-            self._write_sheet(writer, "08_R5N31I驗收摘要", validation)
+            self._write_sheet(writer, "08_R5N31J驗收摘要", validation)
         return str(out)
 
     def run(self, db_path: str, out_path: str, base_date: Optional[str] = None, macro_risk_score: Optional[float] = None, macro_judgement: Optional[str] = None) -> Dict[str, Any]:
@@ -10690,10 +10720,19 @@ class Master6V5RawDbAIEngine:
         df = self._add_scores_and_gates(df)
         strategy_rows = df.apply(lambda r: pd.Series(self._trade_strategy(r, macro_risk_score=macro_risk_score, macro_judgement=macro_judgement)), axis=1)
         df = pd.concat([df, strategy_rows], axis=1)
-        candidate_df = df[df["candidate_status"] == "正式候選"].copy()
+        formal_candidate_df = df[df["candidate_status"] == "正式候選"].copy()
+        conditional_candidate_df = df[df["candidate_status"] == "條件式候選"].copy()
+        # R5N31J：正式候選為第一優先；若五層Gate全PASS為0，改輸出條件式TOP，避免TOP5空白。
+        # 條件式TOP仍完整標示風險與限制策略，不冒充正式候選。
+        if not formal_candidate_df.empty:
+            candidate_df = formal_candidate_df
+            top_source = "正式候選"
+        else:
+            candidate_df = conditional_candidate_df
+            top_source = "條件式候選（正式候選不足時輸出；法人/估值風險需人工複核）"
         top20 = candidate_df.sort_values("master6_v5_score", ascending=False).head(20).copy()
         top5 = candidate_df.sort_values("master6_v5_score", ascending=False).head(5).copy()
-        eliminated = df[df["candidate_status"] != "正式候選"].sort_values("master6_v5_score", ascending=False).head(200).copy()
+        eliminated = df[~df["candidate_status"].isin(["正式候選", "條件式候選"])].sort_values("master6_v5_score", ascending=False).head(200).copy()
         lineage = pd.DataFrame([
             ["stock_id/name/industry/theme", "stocks_master", "建立全市場股票清單與題材欄位"],
             ["technical_score/close/ma/pct20/pos120", "price_history", "重算技術與位階，不讀任何結果表"],
@@ -10705,8 +10744,8 @@ class Master6V5RawDbAIEngine:
             ["master6_v5_score", "上述原始表重算欄位", "EPS/營收/法人/技術/估值/AI題材加權"],
             ["嚴禁讀取", ", ".join(self.banned_tables), "結果表只可存在於DB，不可作為本模式輸入"],
         ], columns=["特徵/輸出", "來源表", "說明"])
-        output = self._write_excel(out_path, tables, df, top20, top5, eliminated, lineage, macro_risk_score=macro_risk_score, macro_judgement=macro_judgement)
-        self.logger.info(f"R5N31I_MASTER6_V5_DONE output={output} rows={len(df)} strict_candidates={len(candidate_df)} top5={','.join(top5['stock_id'].astype(str).tolist())} macro_risk_score={macro_risk_score} macro_judgement={macro_judgement}")
+        output = self._write_excel(out_path, tables, df, top20, top5, eliminated, lineage, macro_risk_score=macro_risk_score, macro_judgement=macro_judgement, top_source=top_source)
+        self.logger.info(f"R5N31J_MASTER6_V5_DONE output={output} rows={len(df)} formal_candidates={len(formal_candidate_df)} conditional_candidates={len(conditional_candidate_df)} top_source={top_source} top5={','.join(top5['stock_id'].astype(str).tolist())} macro_risk_score={macro_risk_score} macro_judgement={macro_judgement}")
         return {
             "output": output,
             "log_file": str(self.logger.log_file),
@@ -10714,7 +10753,9 @@ class Master6V5RawDbAIEngine:
                 "模式": "master6_v5_ai_investment_decision",
                 "Raw DB Only": "YES",
                 "掃描股票數": int(len(df)),
-                "正式候選數": int(len(candidate_df)),
+                "正式候選數": int(len(formal_candidate_df)),
+                "條件式候選數": int(len(conditional_candidate_df)),
+                "TOP來源": top_source,
                 "TOP20": int(len(top20)),
                 "TOP5": int(len(top5)),
                 "禁止結果表已阻擋": ",".join(self.banned_tables),
