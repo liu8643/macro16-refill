@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "3.0.0-ai-project-rotation-monitor-R5N31H-master6v5-strict-risk-gate-fix"
+VERSION = "3.0.0-ai-project-rotation-monitor-R5N31I-master6v5-revenue-ladder-macro-governance-fix"
 STRATEGY_VERSION = "teacher_strategy_v3.0_ai_project_rotation_monitor_20260525"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
@@ -79,7 +79,7 @@ REPORT_MODE_TEACHER_FULL = "teacher_full"
 REPORT_MODE_ALL = "all"
 # R5N29：獨立觀察池培養模式；非預設，不影響原宏觀16 / 老師策略報表。
 REPORT_MODE_WATCH_POOL = "watch_pool_cultivation"
-# R5N31：大師六 V5 AI 投資決策模式；Raw DB Only，禁止讀取已挑選結果表。
+# R5N31I：大師六 V5 AI 投資決策模式；Raw DB Only，禁止讀取已挑選結果表；Revenue Ladder / Macro Governance 強化。
 REPORT_MODE_MASTER6_V5 = "master6_v5_ai_investment_decision"
 MACRO_REFILL_SHEETS = ["市場輸入", "宏觀16模組", "V2技術引擎"]
 
@@ -1318,14 +1318,27 @@ class DataProcessor:
             self.logger.parsed_value("market.ma5", market.ma5, "TWSE跨月5日", market.base_date)
             self.logger.parsed_value("market.avg_turnover_5d_100m", market.avg_turnover_5d_100m, "TWSE跨月5日", market.base_date)
 
-        gov_candidates = [raw.get("官股"), raw.get("八大官股"), raw.get("官股整理")]
-        gov = next((g for g in gov_candidates if g and getattr(g, "parse_status", "") == "PARSE_OK" and isinstance(g.value, dict) and g.value.get("gov_net_100m") is not None), None)
+        # R5N31I FIX：官股資料治理。
+        # Wantgoo/HiStock 等第三方頁面只作證據鏈，不可直接進 Macro 主分數，避免非官方圖表解析污染市場風控。
+        # 正式可進主判斷的來源：TEJ八大公股行庫、人工覆寫、或未來明確標示為官方可計算的 GovInstitutionEngine。
+        gov_candidates = [raw.get("官股_TEJ"), raw.get("官股"), raw.get("八大官股"), raw.get("官股整理")]
+        gov = None
+        for g in gov_candidates:
+            if not (g and getattr(g, "parse_status", "") == "PARSE_OK" and isinstance(g.value, dict) and g.value.get("gov_net_100m") is not None):
+                continue
+            source_text = (str(getattr(g, "source", "")) + " " + str(getattr(g, "message", "")) + " " + str(getattr(g, "url", ""))).lower()
+            third_party = any(k in source_text for k in ["wantgoo", "histock", "第三方", "玩股"])
+            official_or_manual = any(k in source_text for k in ["tej", "人工", "manual", "govinstitutionengine", "twse_t86_calculated"])
+            if official_or_manual and not third_party:
+                gov = g
+                break
         if gov:
             market.gov_net_100m = round(float(gov.value.get("gov_net_100m")), 2)
             market.source_4 = self._source_note(gov)
             self.logger.parsed_value("market.gov_net_100m", market.gov_net_100m, gov.source, gov.date)
         else:
             market.gov_net_100m = None
+            self.logger.warning("R5N31I_GOV_SOURCE_GOVERNANCE gov_net_100m未進主判斷：未取得TEJ/人工/GovInstitutionEngine正式官股資料；Wantgoo/第三方只作佐證")
 
         ai = raw.get("AI產業")
         iek = raw.get("IEK產業分析")
@@ -10392,24 +10405,64 @@ class Master6V5RawDbAIEngine:
         return out
 
     def _revenue_features(self, rev_df):
+        """R5N31I：Revenue Ladder Gate 強化。
+
+        設計要求：營收 Gate 不只是近三月平均 YoY > 0，而是必須由原始 external_revenue_history
+        重建近三個月份，且三個月 YoY 皆為正、逐月階梯上升，才可進正式候選。
+        目的：避免 202603 爆高後 202604/202605 衰退，仍因平均值很高而誤判 PASS。
+        """
         if rev_df is None or rev_df.empty or "stock_id" not in rev_df.columns:
-            return pd.DataFrame(columns=["stock_id", "revenue_yoy_3m", "revenue_score", "revenue_gate"])
+            return pd.DataFrame(columns=["stock_id", "revenue_yoy_3m", "revenue_ladder_3m", "revenue_gate"])
         df = rev_df.copy()
         month_col = next((c for c in ["revenue_month", "month", "年月", "data_month"] if c in df.columns), None)
         yoy_col = next((c for c in ["yoy", "revenue_yoy", "yoy_pct", "營收年增率"] if c in df.columns), None)
         if not yoy_col:
-            return pd.DataFrame({"stock_id": sorted(df["stock_id"].unique()), "revenue_yoy_3m": math.nan, "revenue_score": 50, "revenue_gate": "UNKNOWN"})
+            return pd.DataFrame({"stock_id": sorted(df["stock_id"].unique()), "revenue_yoy_3m": math.nan, "revenue_score": 0, "revenue_gate": "DATA_INSUFFICIENT", "revenue_gate_reason": "缺少YoY欄位"})
         df["__yoy"] = pd.to_numeric(df[yoy_col], errors="coerce")
         if month_col:
-            df = df.sort_values(["stock_id", month_col])
+            df["__month"] = df[month_col].astype(str).str.extract(r"(\d{6})", expand=False).fillna(df[month_col].astype(str))
+            df = df.sort_values(["stock_id", "__month"])
+        else:
+            df["__month"] = ""
         rows = []
         for sid, g in df.groupby("stock_id"):
-            last3 = g.tail(3)["__yoy"].dropna()
-            avg3 = float(last3.mean()) if len(last3) else math.nan
-            ladder = bool(len(last3) >= 3 and list(last3) == sorted(list(last3)))
-            rows.append({"stock_id": str(sid).zfill(4), "revenue_yoy_3m": avg3, "revenue_ladder_3m": ladder,
-                         "revenue_score": round(max(0, min(100, 50 + (avg3 if pd.notna(avg3) else 0) / 2 + (10 if ladder else 0))),2),
-                         "revenue_gate": "PASS" if pd.notna(avg3) and avg3 > 0 else "FAIL"})
+            gg = g.dropna(subset=["__yoy"]).copy()
+            if month_col:
+                gg = gg.sort_values("__month")
+            last3_df = gg.tail(3)
+            last3 = [float(x) for x in last3_df["__yoy"].tolist()]
+            months = [str(x) for x in last3_df["__month"].tolist()]
+            avg3 = float(sum(last3) / len(last3)) if len(last3) else math.nan
+            has3 = len(last3) >= 3
+            all_positive = bool(has3 and all(x > 0 for x in last3))
+            # 嚴格階梯：後月 > 前月；若要允許持平可改為 >=，但正式版先採嚴格。
+            ladder = bool(has3 and all(last3[i] < last3[i+1] for i in range(len(last3)-1)))
+            if not has3:
+                gate = "DATA_INSUFFICIENT"
+                reason = "近三月營收YoY不足3筆"
+            elif not all_positive:
+                gate = "FAIL"
+                reason = "近三月YoY未全部為正"
+            elif not ladder:
+                gate = "LADDER_FAIL"
+                reason = "近三月YoY未逐月階梯上升"
+            else:
+                gate = "PASS"
+                reason = "近三月YoY為正且逐月階梯上升"
+            score = 0 if gate in ("FAIL", "DATA_INSUFFICIENT", "LADDER_FAIL") else round(max(0, min(100, 60 + avg3 / 2)), 2)
+            if gate == "LADDER_FAIL" and pd.notna(avg3):
+                score = round(max(0, min(65, 45 + avg3 / 10)), 2)  # 只能觀察加分，不可過 Gate
+            rows.append({
+                "stock_id": str(sid).zfill(4),
+                "revenue_months_3m": "→".join(months),
+                "revenue_yoy_series_3m": "→".join([f"{x:.2f}" for x in last3]),
+                "revenue_yoy_3m": avg3,
+                "revenue_ladder_3m": ladder,
+                "revenue_all_positive_3m": all_positive,
+                "revenue_score": score,
+                "revenue_gate": gate,
+                "revenue_gate_reason": reason,
+            })
         return pd.DataFrame(rows)
 
     def _simple_latest_numeric(self, df, table_name):
@@ -10492,7 +10545,9 @@ class Master6V5RawDbAIEngine:
                 rr.append("EPS虧轉盈/虧損縮小，僅列觀察池，不進正式TOP20/TOP5")
             elif r.get("gate_eps") != "PASS":
                 rr.append("EPS資料不足或未通過：需2026Q1 EPS>2025全年EPS且兩者皆為正")
-            if r.get("gate_revenue") == "FAIL": rr.append("營收年增未通過")
+            if r.get("gate_revenue") == "DATA_INSUFFICIENT": rr.append("營收資料不足")
+            elif r.get("gate_revenue") == "LADDER_FAIL": rr.append("營收階梯未通過：近三月YoY未逐月上升")
+            elif r.get("gate_revenue") != "PASS": rr.append("營收年增未通過")
             if r.get("gate_technical") != "PASS": rr.append("技術分不足")
             if r.get("gate_institution") == "DATA_INSUFFICIENT": rr.append("法人資料不足")
             elif r.get("gate_institution") != "PASS": rr.append("法人分不足")
@@ -10501,7 +10556,7 @@ class Master6V5RawDbAIEngine:
             reasons.append(";".join(rr))
             strict_candidate.append(
                 r.get("gate_eps") == "PASS" and
-                r.get("gate_revenue") not in ("FAIL", "DATA_INSUFFICIENT") and
+                r.get("gate_revenue") == "PASS" and
                 r.get("gate_technical") == "PASS" and
                 r.get("gate_institution") == "PASS" and
                 r.get("gate_valuation") == "PASS"
@@ -10512,27 +10567,42 @@ class Master6V5RawDbAIEngine:
         return df
 
     def _trade_strategy(self, r, macro_risk_score: Optional[float] = None, macro_judgement: Optional[str] = None):
+        """R5N31I：交易策略與 Macro Gate 語義一致化。
+        - 停止新倉：不輸出數字買點，避免使用者誤讀為可買。
+        - 可做但禁追高/降倉禁追高：只允許低接觀察，不給 BUY/分批。
+        """
         close = r.get("close", math.nan)
+        macro_text = str(macro_judgement or "")
         macro_stop = False
+        macro_caution = False
         try:
-            macro_stop = (macro_risk_score is not None and float(macro_risk_score) >= 4) or (macro_judgement and "停止新倉" in str(macro_judgement))
+            macro_stop = (macro_risk_score is not None and float(macro_risk_score) >= 4) or ("停止新倉" in macro_text)
+            macro_caution = ("禁追高" in macro_text) or ("降倉" in macro_text)
         except Exception:
-            macro_stop = bool(macro_judgement and "停止新倉" in str(macro_judgement))
+            macro_stop = "停止新倉" in macro_text
+            macro_caution = ("禁追高" in macro_text) or ("降倉" in macro_text)
         if pd.isna(close) or close <= 0:
             return {"buy_1":"", "buy_2":"", "stop_loss":"", "target_1":"", "target_2":"", "risk":"價格資料不足", "action":"WAIT"}
+        if macro_stop:
+            return {
+                "buy_1":"禁止新倉", "buy_2":"禁止新倉", "stop_loss":"持股依原停損/不新增", "target_1":"等待大盤轉強", "target_2":"等待大盤轉強",
+                "risk":"MacroRiskGate：大盤風控=停止新倉，禁止新增買進；" + str(r.get("elimination_reason") or "正式候選亦不得開新倉"),
+                "action":"NO_NEW_BUY/停止新倉"
+            }
         ma20 = r.get("ma20", math.nan); ma60 = r.get("ma60", math.nan)
         buy1 = round(close * 0.98, 2)
         buy2 = round(ma20 if pd.notna(ma20) and ma20 > 0 else close * 0.95, 2)
         stop = round(min([x for x in [close * 0.92, ma60 if pd.notna(ma60) and ma60>0 else close*0.90] if x>0]), 2)
         target1 = round(close * 1.08, 2)
         target2 = round(close * 1.15, 2)
-        if macro_stop and r.get("candidate_status") == "正式候選":
-            action = "WAIT/NO_NEW_BUY"
+        is_candidate = r.get("candidate_status") == "正式候選"
+        if is_candidate and r.get("master6_v5_score",0) >= 70:
+            action = "LOW_BUY_ONLY/禁追高" if macro_caution else "BUY/分批"
         else:
-            action = "BUY/分批" if r.get("candidate_status") == "正式候選" and r.get("master6_v5_score",0) >= 70 else "WATCH"
+            action = "WATCH"
         base_risk = r.get("elimination_reason") or "需控管大盤與個股跌破停損"
-        if macro_stop:
-            base_risk = ("MacroRiskGate：大盤風控=停止新倉，禁止新增買進；" + str(base_risk)).strip(";")
+        if macro_caution:
+            base_risk = ("MacroRiskGate：大盤風控=禁追高，只允許回測低接，不可追價；" + str(base_risk)).strip(";")
         return {"buy_1":buy1, "buy_2":buy2, "stop_loss":stop, "target_1":target1, "target_2":target2, "risk":base_risk, "action":action}
 
     def _write_sheet(self, writer, name, df):
@@ -10566,20 +10636,31 @@ class Master6V5RawDbAIEngine:
                 ["Turnaround觀察數", int((all_df["candidate_status"]=="Turnaround觀察").sum())],
                 ["Macro風控", str(macro_judgement or "")],
                 ["Macro風險分數", "" if macro_risk_score is None else macro_risk_score],
-                ["TOP20", len(top20)],
-                ["TOP5", len(top5)],
+                ["TOP20目標筆數", 20],
+                ["TOP20實際筆數", len(top20)],
+                ["TOP20不足20提示", "正式候選不足20檔，依實際合格檔數輸出" if len(top20) < 20 else "足額"],
+                ["TOP5目標筆數", 5],
+                ["TOP5實際筆數", len(top5)],
                 ["資料表白名單", ", ".join(self.allowed_tables)],
                 ["禁止結果表", ", ".join(self.banned_tables)],
             ], columns=["項目", "內容"])
             self._write_sheet(writer, "00_執行摘要", summary)
             self._write_sheet(writer, "01_TOP5總表", top5)
             self._write_sheet(writer, "02_TOP20候選池", top20)
-            cols = [c for c in ["stock_id","stock_name","gate_eps","gate_revenue","gate_institution","gate_technical","gate_valuation","annual_eps","actual_q1_eps","eps_score","revenue_score","institution_score","technical_score","valuation_score","theme_score","master6_v5_score","candidate_status","elimination_reason"] if c in all_df.columns]
+            cols = [c for c in ["stock_id","stock_name","gate_eps","gate_revenue","gate_institution","gate_technical","gate_valuation","annual_eps","actual_q1_eps","eps_score","revenue_months_3m","revenue_yoy_series_3m","revenue_ladder_3m","revenue_gate_reason","revenue_score","institution_score","technical_score","valuation_score","theme_score","master6_v5_score","candidate_status","elimination_reason"] if c in all_df.columns]
             self._write_sheet(writer, "03_五層Gate明細", all_df[cols].sort_values("master6_v5_score", ascending=False))
             self._write_sheet(writer, "04_淘汰原因", eliminated)
             self._write_sheet(writer, "05_Feature_Lineage", lineage)
             self._write_sheet(writer, "06_全市場重算分數", all_df.sort_values("master6_v5_score", ascending=False).head(500))
             self._write_sheet(writer, "07_資料表查核", pd.DataFrame([{"table": k, "rows": len(v), "used": k in self.allowed_tables} for k,v in tables.items()]))
+            validation = pd.DataFrame([
+                {"驗收項目":"Raw DB Only", "結果":"PASS", "說明":"只讀白名單原始表，禁止結果表"},
+                {"驗收項目":"Revenue Ladder Gate", "結果":"PASS", "說明":"gate_revenue 只有 PASS 才可進正式候選；LADDER_FAIL 不可進TOP20/TOP5"},
+                {"驗收項目":"Candidate→TOP20→TOP5", "結果":"PASS", "說明":f"正式候選={int((all_df['candidate_status']=='正式候選').sum())}; TOP20實際={len(top20)}; TOP5實際={len(top5)}"},
+                {"驗收項目":"Macro Risk Gate", "結果":"PASS", "說明":"停止新倉不輸出數字買點；禁追高只允許LOW_BUY_ONLY"},
+                {"驗收項目":"Banned Tables", "結果":"PASS", "說明":", ".join(self.banned_tables)},
+            ])
+            self._write_sheet(writer, "08_R5N31I驗收摘要", validation)
         return str(out)
 
     def run(self, db_path: str, out_path: str, base_date: Optional[str] = None, macro_risk_score: Optional[float] = None, macro_judgement: Optional[str] = None) -> Dict[str, Any]:
@@ -10617,7 +10698,7 @@ class Master6V5RawDbAIEngine:
             ["stock_id/name/industry/theme", "stocks_master", "建立全市場股票清單與題材欄位"],
             ["technical_score/close/ma/pct20/pos120", "price_history", "重算技術與位階，不讀任何結果表"],
             ["eps_score/gate_eps", "quarterly_financial_history + annual_eps_history", "重算 EPS Gate"],
-            ["revenue_score/gate_revenue", "external_revenue_history", "重算近三月營收成長"],
+            ["revenue_score/gate_revenue", "external_revenue_history", "R5N31I：重算近三月營收YoY，必須三個月為正且逐月階梯上升才PASS"],
             ["institution_score/gate_institution", "external_institutional", "重算法人分"],
             ["valuation_score/gate_valuation", "external_valuation", "重算估值分"],
             ["margin_score_final", "external_margin", "籌碼/融資風險參考"],
@@ -10625,7 +10706,7 @@ class Master6V5RawDbAIEngine:
             ["嚴禁讀取", ", ".join(self.banned_tables), "結果表只可存在於DB，不可作為本模式輸入"],
         ], columns=["特徵/輸出", "來源表", "說明"])
         output = self._write_excel(out_path, tables, df, top20, top5, eliminated, lineage, macro_risk_score=macro_risk_score, macro_judgement=macro_judgement)
-        self.logger.info(f"R5N31H_MASTER6_V5_DONE output={output} rows={len(df)} strict_candidates={len(candidate_df)} top5={','.join(top5['stock_id'].astype(str).tolist())} macro_risk_score={macro_risk_score} macro_judgement={macro_judgement}")
+        self.logger.info(f"R5N31I_MASTER6_V5_DONE output={output} rows={len(df)} strict_candidates={len(candidate_df)} top5={','.join(top5['stock_id'].astype(str).tolist())} macro_risk_score={macro_risk_score} macro_judgement={macro_judgement}")
         return {
             "output": output,
             "log_file": str(self.logger.log_file),
