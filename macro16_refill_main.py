@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "3.0.0-ai-project-rotation-monitor-R5N31K-master6v6-closed-loop-decision-platform"
+VERSION = "3.0.0-ai-project-rotation-monitor-R5N31L-master6v6-sqlite-closed-loop-cultivation"
 STRATEGY_VERSION = "teacher_strategy_v3.0_ai_project_rotation_monitor_20260525"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
@@ -81,7 +81,7 @@ REPORT_MODE_ALL = "all"
 REPORT_MODE_WATCH_POOL = "watch_pool_cultivation"
 # R5N31J：大師六 V5 AI 投資決策模式；Raw DB Only，禁止讀取已挑選結果表；Revenue Ladder / Macro Governance / Conditional TOP 輸出強化。
 REPORT_MODE_MASTER6_V5 = "master6_v5_ai_investment_decision"
-# R5N31K：大師六 V6 AI Master Decision Platform；V5 Raw DB Only + Candidate Lifecycle + Observation Pool + Decision Governance 閉環。
+# R5N31L：大師六 V6 AI Master Decision Platform；SQLite Closed Loop，固定落地 data/watch_pool_cultivation.db。
 REPORT_MODE_MASTER6_V6 = "master6_v6_ai_master_decision_platform"
 MACRO_REFILL_SHEETS = ["市場輸入", "宏觀16模組", "V2技術引擎"]
 
@@ -10656,7 +10656,8 @@ class Master6V5RawDbAIEngine:
             pass
 
     def _write_excel(self, out_path, tables, all_df, top20, top5, eliminated, lineage, macro_risk_score=None, macro_judgement=None, top_source="正式候選"):
-        out = Path(out_path)
+        # R5N31L：Dashboard Excel 固定輸出到 reports/V6/Dashboard，不再散落於 reports 根目錄。
+        out = self._v6_excel_output_path(str(out_path or ""), run_date)
         out.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             summary = pd.DataFrame([
@@ -10769,10 +10770,10 @@ class Master6V5RawDbAIEngine:
 
 
 # =============================
-# R5N31K 大師六 V6 AI Master Decision Platform：Closed-loop Decision Governance Engine
+# R5N31L 大師六 V6 AI Master Decision Platform：Closed-loop Decision Governance Engine
 # =============================
 class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
-    """R5N31K：在 R5N31J Raw DB Only / Five Gate 基礎上，新增候選池生命週期、Observation Pool、MarketSnapshot、
+    """R5N31L：在 R5N31K 基礎上，改成 SQLite Closed-loop 培養DB；新增候選池生命週期、Observation Pool、MarketSnapshot、
     AI Decision Governance、Trade Plan V6、Feedback Track 與主管版 Dashboard。
 
     設計原則：
@@ -10781,7 +10782,7 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
     3. BUY 必須經 Candidate Pool -> Observation Pool -> MarketSnapshot -> Governance -> Trade Plan。
     4. 候選不足時，不產生假 TOP5；改輸出 WAIT/WATCH/BREAKOUT 雷達與不足原因。
     """
-    VERSION_TAG = "R5N31K_MASTER6_V6_CLOSED_LOOP_PLATFORM"
+    VERSION_TAG = "R5N31L_MASTER6_V6_SQLITE_CLOSED_LOOP_CULTIVATION"
     V6_ACTIONS = ["STRONG_BUY", "BUY", "ACCUMULATE", "WAIT", "WATCH", "BREAKOUT", "REDUCE", "SELL", "AVOID"]
 
     def __init__(self, logger: Macro16Logger):
@@ -10792,13 +10793,139 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
             return str(base_date).replace("/", "-")[:10]
         return dt.date.today().isoformat()
 
+    def _project_root(self, out_path: str = "") -> Path:
+        """R5N31L：推定專案根目錄。
+        優先使用目前工作目錄；若輸出路徑位於 reports/V6 底下，回推到 reports 上層。
+        目的：固定把可培養 SQLite DB 放在 data/watch_pool_cultivation.db，避免再散落到 reports 內。
+        """
+        cwd = Path.cwd().resolve()
+        try:
+            if out_path:
+                out = Path(out_path).resolve()
+                parts = list(out.parts)
+                if "reports" in parts:
+                    idx = parts.index("reports")
+                    if idx > 0:
+                        return Path(*parts[:idx]).resolve()
+                if out.suffix:
+                    return out.parent.resolve()
+                return out.resolve()
+        except Exception:
+            pass
+        return cwd
+
+    def _ensure_v6_output_dirs(self, out_path: str = "") -> Dict[str, Path]:
+        """R5N31L：建立固定閉環目錄。"""
+        root = self._project_root(out_path)
+        dirs = {
+            "data": root / "data",
+            "reports_v6": root / "reports" / "V6",
+            "candidate_pool": root / "reports" / "V6" / "CandidatePool",
+            "watch_pool": root / "reports" / "V6" / "WatchPool",
+            "lifecycle": root / "reports" / "V6" / "Lifecycle",
+            "market_snapshot": root / "reports" / "V6" / "MarketSnapshot",
+            "trade_plan": root / "reports" / "V6" / "TradePlan",
+            "dashboard": root / "reports" / "V6" / "Dashboard",
+            "logs": root / "logs",
+        }
+        for p in dirs.values():
+            p.mkdir(parents=True, exist_ok=True)
+        for name in ["daily.log", "error.log", "decision.log"]:
+            log_path = dirs["logs"] / name
+            if not log_path.exists():
+                log_path.write_text("", encoding="utf-8")
+        return dirs
+
+    def _append_v6_log_files(self, dirs: Dict[str, Path], message: str, level: str = "INFO"):
+        """R5N31L：同步寫入 daily.log / decision.log / error.log。"""
+        ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts} | {level} | {message}\n"
+        try:
+            (dirs["logs"] / "daily.log").open("a", encoding="utf-8").write(line)
+            if "DECISION" in message or "V6" in message:
+                (dirs["logs"] / "decision.log").open("a", encoding="utf-8").write(line)
+            if level.upper() in ("ERROR", "FAIL"):
+                (dirs["logs"] / "error.log").open("a", encoding="utf-8").write(line)
+        except Exception as exc:
+            self.logger.warning(f"R5N31L_LOG_FILE_WRITE_FAIL error={exc}")
+
     def _v6_lifecycle_db_path(self, out_path: str) -> Path:
-        out = Path(out_path)
-        folder = out.parent if str(out.parent) not in ("", ".") else Path("reports")
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder / "master6_v6_candidate_lifecycle.db"
+        """R5N31L：正式閉環培養DB固定為 data/watch_pool_cultivation.db。"""
+        dirs = self._ensure_v6_output_dirs(out_path)
+        return dirs["data"] / "watch_pool_cultivation.db"
+
+    def _v6_excel_output_path(self, out_path: str, run_date: str) -> Path:
+        """R5N31L：V6 Excel 固定輸出到 reports/V6/Dashboard。"""
+        dirs = self._ensure_v6_output_dirs(out_path)
+        return dirs["dashboard"] / f"大師六V6_AI_Master_Decision_Platform_{run_date.replace('-', '')}.xlsx"
 
     def _ensure_v6_lifecycle_schema(self, conn):
+        """R5N31L：建立 V6 SQLite Closed-loop DB schema。
+        主表採用使用者指定命名：candidate_pool / watch_pool / lifecycle_history /
+        market_snapshot / trade_plan / feedback_history / trade_result / decision_log。
+        舊 R5N31K daily 表保留相容，避免破壞既有報表讀取。
+        """
+        # --- R5N31L正式閉環表 ---
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS candidate_pool (
+            run_date TEXT, stock_id TEXT, stock_name TEXT, candidate_tier TEXT,
+            gate_pass_count INTEGER, gate_status TEXT, candidate_status TEXT,
+            score REAL, confidence_score REAL, candidate_reason TEXT,
+            lifecycle_status TEXT, updated_at TEXT,
+            PRIMARY KEY(run_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS watch_pool (
+            run_date TEXT, stock_id TEXT, stock_name TEXT, lifecycle_status TEXT,
+            observation_days INTEGER, maturity_score REAL, trend_slope REAL,
+            institution_streak INTEGER, washout_flag INTEGER, observation_action TEXT,
+            final_action TEXT, updated_at TEXT,
+            PRIMARY KEY(run_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS lifecycle_history (
+            event_date TEXT, stock_id TEXT, stock_name TEXT, event_type TEXT,
+            from_status TEXT, to_status TEXT, lifecycle_status TEXT,
+            days_in_pool INTEGER, days_absent INTEGER, reason TEXT,
+            evidence_json TEXT, created_at TEXT
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_snapshot (
+            run_date TEXT, stock_id TEXT, stock_name TEXT, snapshot_action TEXT,
+            trend_state TEXT, breakout_state TEXT, close REAL,
+            support1 REAL, support2 REAL, support3 REAL,
+            resistance1 REAL, resistance2 REAL, distance_to_breakout_pct REAL,
+            volume_confirm INTEGER, updated_at TEXT,
+            PRIMARY KEY(run_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_plan (
+            run_date TEXT, stock_id TEXT, stock_name TEXT, final_action TEXT,
+            entry1 REAL, entry2 REAL, stop_loss REAL, target1 REAL, target2 REAL,
+            add_on_price REAL, rr REAL, expected_return_1 REAL, expected_return_2 REAL,
+            position_size_pct REAL, invalid_condition TEXT, updated_at TEXT,
+            PRIMARY KEY(run_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS feedback_history (
+            decision_date TEXT, stock_id TEXT, final_action TEXT, close_t0 REAL,
+            close_t1 REAL, close_t5 REAL, close_t20 REAL, max_drawdown REAL,
+            hit_stop INTEGER, hit_target INTEGER, outcome TEXT, updated_at TEXT,
+            PRIMARY KEY(decision_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_result (
+            decision_date TEXT, stock_id TEXT, final_action TEXT, result_status TEXT,
+            realized_return REAL, realized_rr REAL, note TEXT, updated_at TEXT,
+            PRIMARY KEY(decision_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS decision_log (
+            run_id TEXT, run_date TEXT, stock_id TEXT, stock_name TEXT, final_action TEXT,
+            confidence_score REAL, risk_level TEXT, trade_probability REAL,
+            explain_reason TEXT, risk_reason TEXT, source_version TEXT, created_at TEXT
+        )""")
+        # --- R5N31K相容表 ---
         conn.execute("""
         CREATE TABLE IF NOT EXISTS candidate_pool_daily (
             run_date TEXT, stock_id TEXT, stock_name TEXT, tier TEXT, gate_pass_count INTEGER,
@@ -11075,8 +11202,99 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
             conn.executemany("REPLACE INTO trade_plan_v6 VALUES (?,?,?,?,?,?,?,?,?,?,?)", trade_rows)
             conn.commit()
 
+    def _write_closed_loop_sqlite_outputs(self, final_df, lifecycle_db: Path, run_date: str, lifecycle_events=None):
+        """R5N31L：把每日決策結果正式落地到 data/watch_pool_cultivation.db 指定八大表。"""
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        run_id = getattr(self.logger, "run_id", run_date.replace("-", ""))
+        with sqlite3.connect(str(lifecycle_db)) as conn:
+            self._ensure_v6_lifecycle_schema(conn)
+            def sf(v, default=None):
+                return _safe_float(v, default)
+            candidate_rows, watch_rows, snap_rows, trade_rows, feedback_rows, result_rows, log_rows = [], [], [], [], [], [], []
+            for _, r in final_df.iterrows():
+                sid = str(r.get("stock_id", "")).zfill(4)
+                if not sid or sid == "0000":
+                    continue
+                name = str(r.get("stock_name", "") or "")
+                gates = [r.get("gate_eps"), r.get("gate_revenue"), r.get("gate_institution"), r.get("gate_technical"), r.get("gate_valuation")]
+                gate_pass_count = int(sum(1 for g in gates if g == "PASS"))
+                gate_status = "ALL_PASS" if gate_pass_count == 5 else f"PASS_{gate_pass_count}_OF_5"
+                candidate_rows.append((
+                    run_date, sid, name, r.get("candidate_tier", ""), gate_pass_count, gate_status,
+                    r.get("candidate_status", ""), sf(r.get("master6_v5_score"), 0), sf(r.get("confidence_score"), 0),
+                    r.get("elimination_reason", ""), r.get("lifecycle_status", ""), now
+                ))
+                watch_rows.append((
+                    run_date, sid, name, r.get("lifecycle_status", ""), int(sf(r.get("observation_days"), 0) or 0),
+                    sf(r.get("maturity_score"), 0), sf(r.get("trend_slope"), 0), int(sf(r.get("institution_streak"), 0) or 0),
+                    int(sf(r.get("washout_flag"), 0) or 0), r.get("observation_action", ""), r.get("final_action", ""), now
+                ))
+                snap_rows.append((
+                    run_date, sid, name, r.get("snapshot_action", ""), r.get("trend_state", ""), r.get("breakout_state", ""),
+                    sf(r.get("close"), None), sf(r.get("support1"), None), sf(r.get("support2"), None), sf(r.get("support3"), None),
+                    sf(r.get("resistance1"), None), sf(r.get("resistance2"), None), sf(r.get("distance_to_breakout_pct"), None),
+                    int(sf(r.get("volume_confirm"), 0) or 0), now
+                ))
+                trade_rows.append((
+                    run_date, sid, name, r.get("final_action", ""), sf(r.get("entry1"), None), sf(r.get("entry2"), None),
+                    sf(r.get("stop_loss"), None), sf(r.get("target1"), None), sf(r.get("target2"), None), sf(r.get("add_on_price"), None),
+                    sf(r.get("rr"), None), sf(r.get("expected_return_1"), None), sf(r.get("expected_return_2"), None),
+                    sf(r.get("position_size_pct"), 0), r.get("invalid_condition", ""), now
+                ))
+                feedback_rows.append((run_date, sid, r.get("final_action", ""), sf(r.get("close"), None), None, None, None, None, None, None, "PENDING", now))
+                result_rows.append((run_date, sid, r.get("final_action", ""), "PENDING", None, None, "等待後續收盤資料回填", now))
+                log_rows.append((
+                    run_id, run_date, sid, name, r.get("final_action", ""), sf(r.get("confidence_score"), 0), r.get("risk_level", ""),
+                    sf(r.get("trade_probability"), 0), r.get("explain_reason", ""), r.get("risk_reason", ""), self.VERSION_TAG, now
+                ))
+            conn.executemany("REPLACE INTO candidate_pool VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", candidate_rows)
+            conn.executemany("REPLACE INTO watch_pool VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", watch_rows)
+            conn.executemany("REPLACE INTO market_snapshot VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", snap_rows)
+            conn.executemany("REPLACE INTO trade_plan VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", trade_rows)
+            conn.executemany("REPLACE INTO feedback_history VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", feedback_rows)
+            conn.executemany("REPLACE INTO trade_result VALUES (?,?,?,?,?,?,?,?)", result_rows)
+            conn.executemany("INSERT INTO decision_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", log_rows)
+            if lifecycle_events is not None and not getattr(lifecycle_events, "empty", True):
+                rows=[]
+                for _, e in lifecycle_events.iterrows():
+                    sid = str(e.get("stock_id", "")).zfill(4)
+                    matched = final_df[final_df["stock_id"].astype(str).str.zfill(4).eq(sid)]
+                    name = str(matched.iloc[0].get("stock_name", "")) if not matched.empty else ""
+                    days_in_pool = int(_safe_float(matched.iloc[0].get("observation_days"), 0) or 0) if not matched.empty else 0
+                    days_absent = int(_safe_float(matched.iloc[0].get("days_absent"), 0) or 0) if not matched.empty else 0
+                    rows.append((e.get("event_date", run_date), sid, name, e.get("event_type", ""), e.get("from_status", ""), e.get("to_status", ""), e.get("to_status", ""), days_in_pool, days_absent, e.get("reason", ""), e.get("evidence_json", ""), e.get("created_at", now)))
+                if rows:
+                    conn.executemany("INSERT INTO lifecycle_history VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            conn.commit()
+        return {
+            "candidate_pool": len(candidate_rows), "watch_pool": len(watch_rows), "market_snapshot": len(snap_rows),
+            "trade_plan": len(trade_rows), "feedback_history": len(feedback_rows), "trade_result": len(result_rows), "decision_log": len(log_rows)
+        }
+
+    def _export_v6_folder_reports(self, final_df, dirs: Dict[str, Path], run_date: str):
+        """R5N31L：依固定 reports/V6/* 目錄輸出分頁報表，供人工檢視；DB仍為主體。"""
+        if pd is None or final_df is None or final_df.empty:
+            return {}
+        suffix = run_date.replace('-', '')
+        exports = {}
+        subsets = {
+            "candidate_pool": (dirs["candidate_pool"] / f"candidate_pool_{suffix}.xlsx", final_df[final_df.get("candidate_tier", pd.Series("", index=final_df.index)).isin(["A","B","C"])]),
+            "watch_pool": (dirs["watch_pool"] / f"watch_pool_{suffix}.xlsx", final_df[final_df.get("final_action", pd.Series("", index=final_df.index)).isin(["WAIT","WATCH"])]),
+            "lifecycle": (dirs["lifecycle"] / f"lifecycle_{suffix}.xlsx", final_df[[c for c in ["stock_id","stock_name","candidate_tier","lifecycle_status","observation_days","maturity_score","final_action","risk_reason"] if c in final_df.columns]]),
+            "market_snapshot": (dirs["market_snapshot"] / f"market_snapshot_{suffix}.xlsx", final_df[[c for c in ["stock_id","stock_name","snapshot_action","trend_state","breakout_state","close","support1","support2","resistance1","resistance2","distance_to_breakout_pct","volume_confirm"] if c in final_df.columns]]),
+            "trade_plan": (dirs["trade_plan"] / f"trade_plan_{suffix}.xlsx", final_df[[c for c in ["stock_id","stock_name","final_action","entry1","entry2","stop_loss","target1","target2","add_on_price","rr","position_size_pct"] if c in final_df.columns]]),
+        }
+        for key, (path, df) in subsets.items():
+            try:
+                df.head(500).to_excel(path, index=False)
+                exports[key] = str(path)
+            except Exception as exc:
+                self.logger.warning(f"R5N31L_FOLDER_REPORT_EXPORT_FAIL key={key} path={path} error={exc}")
+        return exports
+
     def _write_excel_v6(self, out_path, tables, final_df, lineage, lifecycle_events, lifecycle_db, run_date, macro_risk_score=None, macro_judgement=None):
-        out = Path(out_path)
+        # R5N31L：Dashboard Excel 固定輸出到 reports/V6/Dashboard；SQLite DB 才是每日主輸出。
+        out = self._v6_excel_output_path(str(out_path or ""), run_date)
         out.parent.mkdir(parents=True, exist_ok=True)
         executable = final_df[final_df["final_action"].isin(["STRONG_BUY", "BUY", "ACCUMULATE", "BREAKOUT"])].copy()
         top5 = executable.sort_values(["trade_probability", "confidence_score", "master6_v5_score"], ascending=False).head(5)
@@ -11101,10 +11319,10 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
             feedback = pd.DataFrame([{"decision_date": run_date, "stock_id": r.get("stock_id"), "final_action": r.get("final_action"), "close_t0": r.get("close"), "close_t1": "待補算", "close_t5": "待補算", "close_t20": "待補算", "max_drawdown": "待補算", "hit_stop": "待補算", "hit_target": "待補算", "outcome": "待補算"} for _, r in top20.iterrows()])
             self._write_sheet(writer, "09_Feedback Track", feedback)
             validation = pd.DataFrame([
-                {"驗收項目":"V6模式可執行", "結果":"PASS", "說明":"新增 master6_v6_ai_master_decision_platform，不覆蓋V5"},
+                {"驗收項目":"V6模式可執行", "結果":"PASS", "說明":"R5N31L SQLite Closed-loop：每日先更新 data/watch_pool_cultivation.db，再輸出Dashboard"},
                 {"驗收項目":"Raw DB Only", "結果":"PASS", "說明":"V6沿用白名單讀表；禁用表存在但不讀"},
                 {"驗收項目":"Gate不直接BUY", "結果":"PASS", "說明":"final_action由Lifecycle+Observation+Snapshot+Governance共同決定"},
-                {"驗收項目":"Lifecycle DB", "結果":"PASS", "說明":str(lifecycle_db)},
+                {"驗收項目":"Closed-loop SQLite DB", "結果":"PASS", "說明":str(lifecycle_db)},
                 {"驗收項目":"Observation成熟度", "結果":"PASS", "說明":"observation_days<5預設WATCH，突破例外需Snapshot支持"},
                 {"驗收項目":"九種Final Action", "結果":"PASS", "說明":", ".join(self.V6_ACTIONS)},
                 {"驗收項目":"Confidence/Risk/Probability", "結果":"PASS", "說明":"TOP5/Dashboard必填治理欄位"},
@@ -11119,17 +11337,19 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
 
     def run(self, db_path: str, out_path: str, base_date: Optional[str] = None, macro_risk_score: Optional[float] = None, macro_judgement: Optional[str] = None) -> Dict[str, Any]:
         if not db_path:
-            raise RuntimeError("R5N31K 大師六 V6 必須指定主DB檔案")
+            raise RuntimeError("R5N31L 大師六 V6 必須指定主DB檔案")
         if pd is None:
-            raise RuntimeError("R5N31K 大師六 V6 需要 pandas，請先安裝 pandas")
+            raise RuntimeError("R5N31L 大師六 V6 需要 pandas，請先安裝 pandas")
         run_date = self._run_date(base_date)
+        dirs = self._ensure_v6_output_dirs(out_path)
         lifecycle_db = self._v6_lifecycle_db_path(out_path)
-        self.logger.info(f"R5N31K_MASTER6_V6_START raw_db_only=1 lifecycle_db={lifecycle_db}")
-        self.logger.info("R5N31K_MASTER6_V6_BANNED_TABLES " + ",".join(self.banned_tables))
+        self._append_v6_log_files(dirs, f"V6_START run_date={run_date} closed_loop_db={lifecycle_db}")
+        self.logger.info(f"R5N31L_MASTER6_V6_START raw_db_only=1 closed_loop_db={lifecycle_db}")
+        self.logger.info("R5N31L_MASTER6_V6_BANNED_TABLES " + ",".join(self.banned_tables))
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
             existing = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
             touched_banned = [t for t in existing if t in self.banned_tables]
-            self.logger.info("R5N31K_MASTER6_V6_BANNED_PRESENT_NOT_READ " + ",".join(touched_banned))
+            self.logger.info("R5N31L_MASTER6_V6_BANNED_PRESENT_NOT_READ " + ",".join(touched_banned))
             tables = {t: self._read_table(conn, t) for t in self.allowed_tables if self._table_exists(conn, t)}
         base = self._build_base(tables)
         df = base
@@ -11151,6 +11371,9 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
         plan_df = self._build_trade_plan_v6(snap_df)
         final_df = self._apply_decision_governance(plan_df, macro_risk_score=macro_risk_score, macro_judgement=macro_judgement)
         self._write_lifecycle_db_outputs(final_df, lifecycle_db, run_date)
+        sqlite_counts = self._write_closed_loop_sqlite_outputs(final_df, lifecycle_db, run_date, event_df)
+        folder_exports = self._export_v6_folder_reports(final_df, dirs, run_date)
+        self._append_v6_log_files(dirs, f"V6_DECISION_UPDATED rows={len(final_df)} sqlite_counts={sqlite_counts} exports={folder_exports}")
         lineage = pd.DataFrame([
             ["Raw Universe", "stocks_master", "全市場股票清單，不讀結果表"],
             ["Technical/Snapshot", "price_history", "支撐壓力、均線、突破、量能、RR"],
@@ -11159,13 +11382,13 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
             ["Institution", "external_institutional", "法人分與資料狀態"],
             ["Valuation", "external_valuation", "PE/PB估值風險"],
             ["Margin", "external_margin", "風險參考"],
-            ["Lifecycle", str(lifecycle_db), "候選池進出、升降級、消失與恢復"],
+            ["SQLite Closed Loop DB", str(lifecycle_db), "candidate_pool/watch_pool/lifecycle_history/market_snapshot/trade_plan/feedback_history/trade_result/decision_log"],
             ["Governance", "V6 rule engine", "Confidence/Risk/Probability/ExpectedReturn/PositionSize/FinalAction"],
             ["禁止讀取", ", ".join(self.banned_tables), "V6流程不得使用已挑選結果表"],
         ], columns=["特徵/輸出", "來源表/檔", "說明"])
         output, top5_n, top20_n, wait_n, breakout_n = self._write_excel_v6(out_path, tables, final_df, lineage, event_df, lifecycle_db, run_date, macro_risk_score=macro_risk_score, macro_judgement=macro_judgement)
-        self.logger.info(f"R5N31K_MASTER6_V6_DONE output={output} rows={len(final_df)} top5={top5_n} top20={top20_n} wait={wait_n} breakout={breakout_n} lifecycle_db={lifecycle_db}")
-        return {"output": output, "lifecycle_db": str(lifecycle_db), "log_file": str(self.logger.log_file), "summary": {"模式":"master6_v6_ai_master_decision_platform", "Raw DB Only":"YES", "掃描股票數":int(len(final_df)), "TOP5":top5_n, "TOP20":top20_n, "WAIT/WATCH":wait_n, "BreakoutRadar":breakout_n, "LifecycleDB":str(lifecycle_db), "輸出檔案":output}}
+        self.logger.info(f"R5N31L_MASTER6_V6_DONE output={output} rows={len(final_df)} top5={top5_n} top20={top20_n} wait={wait_n} breakout={breakout_n} closed_loop_db={lifecycle_db} folder_exports={folder_exports}")
+        return {"output": output, "lifecycle_db": str(lifecycle_db), "log_file": str(self.logger.log_file), "summary": {"模式":"master6_v6_ai_master_decision_platform", "Raw DB Only":"YES", "掃描股票數":int(len(final_df)), "TOP5":top5_n, "TOP20":top20_n, "WAIT/WATCH":wait_n, "BreakoutRadar":breakout_n, "ClosedLoopDB":str(lifecycle_db), "FolderExports":folder_exports, "輸出檔案":output}}
 
 
 def run_gui():
