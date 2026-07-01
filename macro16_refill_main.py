@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "3.0.0-ai-project-rotation-monitor-R5N31L-master6v6-sqlite-closed-loop-cultivation"
+VERSION = "3.0.0-ai-project-rotation-monitor-R5N31M-master6v6-side-output-fix"
 STRATEGY_VERSION = "teacher_strategy_v3.0_ai_project_rotation_monitor_20260525"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
@@ -8699,24 +8699,41 @@ class Macro16Engine:
         if report_mode == REPORT_MODE_ALL:
             evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
 
-        # R5N31F FIX：避免 GUI 使用者仍選 macro_refill 時誤以為沒有產出大師六V5。
-        # 只要有主DB且不是已進入 V5 主模式，就在宏觀報表完成後自動側掛輸出
-        # reports/大師六V5_AI投資決策_YYYYMMDD.xlsx。
-        # 此側掛輸出使用 Master6V5RawDbAIEngine，僅讀白名單原始表，禁止讀 ranking_result/trade_plan/watchlist/prebreakout/top20/teacher_pool。
+        # R5N31M FIX：macro_refill/其他日常模式自動側掛大師六 V5 + V6。
+        # 目的：使用者仍選 macro_refill 時，也要同時產出：
+        # 1. reports/大師六V5_AI投資決策_YYYYMMDD.xlsx
+        # 2. data/watch_pool_cultivation.db（V6 八大閉環表）
+        # 3. reports/V6/Dashboard/大師六V6_AI_Master_Decision_YYYYMMDD.xlsx 與各分層報表。
         master6_v5_output = ""
-        if db_path and report_mode != REPORT_MODE_MASTER6_V5:
+        master6_v6_output = ""
+        master6_v6_db = ""
+        if db_path and report_mode not in (REPORT_MODE_MASTER6_V5, REPORT_MODE_MASTER6_V6):
+            base_dir = Path(output).resolve().parent
+            reports_dir = base_dir / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            side_date = (base_date or dt.date.today().isoformat()).replace("-", "")
             try:
-                base_dir = Path(output).resolve().parent
-                reports_dir = base_dir / "reports"
-                reports_dir.mkdir(parents=True, exist_ok=True)
-                v5_date = (base_date or dt.date.today().isoformat()).replace("-", "")
-                master6_v5_output = str(reports_dir / f"大師六V5_AI投資決策_{v5_date}.xlsx")
-                self.logger.info(f"R5N31F_MASTER6_V5_SIDE_OUTPUT_START report_mode={report_mode} output={master6_v5_output}")
+                master6_v5_output = str(reports_dir / f"大師六V5_AI投資決策_{side_date}.xlsx")
+                self.logger.info(f"R5N31M_MASTER6_V5_SIDE_OUTPUT_START report_mode={report_mode} output={master6_v5_output}")
                 Master6V5RawDbAIEngine(self.logger).run(db_path, master6_v5_output, base_date, macro_risk_score=tech.risk_score, macro_judgement=tech.market_judgement)
-                self.logger.info(f"R5N31F_MASTER6_V5_SIDE_OUTPUT_DONE output={master6_v5_output}")
+                self.logger.info(f"R5N31M_MASTER6_V5_SIDE_OUTPUT_DONE output={master6_v5_output}")
             except Exception as exc:
                 master6_v5_output = ""
-                self.logger.warning(f"R5N31F_MASTER6_V5_SIDE_OUTPUT_FAIL error={exc}")
+                self.logger.warning(f"R5N31M_MASTER6_V5_SIDE_OUTPUT_FAIL error={exc}")
+
+            try:
+                v6_out_hint = str(base_dir / f"大師六V6_AI_Master_Decision_{side_date}.xlsx")
+                self.logger.info(f"R5N31M_MASTER6_V6_SIDE_OUTPUT_START report_mode={report_mode} output_hint={v6_out_hint}")
+                v6_result = Master6V6AIMasterDecisionPlatformEngine(self.logger).run(
+                    db_path, v6_out_hint, base_date, macro_risk_score=tech.risk_score, macro_judgement=tech.market_judgement
+                )
+                master6_v6_output = str(v6_result.get("output", ""))
+                master6_v6_db = str(v6_result.get("lifecycle_db", ""))
+                self.logger.info(f"R5N31M_MASTER6_V6_SIDE_OUTPUT_DONE output={master6_v6_output} closed_loop_db={master6_v6_db}")
+            except Exception as exc:
+                master6_v6_output = ""
+                master6_v6_db = ""
+                self.logger.warning(f"R5N31M_MASTER6_V6_SIDE_OUTPUT_FAIL error={exc}")
         # R5N29K：保留 data/reports/logs 工作資料夾，不再自動產出 data.zip。
         # 原因：data.zip 只是附件/交付包形式，不是每日培養迴路的工作資料。
         data_outputs: Dict[str, str] = {}
@@ -8729,7 +8746,13 @@ class Macro16Engine:
             summary["reports_folder"] = data_outputs.get("reports_folder", "")
             summary["logs_folder"] = data_outputs.get("logs_folder", "")
         self.logger.info("執行完成")
-        return {"output": output, "master6_v5_output": master6_v5_output, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file), "data_outputs": data_outputs}
+        if master6_v5_output:
+            summary["master6_v5_output"] = master6_v5_output
+        if master6_v6_output:
+            summary["master6_v6_output"] = master6_v6_output
+        if master6_v6_db:
+            summary["master6_v6_closed_loop_db"] = master6_v6_db
+        return {"output": output, "master6_v5_output": master6_v5_output, "master6_v6_output": master6_v6_output, "master6_v6_closed_loop_db": master6_v6_db, "evidence_word": evidence_word, "raw_dir": str(self.logger.raw_dir), "summary": summary, "warnings": warnings, "log_file": str(self.logger.log_file), "data_outputs": data_outputs}
 
 
 class WatchPoolCultivationEngine:
@@ -10656,8 +10679,11 @@ class Master6V5RawDbAIEngine:
             pass
 
     def _write_excel(self, out_path, tables, all_df, top20, top5, eliminated, lineage, macro_risk_score=None, macro_judgement=None, top_source="正式候選"):
-        # R5N31L：Dashboard Excel 固定輸出到 reports/V6/Dashboard，不再散落於 reports 根目錄。
-        out = self._v6_excel_output_path(str(out_path or ""), run_date)
+        # R5N31M FIX：這是 V5 Excel writer，不可呼叫只存在於 V6 subclass 的 _v6_excel_output_path。
+        # R5N31L 的錯誤根因是 macro_refill 側掛 V5 時進入此函式，卻呼叫 V6 專屬方法，
+        # 造成 AttributeError: 'Master6V5RawDbAIEngine' object has no attribute '_v6_excel_output_path'。
+        # V5 報表維持使用呼叫端指定的 out_path；V6 Dashboard 由 Master6V6AIMasterDecisionPlatformEngine._write_excel_v6 負責。
+        out = Path(out_path or (Path.cwd() / f"大師六V5_AI投資決策_{dt.date.today().strftime('%Y%m%d')}.xlsx"))
         out.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             summary = pd.DataFrame([
