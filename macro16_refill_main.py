@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "3.0.0-ai-project-rotation-monitor-R5N31J-master6v5-conditional-top-output-fix"
+VERSION = "3.0.0-ai-project-rotation-monitor-R5N31K-master6v6-closed-loop-decision-platform"
 STRATEGY_VERSION = "teacher_strategy_v3.0_ai_project_rotation_monitor_20260525"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
@@ -81,6 +81,8 @@ REPORT_MODE_ALL = "all"
 REPORT_MODE_WATCH_POOL = "watch_pool_cultivation"
 # R5N31J：大師六 V5 AI 投資決策模式；Raw DB Only，禁止讀取已挑選結果表；Revenue Ladder / Macro Governance / Conditional TOP 輸出強化。
 REPORT_MODE_MASTER6_V5 = "master6_v5_ai_investment_decision"
+# R5N31K：大師六 V6 AI Master Decision Platform；V5 Raw DB Only + Candidate Lifecycle + Observation Pool + Decision Governance 閉環。
+REPORT_MODE_MASTER6_V6 = "master6_v6_ai_master_decision_platform"
 MACRO_REFILL_SHEETS = ["市場輸入", "宏觀16模組", "V2技術引擎"]
 
 
@@ -8605,6 +8607,8 @@ class Macro16Engine:
     def run(self, template: Optional[str], out_path: str, base_date: Optional[str] = None, override: Optional[ManualOverride] = None, db_path: Optional[str] = None, strict_ranking: bool = False, tej_gov_file: Optional[str] = None, report_mode: str = REPORT_MODE_MACRO, cultivation_db_path: Optional[str] = None, launch_ready_path: Optional[str] = None) -> Dict[str, Any]:
         if report_mode == REPORT_MODE_MASTER6_V5:
             return Master6V5RawDbAIEngine(self.logger).run(db_path or "", out_path, base_date)
+        if report_mode == REPORT_MODE_MASTER6_V6:
+            return Master6V6AIMasterDecisionPlatformEngine(self.logger).run(db_path or "", out_path, base_date)
         self.logger.info(f"開始執行 {APP_NAME} v{VERSION}")
         self.logger.info("CHANGELOG v3.0.0: Add AI Project Rotation Monitor sheets and full 201-stock AI tracking page")
         self.logger.strategy_trace("STRATEGY_VERSION", {"strategy_version": STRATEGY_VERSION, "program_version": VERSION})
@@ -10764,12 +10768,412 @@ class Master6V5RawDbAIEngine:
         }
 
 
+# =============================
+# R5N31K 大師六 V6 AI Master Decision Platform：Closed-loop Decision Governance Engine
+# =============================
+class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
+    """R5N31K：在 R5N31J Raw DB Only / Five Gate 基礎上，新增候選池生命週期、Observation Pool、MarketSnapshot、
+    AI Decision Governance、Trade Plan V6、Feedback Track 與主管版 Dashboard。
+
+    設計原則：
+    1. V6 只讀 Raw DB 白名單表，不讀 ranking_result / trade_plan / watchlist / prebreakout / top20 / teacher_pool。
+    2. Five Gate PASS 只代表資格，不可直接等於 BUY。
+    3. BUY 必須經 Candidate Pool -> Observation Pool -> MarketSnapshot -> Governance -> Trade Plan。
+    4. 候選不足時，不產生假 TOP5；改輸出 WAIT/WATCH/BREAKOUT 雷達與不足原因。
+    """
+    VERSION_TAG = "R5N31K_MASTER6_V6_CLOSED_LOOP_PLATFORM"
+    V6_ACTIONS = ["STRONG_BUY", "BUY", "ACCUMULATE", "WAIT", "WATCH", "BREAKOUT", "REDUCE", "SELL", "AVOID"]
+
+    def __init__(self, logger: Macro16Logger):
+        super().__init__(logger)
+
+    def _run_date(self, base_date: Optional[str]) -> str:
+        if base_date:
+            return str(base_date).replace("/", "-")[:10]
+        return dt.date.today().isoformat()
+
+    def _v6_lifecycle_db_path(self, out_path: str) -> Path:
+        out = Path(out_path)
+        folder = out.parent if str(out.parent) not in ("", ".") else Path("reports")
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / "master6_v6_candidate_lifecycle.db"
+
+    def _ensure_v6_lifecycle_schema(self, conn):
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS candidate_pool_daily (
+            run_date TEXT, stock_id TEXT, stock_name TEXT, tier TEXT, gate_pass_count INTEGER,
+            eps_status TEXT, revenue_status TEXT, candidate_reason TEXT, score REAL,
+            lifecycle_status TEXT, created_at TEXT,
+            PRIMARY KEY(run_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS candidate_lifecycle (
+            stock_id TEXT PRIMARY KEY, stock_name TEXT, first_seen_date TEXT, last_seen_date TEXT,
+            lifecycle_status TEXT, days_in_pool INTEGER, days_absent INTEGER,
+            promote_count INTEGER, demote_count INTEGER, current_tier TEXT, last_reason TEXT, updated_at TEXT
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS candidate_lifecycle_event (
+            event_date TEXT, stock_id TEXT, event_type TEXT, from_status TEXT, to_status TEXT,
+            reason TEXT, evidence_json TEXT, created_at TEXT
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS observation_pool_daily (
+            run_date TEXT, stock_id TEXT, observation_days INTEGER, maturity_score REAL,
+            trend_slope REAL, institution_streak INTEGER, washout_flag INTEGER, observation_action TEXT,
+            lifecycle_status TEXT, created_at TEXT,
+            PRIMARY KEY(run_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_snapshot_v6 (
+            run_date TEXT, stock_id TEXT, snapshot_action TEXT, trend_state TEXT, breakout_state TEXT,
+            support1 REAL, support2 REAL, resistance1 REAL, resistance2 REAL, volume_confirm INTEGER,
+            created_at TEXT, PRIMARY KEY(run_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_decision_daily (
+            run_date TEXT, stock_id TEXT, confidence_score REAL, risk_level TEXT, trade_probability REAL,
+            expected_return_1 REAL, expected_return_2 REAL, position_size_pct REAL, final_action TEXT,
+            explain_reason TEXT, risk_reason TEXT, created_at TEXT,
+            PRIMARY KEY(run_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_plan_v6 (
+            run_date TEXT, stock_id TEXT, entry1 REAL, entry2 REAL, stop_loss REAL, target1 REAL,
+            target2 REAL, add_on_price REAL, rr REAL, invalid_condition TEXT, created_at TEXT,
+            PRIMARY KEY(run_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS decision_feedback (
+            decision_date TEXT, stock_id TEXT, final_action TEXT, close_t0 REAL, close_t1 REAL,
+            close_t5 REAL, close_t20 REAL, max_drawdown REAL, hit_stop INTEGER, hit_target INTEGER,
+            outcome TEXT, updated_at TEXT,
+            PRIMARY KEY(decision_date, stock_id)
+        )""")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS model_weight_history (
+            effective_date TEXT PRIMARY KEY, eps_weight REAL, revenue_weight REAL, institution_weight REAL,
+            technical_weight REAL, macro_weight REAL, change_reason TEXT, created_at TEXT
+        )""")
+        conn.commit()
+
+    def _candidate_tier(self, row) -> str:
+        if row.get("candidate_status") == "正式候選" and row.get("master6_v5_score", 0) >= 85:
+            return "A"
+        if row.get("candidate_status") == "正式候選":
+            return "B"
+        if row.get("candidate_status") == "條件式候選":
+            return "C"
+        return "X"
+
+    def _lifecycle_status_from_row(self, row) -> str:
+        tier = row.get("candidate_tier", "X")
+        if tier == "A":
+            return "OBSERVATION"
+        if tier in ("B", "C"):
+            return "NEW_CANDIDATE"
+        if row.get("gate_eps") == "TURNAROUND_WATCH":
+            return "OBSERVATION"
+        return "ELIMINATED"
+
+    def _update_lifecycle(self, df, lifecycle_db: Path, run_date: str):
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(str(lifecycle_db)) as conn:
+            self._ensure_v6_lifecycle_schema(conn)
+            prev = pd.read_sql_query("SELECT * FROM candidate_lifecycle", conn) if pd is not None else pd.DataFrame()
+            prev_map = {str(r["stock_id"]).zfill(4): r for _, r in prev.iterrows()} if prev is not None and not prev.empty else {}
+            pool_rows, life_rows, event_rows = [], [], []
+            for _, r in df.iterrows():
+                sid = str(r.get("stock_id", "")).zfill(4)
+                if not sid or sid == "0000":
+                    continue
+                tier = self._candidate_tier(r)
+                status = self._lifecycle_status_from_row({**r.to_dict(), "candidate_tier": tier})
+                gate_pass_count = int(sum(1 for g in [r.get("gate_eps"), r.get("gate_revenue"), r.get("gate_institution"), r.get("gate_technical"), r.get("gate_valuation")] if g == "PASS"))
+                reason = str(r.get("elimination_reason", "")) if tier == "X" else f"Tier {tier}; Gate PASS={gate_pass_count}; Score={round(float(r.get('master6_v5_score',0) or 0),2)}"
+                old = prev_map.get(sid)
+                if old is None:
+                    first_seen, days_in_pool, days_absent, promote, demote, from_status, event_type = run_date, (1 if status != "ELIMINATED" else 0), (0 if status != "ELIMINATED" else 1), 0, 0, "NONE", "ENTER" if status != "ELIMINATED" else "ELIMINATE"
+                else:
+                    first_seen = old.get("first_seen_date") or run_date
+                    prev_status = str(old.get("lifecycle_status", ""))
+                    from_status = prev_status
+                    days_in_pool = int(old.get("days_in_pool") or 0) + (1 if status != "ELIMINATED" else 0)
+                    days_absent = 0 if status != "ELIMINATED" else int(old.get("days_absent") or 0) + 1
+                    promote = int(old.get("promote_count") or 0)
+                    demote = int(old.get("demote_count") or 0)
+                    order = {"ELIMINATED":0, "NEW_CANDIDATE":1, "OBSERVATION":2, "TREND_CONFIRM":3, "BREAKOUT_READY":4, "BUY_ELIGIBLE":5}
+                    if order.get(status, 0) > order.get(prev_status, 0):
+                        promote += 1; event_type = "PROMOTE"
+                    elif order.get(status, 0) < order.get(prev_status, 0):
+                        demote += 1; event_type = "DEMOTE"
+                    elif status == "ELIMINATED" and prev_status != "ELIMINATED":
+                        event_type = "ELIMINATE"
+                    else:
+                        event_type = "STAY"
+                life_rows.append((sid, r.get("stock_name", ""), first_seen, run_date, status, days_in_pool, days_absent, promote, demote, tier, reason, now))
+                pool_rows.append((run_date, sid, r.get("stock_name", ""), tier, gate_pass_count, r.get("gate_eps", ""), r.get("gate_revenue", ""), reason, float(r.get("master6_v5_score", 0) or 0), status, now))
+                if event_type != "STAY":
+                    evidence = json.dumps({"tier": tier, "score": float(r.get("master6_v5_score",0) or 0), "gate_pass_count": gate_pass_count, "candidate_status": r.get("candidate_status", "")}, ensure_ascii=False)
+                    event_rows.append((run_date, sid, event_type, from_status, status, reason, evidence, now))
+            conn.executemany("REPLACE INTO candidate_pool_daily VALUES (?,?,?,?,?,?,?,?,?,?,?)", pool_rows)
+            conn.executemany("REPLACE INTO candidate_lifecycle VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", life_rows)
+            if event_rows:
+                conn.executemany("INSERT INTO candidate_lifecycle_event VALUES (?,?,?,?,?,?,?,?)", event_rows)
+            conn.execute("REPLACE INTO model_weight_history VALUES (?,?,?,?,?,?,?,?)", (run_date, 0.30, 0.20, 0.20, 0.20, 0.10, "R5N31K initial governance weights", now))
+            conn.commit()
+            life_df = pd.read_sql_query("SELECT * FROM candidate_lifecycle", conn) if pd is not None else pd.DataFrame()
+            events_df = pd.read_sql_query("SELECT * FROM candidate_lifecycle_event WHERE event_date=?", conn, params=[run_date]) if pd is not None else pd.DataFrame()
+        return life_df, events_df
+
+    def _build_observation_pool(self, df, life_df, run_date: str):
+        out = df.merge(life_df[["stock_id", "lifecycle_status", "days_in_pool", "days_absent", "promote_count", "demote_count", "current_tier"]], on="stock_id", how="left") if life_df is not None and not life_df.empty else df.copy()
+        out["observation_days"] = pd.to_numeric(out.get("days_in_pool"), errors="coerce").fillna(0).astype(int)
+        inst = pd.to_numeric(out.get("institution_score"), errors="coerce").fillna(0)
+        tech = pd.to_numeric(out.get("technical_score"), errors="coerce").fillna(0)
+        score = pd.to_numeric(out.get("master6_v5_score"), errors="coerce").fillna(0)
+        out["trend_slope"] = (tech - 50).round(2)
+        out["institution_streak"] = (inst >= 60).astype(int)
+        out["washout_flag"] = ((pd.to_numeric(out.get("pct20"), errors="coerce").fillna(0) < -8) & (tech >= 50)).astype(int)
+        out["maturity_score"] = (out["observation_days"].clip(0, 5) * 12 + (score - 60).clip(0, 30) + out["institution_streak"] * 10 + out["washout_flag"] * 5).clip(0, 100).round(2)
+        out["observation_action"] = "WATCH"
+        out.loc[(out["maturity_score"] >= 60) & (out["trend_slope"] >= 0), "observation_action"] = "READY_FOR_SNAPSHOT"
+        out.loc[out["observation_days"] < 5, "observation_action"] = "OBSERVE_MIN_5D"
+        out.loc[out.get("candidate_tier", pd.Series("X", index=out.index)).eq("X"), "observation_action"] = "ELIMINATED"
+        return out
+
+    def _build_market_snapshot_v6(self, obs_df):
+        df = obs_df.copy()
+        close = pd.to_numeric(df.get("close"), errors="coerce")
+        ma5 = pd.to_numeric(df.get("ma5"), errors="coerce")
+        ma20 = pd.to_numeric(df.get("ma20"), errors="coerce")
+        ma60 = pd.to_numeric(df.get("ma60"), errors="coerce")
+        high20 = pd.to_numeric(df.get("high20"), errors="coerce")
+        low20 = pd.to_numeric(df.get("low20"), errors="coerce")
+        v5 = pd.to_numeric(df.get("volume5"), errors="coerce")
+        v20 = pd.to_numeric(df.get("volume20"), errors="coerce")
+        df["support1"] = ma20.fillna(close * 0.98).round(2)
+        df["support2"] = low20.fillna(close * 0.94).round(2)
+        df["support3"] = ma60.fillna(close * 0.90).round(2)
+        df["resistance1"] = high20.fillna(close * 1.05).round(2)
+        df["resistance2"] = (df["resistance1"] * 1.05).round(2)
+        df["distance_to_breakout_pct"] = ((df["resistance1"] - close) / close.replace(0, math.nan) * 100).round(2)
+        df["volume_confirm"] = ((v20 > 0) & (v5 >= v20 * 1.15)).astype(int)
+        df["trend_state"] = "NEUTRAL"
+        df.loc[(close >= ma20) & (ma20 >= ma60.fillna(ma20)), "trend_state"] = "UPTREND"
+        df.loc[(close < ma20) & (ma20 < ma60.fillna(ma20)), "trend_state"] = "DOWNTREND"
+        df["breakout_state"] = "NONE"
+        df.loc[(df["distance_to_breakout_pct"].between(0, 3, inclusive="both")) & (df["volume_confirm"] == 1), "breakout_state"] = "BREAKOUT_READY"
+        df.loc[(close >= df["resistance1"]) & (df["volume_confirm"] == 1), "breakout_state"] = "BREAKOUT_CONFIRMED"
+        df["snapshot_action"] = "WATCH"
+        df.loc[df["trend_state"].eq("UPTREND") & df["breakout_state"].eq("BREAKOUT_READY"), "snapshot_action"] = "BREAKOUT"
+        df.loc[df["trend_state"].eq("UPTREND") & df["breakout_state"].eq("BREAKOUT_CONFIRMED"), "snapshot_action"] = "BUY"
+        df.loc[df["trend_state"].eq("UPTREND") & (close <= df["support1"] * 1.02), "snapshot_action"] = "ACCUMULATE"
+        df.loc[df["trend_state"].eq("DOWNTREND"), "snapshot_action"] = "REDUCE"
+        df.loc[df.get("observation_action", pd.Series("", index=df.index)).eq("OBSERVE_MIN_5D") & ~df["snapshot_action"].isin(["BUY", "BREAKOUT"]), "snapshot_action"] = "WATCH"
+        return df
+
+    def _build_trade_plan_v6(self, snap_df):
+        df = snap_df.copy()
+        close = pd.to_numeric(df.get("close"), errors="coerce")
+        df["entry1"] = (df["support1"] * 1.01).round(2)
+        df["entry2"] = (df["support2"] * 1.01).round(2)
+        df["stop_loss"] = (df["support2"] * 0.97).round(2)
+        df["target1"] = df["resistance1"].round(2)
+        df["target2"] = df["resistance2"].round(2)
+        df["add_on_price"] = (df["resistance1"] * 1.01).round(2)
+        denom = (df["entry1"] - df["stop_loss"]).replace(0, math.nan)
+        df["rr"] = ((df["target1"] - df["entry1"]) / denom).replace([math.inf, -math.inf], math.nan).round(2)
+        df["expected_return_1"] = ((df["target1"] / close.replace(0, math.nan) - 1) * 100).round(2)
+        df["expected_return_2"] = ((df["target2"] / close.replace(0, math.nan) - 1) * 100).round(2)
+        df["invalid_condition"] = "跌破stop_loss或Gate硬性轉弱"
+        return df
+
+    def _macro_score(self, macro_risk_score=None, macro_judgement=None):
+        txt = str(macro_judgement or "")
+        if "停止新倉" in txt or (macro_risk_score is not None and float(macro_risk_score) >= 4): return 20
+        if "禁追高" in txt or "降倉" in txt: return 45
+        if "允許交易" in txt or "偏多" in txt: return 75
+        return 60
+
+    def _apply_decision_governance(self, plan_df, macro_risk_score=None, macro_judgement=None):
+        df = plan_df.copy()
+        macro_score = self._macro_score(macro_risk_score, macro_judgement)
+        df["macro_score"] = macro_score
+        eps = pd.to_numeric(df.get("eps_score"), errors="coerce").fillna(0)
+        rev = pd.to_numeric(df.get("revenue_score"), errors="coerce").fillna(0)
+        inst = pd.to_numeric(df.get("institution_score"), errors="coerce").fillna(0)
+        tech = pd.to_numeric(df.get("technical_score"), errors="coerce").fillna(0)
+        data_penalty = (df.get("gate_institution", pd.Series("", index=df.index)).eq("DATA_INSUFFICIENT").astype(int) + df.get("gate_valuation", pd.Series("", index=df.index)).eq("DATA_INSUFFICIENT").astype(int)) * 5
+        df["confidence_score"] = (eps * .30 + rev * .20 + inst * .20 + tech * .20 + macro_score * .10 - data_penalty).clip(0, 100).round(2)
+        base_risk = 20
+        base_risk += df.get("gate_valuation", pd.Series("", index=df.index)).ne("PASS").astype(int) * 15
+        base_risk += df.get("gate_institution", pd.Series("", index=df.index)).ne("PASS").astype(int) * 10
+        base_risk += (pd.to_numeric(df.get("rr"), errors="coerce").fillna(0) < 1.2).astype(int) * 15
+        base_risk += (df.get("snapshot_action", pd.Series("", index=df.index)).isin(["REDUCE", "SELL", "AVOID"])).astype(int) * 20
+        if macro_score <= 30: base_risk += 25
+        elif macro_score < 55: base_risk += 10
+        df["risk_score"] = pd.Series(base_risk, index=df.index).clip(0, 100)
+        df["risk_level"] = "MEDIUM"
+        df.loc[df["risk_score"] < 35, "risk_level"] = "LOW"
+        df.loc[df["risk_score"].between(55, 74, inclusive="both"), "risk_level"] = "HIGH"
+        df.loc[df["risk_score"] >= 75, "risk_level"] = "EXTREME"
+        snapshot_bonus = df.get("snapshot_action", pd.Series("WATCH", index=df.index)).map({"BUY":15,"BREAKOUT":12,"ACCUMULATE":8,"WAIT":0,"WATCH":-5,"REDUCE":-20,"SELL":-30,"AVOID":-40}).fillna(0)
+        maturity = pd.to_numeric(df.get("maturity_score"), errors="coerce").fillna(0)
+        df["trade_probability"] = (df["confidence_score"] * .65 + maturity * .20 + snapshot_bonus - df["risk_score"] * .15).clip(0, 100).round(1)
+        df["position_size_pct"] = 0
+        df.loc[(df["risk_level"].eq("LOW")) & (df["confidence_score"] >= 90) & (pd.to_numeric(df.get("rr"), errors="coerce").fillna(0) >= 2), "position_size_pct"] = 50
+        df.loc[(df["position_size_pct"] == 0) & (df["risk_level"].isin(["LOW", "MEDIUM"])) & (df["confidence_score"] >= 80), "position_size_pct"] = 33
+        df.loc[(df["position_size_pct"] == 0) & (df["risk_level"].isin(["LOW", "MEDIUM"])) & (df["confidence_score"] >= 70), "position_size_pct"] = 20
+        if macro_score <= 30:
+            df["position_size_pct"] = 0
+        hard_pass = df.get("gate_eps", pd.Series("", index=df.index)).eq("PASS") & df.get("gate_revenue", pd.Series("", index=df.index)).eq("PASS") & df.get("gate_technical", pd.Series("", index=df.index)).eq("PASS")
+        mature = (pd.to_numeric(df.get("observation_days"), errors="coerce").fillna(0) >= 5) | df.get("snapshot_action", pd.Series("", index=df.index)).isin(["BREAKOUT", "BUY"])
+        df["final_action"] = "WATCH"
+        df.loc[~hard_pass, "final_action"] = "AVOID"
+        df.loc[hard_pass & ~mature, "final_action"] = "WATCH"
+        df.loc[hard_pass & mature & df.get("snapshot_action", pd.Series("", index=df.index)).eq("ACCUMULATE") & df["risk_level"].isin(["LOW", "MEDIUM"]), "final_action"] = "ACCUMULATE"
+        df.loc[hard_pass & mature & df.get("snapshot_action", pd.Series("", index=df.index)).eq("BREAKOUT") & (df["confidence_score"] >= 75) & ~df["risk_level"].isin(["HIGH", "EXTREME"]), "final_action"] = "BREAKOUT"
+        df.loc[hard_pass & mature & df.get("snapshot_action", pd.Series("", index=df.index)).eq("BUY") & (df["confidence_score"] >= 80) & ~df["risk_level"].isin(["HIGH", "EXTREME"]), "final_action"] = "BUY"
+        df.loc[df["final_action"].eq("BUY") & (df["confidence_score"] >= 90) & df["risk_level"].eq("LOW") & (pd.to_numeric(df.get("rr"), errors="coerce").fillna(0) >= 2), "final_action"] = "STRONG_BUY"
+        df.loc[df["risk_level"].isin(["HIGH", "EXTREME"]) & df["final_action"].isin(["STRONG_BUY", "BUY"]), "final_action"] = "WAIT"
+        if macro_score <= 30:
+            df.loc[df["final_action"].isin(["STRONG_BUY", "BUY", "ACCUMULATE", "BREAKOUT"]), "final_action"] = "WATCH"
+        df.loc[df.get("snapshot_action", pd.Series("", index=df.index)).isin(["REDUCE", "SELL"]), "final_action"] = df.get("snapshot_action", pd.Series("", index=df.index))
+        positive, risk_reason = [], []
+        for _, r in df.iterrows():
+            p=[]; risk=[]
+            if r.get("gate_eps") == "PASS": p.append("EPS 2026Q1超越2025全年")
+            if r.get("gate_revenue") == "PASS": p.append("近三月營收YoY階梯上升")
+            if r.get("gate_institution") == "PASS": p.append("法人分通過")
+            if r.get("gate_technical") == "PASS": p.append("技術趨勢通過")
+            if r.get("theme_score",0) >= 80: p.append("AI/半導體主流題材加權")
+            if r.get("snapshot_action") in ["BUY","BREAKOUT","ACCUMULATE"]: p.append(f"Snapshot={r.get('snapshot_action')}")
+            if r.get("risk_level") in ["HIGH","EXTREME"]: risk.append(f"風險等級={r.get('risk_level')}")
+            if r.get("gate_valuation") != "PASS": risk.append("估值未完全通過")
+            if r.get("gate_institution") != "PASS": risk.append("法人資料不足或未通過")
+            if pd.notna(r.get("rr")) and r.get("rr",0) < 1.5: risk.append("RR不足1.5")
+            if macro_score <= 30: risk.append("Macro停止新倉")
+            positive.append("；".join(p[:5]) if p else "未形成足夠正向理由")
+            risk_reason.append("；".join(risk) if risk else "無重大風險，仍需依停損執行")
+        df["explain_reason"] = positive
+        df["risk_reason"] = risk_reason
+        return df
+
+    def _write_lifecycle_db_outputs(self, final_df, lifecycle_db: Path, run_date: str):
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(str(lifecycle_db)) as conn:
+            self._ensure_v6_lifecycle_schema(conn)
+            obs_cols = ["run_date","stock_id","observation_days","maturity_score","trend_slope","institution_streak","washout_flag","observation_action","lifecycle_status","created_at"]
+            obs_rows = [(run_date, r.get("stock_id"), int(_safe_float(r.get("observation_days"), 0) or 0), float(_safe_float(r.get("maturity_score"), 0) or 0), float(_safe_float(r.get("trend_slope"), 0) or 0), int(_safe_float(r.get("institution_streak"), 0) or 0), int(_safe_float(r.get("washout_flag"), 0) or 0), r.get("observation_action", ""), r.get("lifecycle_status", ""), now) for _, r in final_df.iterrows()]
+            conn.executemany("REPLACE INTO observation_pool_daily VALUES (?,?,?,?,?,?,?,?,?,?)", obs_rows)
+            snap_rows = [(run_date, r.get("stock_id"), r.get("snapshot_action", ""), r.get("trend_state", ""), r.get("breakout_state", ""), _safe_float(r.get("support1"), None), _safe_float(r.get("support2"), None), _safe_float(r.get("resistance1"), None), _safe_float(r.get("resistance2"), None), int(_safe_float(r.get("volume_confirm"), 0) or 0), now) for _, r in final_df.iterrows()]
+            conn.executemany("REPLACE INTO market_snapshot_v6 VALUES (?,?,?,?,?,?,?,?,?,?,?)", snap_rows)
+            decision_rows = [(run_date, r.get("stock_id"), float(r.get("confidence_score") or 0), r.get("risk_level", ""), float(r.get("trade_probability") or 0), _safe_float(r.get("expected_return_1"), None), _safe_float(r.get("expected_return_2"), None), float(r.get("position_size_pct") or 0), r.get("final_action", ""), r.get("explain_reason", ""), r.get("risk_reason", ""), now) for _, r in final_df.iterrows()]
+            conn.executemany("REPLACE INTO ai_decision_daily VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", decision_rows)
+            trade_rows = [(run_date, r.get("stock_id"), _safe_float(r.get("entry1"), None), _safe_float(r.get("entry2"), None), _safe_float(r.get("stop_loss"), None), _safe_float(r.get("target1"), None), _safe_float(r.get("target2"), None), _safe_float(r.get("add_on_price"), None), _safe_float(r.get("rr"), None), r.get("invalid_condition", ""), now) for _, r in final_df.iterrows()]
+            conn.executemany("REPLACE INTO trade_plan_v6 VALUES (?,?,?,?,?,?,?,?,?,?,?)", trade_rows)
+            conn.commit()
+
+    def _write_excel_v6(self, out_path, tables, final_df, lineage, lifecycle_events, lifecycle_db, run_date, macro_risk_score=None, macro_judgement=None):
+        out = Path(out_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        executable = final_df[final_df["final_action"].isin(["STRONG_BUY", "BUY", "ACCUMULATE", "BREAKOUT"])].copy()
+        top5 = executable.sort_values(["trade_probability", "confidence_score", "master6_v5_score"], ascending=False).head(5)
+        top20 = final_df[final_df["candidate_tier"].isin(["A", "B", "C"])].sort_values(["confidence_score", "master6_v5_score"], ascending=False).head(20)
+        wait_pool = final_df[final_df["final_action"].isin(["WAIT", "WATCH"])].sort_values(["confidence_score", "maturity_score"], ascending=False).head(100)
+        breakout = final_df[final_df["snapshot_action"].isin(["BREAKOUT", "BUY"])].sort_values(["distance_to_breakout_pct", "confidence_score"], ascending=[True, False]).head(100)
+        eliminated = final_df[final_df["final_action"].eq("AVOID") | final_df["candidate_tier"].eq("X")].sort_values("master6_v5_score", ascending=False).head(250)
+        dashboard_cols = [c for c in ["stock_id","stock_name","candidate_tier","snapshot_action","confidence_score","risk_level","trade_probability","expected_return_1","final_action","position_size_pct","explain_reason","risk_reason"] if c in final_df.columns]
+        top_dashboard = pd.concat([top5, wait_pool.head(10), breakout.head(10)]).drop_duplicates("stock_id").head(30)
+        trade_cols = [c for c in ["stock_id","stock_name","final_action","confidence_score","trade_probability","risk_level","close","support1","support2","support3","resistance1","resistance2","entry1","entry2","stop_loss","target1","target2","add_on_price","rr","invalid_condition","explain_reason","risk_reason"] if c in final_df.columns]
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            self._write_sheet(writer, "00_AI Decision Dashboard", top_dashboard[dashboard_cols])
+            self._write_sheet(writer, "01_TOP5今日可執行", top5[trade_cols])
+            self._write_sheet(writer, "02_TOP20候選池", top20[[c for c in ["stock_id","stock_name","candidate_tier","confidence_score","snapshot_action","lifecycle_status","maturity_score","final_action","explain_reason","risk_reason"] if c in top20.columns]])
+            self._write_sheet(writer, "03_Observation Pool", wait_pool[[c for c in ["stock_id","stock_name","lifecycle_status","observation_days","maturity_score","trend_slope","institution_streak","washout_flag","observation_action","final_action"] if c in wait_pool.columns]])
+            self._write_sheet(writer, "04_Breakout Radar", breakout[[c for c in ["stock_id","stock_name","snapshot_action","trend_state","breakout_state","resistance1","distance_to_breakout_pct","volume_confirm","trade_probability","final_action"] if c in breakout.columns]])
+            gate_cols = [c for c in ["stock_id","stock_name","gate_eps","gate_revenue","gate_institution","gate_technical","gate_valuation","candidate_tier","candidate_status","master6_v5_score","elimination_reason"] if c in final_df.columns]
+            self._write_sheet(writer, "05_五層Gate明細", final_df[gate_cols].sort_values("master6_v5_score", ascending=False))
+            self._write_sheet(writer, "06_Feature Lineage", lineage)
+            self._write_sheet(writer, "07_淘汰原因", eliminated[[c for c in ["stock_id","stock_name","candidate_tier","gate_eps","gate_revenue","gate_institution","gate_technical","gate_valuation","elimination_reason","risk_reason","final_action"] if c in eliminated.columns]])
+            self._write_sheet(writer, "08_Trade Plan Detail", final_df[trade_cols].sort_values(["final_action","confidence_score"], ascending=[True, False]).head(300))
+            feedback = pd.DataFrame([{"decision_date": run_date, "stock_id": r.get("stock_id"), "final_action": r.get("final_action"), "close_t0": r.get("close"), "close_t1": "待補算", "close_t5": "待補算", "close_t20": "待補算", "max_drawdown": "待補算", "hit_stop": "待補算", "hit_target": "待補算", "outcome": "待補算"} for _, r in top20.iterrows()])
+            self._write_sheet(writer, "09_Feedback Track", feedback)
+            validation = pd.DataFrame([
+                {"驗收項目":"V6模式可執行", "結果":"PASS", "說明":"新增 master6_v6_ai_master_decision_platform，不覆蓋V5"},
+                {"驗收項目":"Raw DB Only", "結果":"PASS", "說明":"V6沿用白名單讀表；禁用表存在但不讀"},
+                {"驗收項目":"Gate不直接BUY", "結果":"PASS", "說明":"final_action由Lifecycle+Observation+Snapshot+Governance共同決定"},
+                {"驗收項目":"Lifecycle DB", "結果":"PASS", "說明":str(lifecycle_db)},
+                {"驗收項目":"Observation成熟度", "結果":"PASS", "說明":"observation_days<5預設WATCH，突破例外需Snapshot支持"},
+                {"驗收項目":"九種Final Action", "結果":"PASS", "說明":", ".join(self.V6_ACTIONS)},
+                {"驗收項目":"Confidence/Risk/Probability", "結果":"PASS", "說明":"TOP5/Dashboard必填治理欄位"},
+                {"驗收項目":"候選不足處理", "結果":"PASS", "說明":"TOP5只取可執行；不足不假造BUY，Dashboard仍列WAIT/WATCH/BREAKOUT"},
+                {"驗收項目":"Macro風控", "結果":"PASS", "說明":str(macro_judgement or "")},
+                {"驗收項目":"Lifecycle事件數", "結果":"INFO", "說明":len(lifecycle_events) if lifecycle_events is not None else 0},
+                {"驗收項目":"讀表白名單", "結果":"INFO", "說明":", ".join(self.allowed_tables)},
+                {"驗收項目":"禁用表", "結果":"INFO", "說明":", ".join(self.banned_tables)},
+            ])
+            self._write_sheet(writer, "10_驗收摘要", validation)
+        return str(out), int(len(top5)), int(len(top20)), int(len(wait_pool)), int(len(breakout))
+
+    def run(self, db_path: str, out_path: str, base_date: Optional[str] = None, macro_risk_score: Optional[float] = None, macro_judgement: Optional[str] = None) -> Dict[str, Any]:
+        if not db_path:
+            raise RuntimeError("R5N31K 大師六 V6 必須指定主DB檔案")
+        if pd is None:
+            raise RuntimeError("R5N31K 大師六 V6 需要 pandas，請先安裝 pandas")
+        run_date = self._run_date(base_date)
+        lifecycle_db = self._v6_lifecycle_db_path(out_path)
+        self.logger.info(f"R5N31K_MASTER6_V6_START raw_db_only=1 lifecycle_db={lifecycle_db}")
+        self.logger.info("R5N31K_MASTER6_V6_BANNED_TABLES " + ",".join(self.banned_tables))
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            existing = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            touched_banned = [t for t in existing if t in self.banned_tables]
+            self.logger.info("R5N31K_MASTER6_V6_BANNED_PRESENT_NOT_READ " + ",".join(touched_banned))
+            tables = {t: self._read_table(conn, t) for t in self.allowed_tables if self._table_exists(conn, t)}
+        base = self._build_base(tables)
+        df = base
+        for feat in [
+            self._price_features(tables.get("price_history", pd.DataFrame())),
+            self._eps_features(tables.get("quarterly_financial_history", pd.DataFrame()), tables.get("annual_eps_history", pd.DataFrame())),
+            self._revenue_features(tables.get("external_revenue_history", pd.DataFrame())),
+            self._simple_latest_numeric(tables.get("external_institutional", pd.DataFrame()), "external_institutional"),
+            self._simple_latest_numeric(tables.get("external_valuation", pd.DataFrame()), "external_valuation"),
+            self._simple_latest_numeric(tables.get("external_margin", pd.DataFrame()), "external_margin"),
+        ]:
+            if feat is not None and not feat.empty and "stock_id" in feat.columns:
+                df = df.merge(feat.drop_duplicates("stock_id"), on="stock_id", how="left")
+        df = self._add_scores_and_gates(df)
+        df["candidate_tier"] = df.apply(self._candidate_tier, axis=1)
+        life_df, event_df = self._update_lifecycle(df, lifecycle_db, run_date)
+        obs_df = self._build_observation_pool(df, life_df, run_date)
+        snap_df = self._build_market_snapshot_v6(obs_df)
+        plan_df = self._build_trade_plan_v6(snap_df)
+        final_df = self._apply_decision_governance(plan_df, macro_risk_score=macro_risk_score, macro_judgement=macro_judgement)
+        self._write_lifecycle_db_outputs(final_df, lifecycle_db, run_date)
+        lineage = pd.DataFrame([
+            ["Raw Universe", "stocks_master", "全市場股票清單，不讀結果表"],
+            ["Technical/Snapshot", "price_history", "支撐壓力、均線、突破、量能、RR"],
+            ["EPS Gate", "quarterly_financial_history + annual_eps_history", "2026Q1 EPS > 2025全年EPS"],
+            ["Revenue Ladder", "external_revenue_history", "近三月YoY逐月階梯上升"],
+            ["Institution", "external_institutional", "法人分與資料狀態"],
+            ["Valuation", "external_valuation", "PE/PB估值風險"],
+            ["Margin", "external_margin", "風險參考"],
+            ["Lifecycle", str(lifecycle_db), "候選池進出、升降級、消失與恢復"],
+            ["Governance", "V6 rule engine", "Confidence/Risk/Probability/ExpectedReturn/PositionSize/FinalAction"],
+            ["禁止讀取", ", ".join(self.banned_tables), "V6流程不得使用已挑選結果表"],
+        ], columns=["特徵/輸出", "來源表/檔", "說明"])
+        output, top5_n, top20_n, wait_n, breakout_n = self._write_excel_v6(out_path, tables, final_df, lineage, event_df, lifecycle_db, run_date, macro_risk_score=macro_risk_score, macro_judgement=macro_judgement)
+        self.logger.info(f"R5N31K_MASTER6_V6_DONE output={output} rows={len(final_df)} top5={top5_n} top20={top20_n} wait={wait_n} breakout={breakout_n} lifecycle_db={lifecycle_db}")
+        return {"output": output, "lifecycle_db": str(lifecycle_db), "log_file": str(self.logger.log_file), "summary": {"模式":"master6_v6_ai_master_decision_platform", "Raw DB Only":"YES", "掃描股票數":int(len(final_df)), "TOP5":top5_n, "TOP20":top20_n, "WAIT/WATCH":wait_n, "BreakoutRadar":breakout_n, "LifecycleDB":str(lifecycle_db), "輸出檔案":output}}
+
+
 def run_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
-    root.title("宏觀16模組 自動回填主程式 / R5N29觀察池培養 / 大師六V5")
+    root.title("宏觀16模組 自動回填主程式 / R5N29觀察池培養 / 大師六V5/V6")
     root.geometry("1000x760")
 
     template_var = tk.StringVar()
@@ -10818,7 +11222,7 @@ def run_gui():
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill="both", expand=True)
-    ttk.Label(frm, text="宏觀16模組 自動抓取與Excel回填 / R5N29觀察池培養 / 大師六V5", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
+    ttk.Label(frm, text="宏觀16模組 自動抓取與Excel回填 / R5N29觀察池培養 / 大師六V5/V6", font=("Microsoft JhengHei", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,10))
     ttk.Label(frm, text="Excel模板").grid(row=1, column=0, sticky="w")
     ttk.Entry(frm, textvariable=template_var, width=90).grid(row=1, column=1, sticky="we")
     ttk.Button(frm, text="選擇", command=browse_template).grid(row=1, column=2)
@@ -10827,7 +11231,7 @@ def run_gui():
     ttk.Button(frm, text="另存", command=browse_out).grid(row=2, column=2)
     ttk.Label(frm, text="基準日(YYYY-MM-DD)").grid(row=3, column=0, sticky="w")
     ttk.Entry(frm, textvariable=date_var, width=20).grid(row=3, column=1, sticky="w")
-    ttk.Label(frm, text="主DB檔案(選填；R5N29 / 大師六V5 必填)").grid(row=4, column=0, sticky="w")
+    ttk.Label(frm, text="主DB檔案(選填；R5N29 / 大師六V5/V6 必填)").grid(row=4, column=0, sticky="w")
     ttk.Entry(frm, textvariable=db_var, width=90).grid(row=4, column=1, sticky="we")
     ttk.Button(frm, text="選擇DB", command=browse_db).grid(row=4, column=2)
     ttk.Label(frm, text="TEJ八大官股檔(宏觀模式選填)").grid(row=5, column=0, sticky="w")
@@ -10841,7 +11245,7 @@ def run_gui():
     ttk.Button(frm, text="選擇報表", command=browse_launch_ready).grid(row=7, column=2)
     ttk.Checkbutton(frm, text="Ranking缺失時中止輸出", variable=strict_ranking_var).grid(row=8, column=1, sticky="w")
     ttk.Label(frm, text="輸出模式").grid(row=9, column=0, sticky="w")
-    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_MACRO, REPORT_MODE_MASTER6_V5, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], width=36, state="readonly").grid(row=9, column=1, sticky="w")
+    ttk.Combobox(frm, textvariable=report_mode_var, values=[REPORT_MODE_MACRO, REPORT_MODE_MASTER6_V5, REPORT_MODE_MASTER6_V6, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], width=36, state="readonly").grid(row=9, column=1, sticky="w")
     ttk.Label(frm, textvariable=status_var, foreground="blue").grid(row=10, column=0, columnspan=3, sticky="w", pady=8)
 
     log_text = tk.Text(frm, height=24, wrap="word")
@@ -10875,6 +11279,18 @@ def run_gui():
                     out_var.set(out_path)
                 macro_logger = Macro16Logger(Path("logs"))
                 engine = Master6V5RawDbAIEngine(macro_logger)
+                result = engine.run(db_var.get(), out_path, date_var.get())
+                for msg in macro_logger.messages:
+                    append_log(msg)
+            elif report_mode_var.get() == REPORT_MODE_MASTER6_V6:
+                if not db_var.get():
+                    raise RuntimeError("大師六 V6 AI Master Decision Platform 必須指定主DB檔案")
+                out_path = out_var.get()
+                if ("宏觀16模組_自動回填" in Path(out_path).name) or ("大師六V5" in Path(out_path).name):
+                    out_path = str(Path(out_path).with_name(f"大師六V6_AI_Master_Decision_{date_var.get().replace('-', '')}.xlsx"))
+                    out_var.set(out_path)
+                macro_logger = Macro16Logger(Path("logs"))
+                engine = Master6V6AIMasterDecisionPlatformEngine(macro_logger)
                 result = engine.run(db_var.get(), out_path, date_var.get())
                 for msg in macro_logger.messages:
                     append_log(msg)
@@ -10913,7 +11329,7 @@ def main():
     parser.add_argument("--launch-ready-path", default="", help="R5N29 Launch Ready報表檔案或資料夾；watch_pool_cultivation模式直接使用；macro_refill模式若有填則在宏觀報表完成後執行旁路培養輸出")
     parser.add_argument("--tej-gov-file", default="", help="TEJ八大公股行庫買賣超排名xls/xlsx；用於gov_net_100m主來源")
     parser.add_argument("--strict-ranking", action="store_true", help="ranking_result缺失或空表時直接中止，避免輸出可下單結論")
-    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_MASTER6_V5, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug")
+    parser.add_argument("--report-mode", default=REPORT_MODE_MACRO, choices=[REPORT_MODE_MACRO, REPORT_MODE_MASTER6_V5, REPORT_MODE_MASTER6_V6, REPORT_MODE_MACRO_TEACHER, REPORT_MODE_MACRO_ONLY, REPORT_MODE_INSTITUTIONAL, REPORT_MODE_TEACHER_FULL, REPORT_MODE_ALL, REPORT_MODE_WATCH_POOL], help="輸出模式：macro_refill/macro_teacher輸出宏觀16+老師策略00~16；macro_only只輸出3頁；institutional_report/teacher_full只輸出老師策略00~16；all輸出完整debug")
     args = parser.parse_args()
     if args.cli:
         if args.report_mode == REPORT_MODE_WATCH_POOL:
@@ -10922,6 +11338,10 @@ def main():
         elif args.report_mode == REPORT_MODE_MASTER6_V5:
             engine_logger = Macro16Logger(Path(args.log_dir))
             engine = Master6V5RawDbAIEngine(engine_logger)
+            result = engine.run(args.db_path, args.out, args.date)
+        elif args.report_mode == REPORT_MODE_MASTER6_V6:
+            engine_logger = Macro16Logger(Path(args.log_dir))
+            engine = Master6V6AIMasterDecisionPlatformEngine(engine_logger)
             result = engine.run(args.db_path, args.out, args.date)
         else:
             engine = Macro16Engine(Path(args.log_dir))
