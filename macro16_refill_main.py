@@ -53,7 +53,7 @@ except Exception:
     np = None
 
 APP_NAME = "Macro16RefillEngine"
-VERSION = "3.0.0-ai-project-rotation-monitor-R5N31M-master6v6-side-output-fix"
+VERSION = "3.0.0-ai-project-rotation-monitor-R5N31N-master6v6-complete-export-fix"
 STRATEGY_VERSION = "teacher_strategy_v3.0_ai_project_rotation_monitor_20260525"
 DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_FALLBACK_DAYS = 5
@@ -8699,7 +8699,7 @@ class Macro16Engine:
         if report_mode == REPORT_MODE_ALL:
             evidence_word = self.word_evidence_writer.write(str(Path(out_path).with_name(Path(out_path).stem + "_資料證據報告.docx")), raw, summary)
 
-        # R5N31M FIX：macro_refill/其他日常模式自動側掛大師六 V5 + V6。
+        # R5N31N FIX：macro_refill/其他日常模式自動側掛大師六 V5 + V6。
         # 目的：使用者仍選 macro_refill 時，也要同時產出：
         # 1. reports/大師六V5_AI投資決策_YYYYMMDD.xlsx
         # 2. data/watch_pool_cultivation.db（V6 八大閉環表）
@@ -8714,26 +8714,26 @@ class Macro16Engine:
             side_date = (base_date or dt.date.today().isoformat()).replace("-", "")
             try:
                 master6_v5_output = str(reports_dir / f"大師六V5_AI投資決策_{side_date}.xlsx")
-                self.logger.info(f"R5N31M_MASTER6_V5_SIDE_OUTPUT_START report_mode={report_mode} output={master6_v5_output}")
+                self.logger.info(f"R5N31N_MASTER6_V5_SIDE_OUTPUT_START report_mode={report_mode} output={master6_v5_output}")
                 Master6V5RawDbAIEngine(self.logger).run(db_path, master6_v5_output, base_date, macro_risk_score=tech.risk_score, macro_judgement=tech.market_judgement)
-                self.logger.info(f"R5N31M_MASTER6_V5_SIDE_OUTPUT_DONE output={master6_v5_output}")
+                self.logger.info(f"R5N31N_MASTER6_V5_SIDE_OUTPUT_DONE output={master6_v5_output}")
             except Exception as exc:
                 master6_v5_output = ""
-                self.logger.warning(f"R5N31M_MASTER6_V5_SIDE_OUTPUT_FAIL error={exc}")
+                self.logger.warning(f"R5N31N_MASTER6_V5_SIDE_OUTPUT_FAIL error={exc}")
 
             try:
                 v6_out_hint = str(base_dir / f"大師六V6_AI_Master_Decision_{side_date}.xlsx")
-                self.logger.info(f"R5N31M_MASTER6_V6_SIDE_OUTPUT_START report_mode={report_mode} output_hint={v6_out_hint}")
+                self.logger.info(f"R5N31N_MASTER6_V6_SIDE_OUTPUT_START report_mode={report_mode} output_hint={v6_out_hint}")
                 v6_result = Master6V6AIMasterDecisionPlatformEngine(self.logger).run(
                     db_path, v6_out_hint, base_date, macro_risk_score=tech.risk_score, macro_judgement=tech.market_judgement
                 )
                 master6_v6_output = str(v6_result.get("output", ""))
                 master6_v6_db = str(v6_result.get("lifecycle_db", ""))
-                self.logger.info(f"R5N31M_MASTER6_V6_SIDE_OUTPUT_DONE output={master6_v6_output} closed_loop_db={master6_v6_db}")
+                self.logger.info(f"R5N31N_MASTER6_V6_SIDE_OUTPUT_DONE output={master6_v6_output} closed_loop_db={master6_v6_db}")
             except Exception as exc:
                 master6_v6_output = ""
                 master6_v6_db = ""
-                self.logger.warning(f"R5N31M_MASTER6_V6_SIDE_OUTPUT_FAIL error={exc}")
+                self.logger.warning(f"R5N31N_MASTER6_V6_SIDE_OUTPUT_FAIL error={exc}")
         # R5N29K：保留 data/reports/logs 工作資料夾，不再自動產出 data.zip。
         # 原因：data.zip 只是附件/交付包形式，不是每日培養迴路的工作資料。
         data_outputs: Dict[str, str] = {}
@@ -10679,7 +10679,7 @@ class Master6V5RawDbAIEngine:
             pass
 
     def _write_excel(self, out_path, tables, all_df, top20, top5, eliminated, lineage, macro_risk_score=None, macro_judgement=None, top_source="正式候選"):
-        # R5N31M FIX：這是 V5 Excel writer，不可呼叫只存在於 V6 subclass 的 _v6_excel_output_path。
+        # R5N31N FIX：這是 V5 Excel writer，不可呼叫只存在於 V6 subclass 的 _v6_excel_output_path。
         # R5N31L 的錯誤根因是 macro_refill 側掛 V5 時進入此函式，卻呼叫 V6 專屬方法，
         # 造成 AttributeError: 'Master6V5RawDbAIEngine' object has no attribute '_v6_excel_output_path'。
         # V5 報表維持使用呼叫端指定的 out_path；V6 Dashboard 由 Master6V6AIMasterDecisionPlatformEngine._write_excel_v6 負責。
@@ -10808,7 +10808,7 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
     3. BUY 必須經 Candidate Pool -> Observation Pool -> MarketSnapshot -> Governance -> Trade Plan。
     4. 候選不足時，不產生假 TOP5；改輸出 WAIT/WATCH/BREAKOUT 雷達與不足原因。
     """
-    VERSION_TAG = "R5N31L_MASTER6_V6_SQLITE_CLOSED_LOOP_CULTIVATION"
+    VERSION_TAG = "R5N31N_MASTER6_V6_SQLITE_CLOSED_LOOP_COMPLETE_EXPORT"
     V6_ACTIONS = ["STRONG_BUY", "BUY", "ACCUMULATE", "WAIT", "WATCH", "BREAKOUT", "REDUCE", "SELL", "AVOID"]
 
     def __init__(self, logger: Macro16Logger):
@@ -10841,7 +10841,7 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
         return cwd
 
     def _ensure_v6_output_dirs(self, out_path: str = "") -> Dict[str, Path]:
-        """R5N31L：建立固定閉環目錄。"""
+        """R5N31N：建立固定閉環目錄，補齊 Feedback/TradeResult/DecisionLog 輸出資料夾。"""
         root = self._project_root(out_path)
         dirs = {
             "data": root / "data",
@@ -10851,6 +10851,9 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
             "lifecycle": root / "reports" / "V6" / "Lifecycle",
             "market_snapshot": root / "reports" / "V6" / "MarketSnapshot",
             "trade_plan": root / "reports" / "V6" / "TradePlan",
+            "feedback": root / "reports" / "V6" / "Feedback",
+            "trade_result": root / "reports" / "V6" / "TradeResult",
+            "decision_log": root / "reports" / "V6" / "DecisionLog",
             "dashboard": root / "reports" / "V6" / "Dashboard",
             "logs": root / "logs",
         }
@@ -10881,9 +10884,26 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
         return dirs["data"] / "watch_pool_cultivation.db"
 
     def _v6_excel_output_path(self, out_path: str, run_date: str) -> Path:
-        """R5N31L：V6 Excel 固定輸出到 reports/V6/Dashboard。"""
+        """R5N31N：V6 Excel 固定輸出到 reports/V6/Dashboard。
+        同時在 _write_excel_v6 內複製到 reports 根目錄與 ASCII 檔名，避免使用者只看 reports 根目錄時誤判沒有產出。
+        """
         dirs = self._ensure_v6_output_dirs(out_path)
         return dirs["dashboard"] / f"大師六V6_AI_Master_Decision_Platform_{run_date.replace('-', '')}.xlsx"
+
+    def _v6_root_report_paths(self, out_path: str, run_date: str) -> List[Path]:
+        """R5N31N：提供 reports 根目錄可見副本與 ASCII 相容副本。
+        主檔仍在 reports/V6/Dashboard；副本只為使用者查找與壓縮編碼相容。
+        """
+        root = self._project_root(out_path)
+        suffix = run_date.replace('-', '')
+        reports_root = root / "reports"
+        reports_root.mkdir(parents=True, exist_ok=True)
+        dirs = self._ensure_v6_output_dirs(out_path)
+        return [
+            reports_root / f"大師六V6_AI_Master_Decision_Platform_{suffix}.xlsx",
+            dirs["dashboard"] / f"Master6V6_AI_Master_Decision_Platform_{suffix}.xlsx",
+            reports_root / f"Master6V6_AI_Master_Decision_Platform_{suffix}.xlsx",
+        ]
 
     def _ensure_v6_lifecycle_schema(self, conn):
         """R5N31L：建立 V6 SQLite Closed-loop DB schema。
@@ -11298,24 +11318,73 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
         }
 
     def _export_v6_folder_reports(self, final_df, dirs: Dict[str, Path], run_date: str):
-        """R5N31L：依固定 reports/V6/* 目錄輸出分頁報表，供人工檢視；DB仍為主體。"""
+        """R5N31N：依固定 reports/V6/* 目錄輸出分頁報表。
+        修正 R5N31M 缺口：原本只輸出 5 類 Excel，未輸出 Feedback/TradeResult/DecisionLog，
+        導致使用者看到 SQLite 有八大表，但 reports/V6 不完整。
+        """
         if pd is None or final_df is None or final_df.empty:
             return {}
         suffix = run_date.replace('-', '')
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         exports = {}
+        def pick(cols):
+            return [c for c in cols if c in final_df.columns]
+        feedback_df = pd.DataFrame([{
+            "decision_date": run_date,
+            "stock_id": str(r.get("stock_id", "")).zfill(4),
+            "stock_name": r.get("stock_name", ""),
+            "final_action": r.get("final_action", ""),
+            "close_t0": r.get("close"),
+            "close_t1": None,
+            "close_t5": None,
+            "close_t20": None,
+            "max_drawdown": None,
+            "hit_stop": None,
+            "hit_target": None,
+            "outcome": "PENDING",
+            "updated_at": now,
+        } for _, r in final_df.iterrows()])
+        trade_result_df = pd.DataFrame([{
+            "decision_date": run_date,
+            "stock_id": str(r.get("stock_id", "")).zfill(4),
+            "stock_name": r.get("stock_name", ""),
+            "final_action": r.get("final_action", ""),
+            "result_status": "PENDING",
+            "realized_return": None,
+            "realized_rr": None,
+            "note": "等待後續收盤資料回填",
+            "updated_at": now,
+        } for _, r in final_df.iterrows()])
+        decision_log_df = pd.DataFrame([{
+            "run_date": run_date,
+            "stock_id": str(r.get("stock_id", "")).zfill(4),
+            "stock_name": r.get("stock_name", ""),
+            "final_action": r.get("final_action", ""),
+            "confidence_score": r.get("confidence_score"),
+            "risk_level": r.get("risk_level"),
+            "trade_probability": r.get("trade_probability"),
+            "explain_reason": r.get("explain_reason"),
+            "risk_reason": r.get("risk_reason"),
+            "source_version": self.VERSION_TAG,
+            "created_at": now,
+        } for _, r in final_df.iterrows()])
         subsets = {
             "candidate_pool": (dirs["candidate_pool"] / f"candidate_pool_{suffix}.xlsx", final_df[final_df.get("candidate_tier", pd.Series("", index=final_df.index)).isin(["A","B","C"])]),
             "watch_pool": (dirs["watch_pool"] / f"watch_pool_{suffix}.xlsx", final_df[final_df.get("final_action", pd.Series("", index=final_df.index)).isin(["WAIT","WATCH"])]),
-            "lifecycle": (dirs["lifecycle"] / f"lifecycle_{suffix}.xlsx", final_df[[c for c in ["stock_id","stock_name","candidate_tier","lifecycle_status","observation_days","maturity_score","final_action","risk_reason"] if c in final_df.columns]]),
-            "market_snapshot": (dirs["market_snapshot"] / f"market_snapshot_{suffix}.xlsx", final_df[[c for c in ["stock_id","stock_name","snapshot_action","trend_state","breakout_state","close","support1","support2","resistance1","resistance2","distance_to_breakout_pct","volume_confirm"] if c in final_df.columns]]),
-            "trade_plan": (dirs["trade_plan"] / f"trade_plan_{suffix}.xlsx", final_df[[c for c in ["stock_id","stock_name","final_action","entry1","entry2","stop_loss","target1","target2","add_on_price","rr","position_size_pct"] if c in final_df.columns]]),
+            "lifecycle": (dirs["lifecycle"] / f"lifecycle_{suffix}.xlsx", final_df[pick(["stock_id","stock_name","candidate_tier","lifecycle_status","observation_days","maturity_score","final_action","risk_reason"])]),
+            "market_snapshot": (dirs["market_snapshot"] / f"market_snapshot_{suffix}.xlsx", final_df[pick(["stock_id","stock_name","snapshot_action","trend_state","breakout_state","close","support1","support2","support3","resistance1","resistance2","distance_to_breakout_pct","volume_confirm"])]),
+            "trade_plan": (dirs["trade_plan"] / f"trade_plan_{suffix}.xlsx", final_df[pick(["stock_id","stock_name","final_action","entry1","entry2","stop_loss","target1","target2","add_on_price","rr","expected_return_1","expected_return_2","position_size_pct","invalid_condition"])]),
+            "feedback_history": (dirs["feedback"] / f"feedback_history_{suffix}.xlsx", feedback_df),
+            "trade_result": (dirs["trade_result"] / f"trade_result_{suffix}.xlsx", trade_result_df),
+            "decision_log": (dirs["decision_log"] / f"decision_log_{suffix}.xlsx", decision_log_df),
         }
         for key, (path, df) in subsets.items():
             try:
+                path.parent.mkdir(parents=True, exist_ok=True)
                 df.head(500).to_excel(path, index=False)
                 exports[key] = str(path)
             except Exception as exc:
-                self.logger.warning(f"R5N31L_FOLDER_REPORT_EXPORT_FAIL key={key} path={path} error={exc}")
+                self.logger.warning(f"R5N31N_FOLDER_REPORT_EXPORT_FAIL key={key} path={path} error={exc}")
         return exports
 
     def _write_excel_v6(self, out_path, tables, final_df, lineage, lifecycle_events, lifecycle_db, run_date, macro_risk_score=None, macro_judgement=None):
@@ -11359,6 +11428,19 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
                 {"驗收項目":"禁用表", "結果":"INFO", "說明":", ".join(self.banned_tables)},
             ])
             self._write_sheet(writer, "10_驗收摘要", validation)
+        # R5N31N：Dashboard 主檔寫入 reports/V6/Dashboard 後，同步複製到 reports 根目錄與 ASCII 檔名，避免使用者在根目錄看不到或壓縮後中文檔名亂碼。
+        dashboard_copies = []
+        try:
+            import shutil as _r5n31n_shutil
+            for alias_path in self._v6_root_report_paths(str(out_path or ""), run_date):
+                if alias_path.resolve() == out.resolve():
+                    continue
+                alias_path.parent.mkdir(parents=True, exist_ok=True)
+                _r5n31n_shutil.copy2(out, alias_path)
+                dashboard_copies.append(str(alias_path))
+            self.logger.info(f"R5N31N_V6_DASHBOARD_COPIES paths={dashboard_copies}")
+        except Exception as exc:
+            self.logger.warning(f"R5N31N_V6_DASHBOARD_COPY_FAIL error={exc}")
         return str(out), int(len(top5)), int(len(top20)), int(len(wait_pool)), int(len(breakout))
 
     def run(self, db_path: str, out_path: str, base_date: Optional[str] = None, macro_risk_score: Optional[float] = None, macro_judgement: Optional[str] = None) -> Dict[str, Any]:
@@ -11413,8 +11495,31 @@ class Master6V6AIMasterDecisionPlatformEngine(Master6V5RawDbAIEngine):
             ["禁止讀取", ", ".join(self.banned_tables), "V6流程不得使用已挑選結果表"],
         ], columns=["特徵/輸出", "來源表/檔", "說明"])
         output, top5_n, top20_n, wait_n, breakout_n = self._write_excel_v6(out_path, tables, final_df, lineage, event_df, lifecycle_db, run_date, macro_risk_score=macro_risk_score, macro_judgement=macro_judgement)
-        self.logger.info(f"R5N31L_MASTER6_V6_DONE output={output} rows={len(final_df)} top5={top5_n} top20={top20_n} wait={wait_n} breakout={breakout_n} closed_loop_db={lifecycle_db} folder_exports={folder_exports}")
-        return {"output": output, "lifecycle_db": str(lifecycle_db), "log_file": str(self.logger.log_file), "summary": {"模式":"master6_v6_ai_master_decision_platform", "Raw DB Only":"YES", "掃描股票數":int(len(final_df)), "TOP5":top5_n, "TOP20":top20_n, "WAIT/WATCH":wait_n, "BreakoutRadar":breakout_n, "ClosedLoopDB":str(lifecycle_db), "FolderExports":folder_exports, "輸出檔案":output}}
+        folder_exports["dashboard"] = output
+        try:
+            folder_exports["dashboard_aliases"] = [str(p) for p in self._v6_root_report_paths(str(out_path or ""), run_date)]
+        except Exception:
+            pass
+        manifest = {
+            "version": self.VERSION_TAG,
+            "run_date": run_date,
+            "raw_db_only": True,
+            "closed_loop_db": str(lifecycle_db),
+            "sqlite_counts": sqlite_counts,
+            "folder_exports": folder_exports,
+            "summary": {"rows": int(len(final_df)), "TOP5": top5_n, "TOP20": top20_n, "WAIT/WATCH": wait_n, "BreakoutRadar": breakout_n},
+            "required_tables": ["candidate_pool","watch_pool","lifecycle_history","market_snapshot","trade_plan","feedback_history","trade_result","decision_log"],
+            "created_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            manifest_path = dirs["data"] / "v6_closed_loop_manifest.json"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            folder_exports["manifest"] = str(manifest_path)
+            self._append_v6_log_files(dirs, f"V6_OUTPUT_READY output={output} manifest={manifest_path} exports={folder_exports}")
+        except Exception as exc:
+            self.logger.warning(f"R5N31N_V6_MANIFEST_WRITE_FAIL error={exc}")
+        self.logger.info(f"R5N31N_MASTER6_V6_DONE output={output} rows={len(final_df)} top5={top5_n} top20={top20_n} wait={wait_n} breakout={breakout_n} closed_loop_db={lifecycle_db} folder_exports={folder_exports}")
+        return {"output": output, "lifecycle_db": str(lifecycle_db), "log_file": str(self.logger.log_file), "manifest": str((dirs["data"] / "v6_closed_loop_manifest.json")), "summary": {"模式":"master6_v6_ai_master_decision_platform", "Raw DB Only":"YES", "掃描股票數":int(len(final_df)), "TOP5":top5_n, "TOP20":top20_n, "WAIT/WATCH":wait_n, "BreakoutRadar":breakout_n, "ClosedLoopDB":str(lifecycle_db), "FolderExports":folder_exports, "輸出檔案":output}}
 
 
 def run_gui():
